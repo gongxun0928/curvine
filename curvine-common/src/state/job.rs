@@ -40,6 +40,21 @@ pub enum JobTaskState {
     Completed = 3,
     Failed = 4,
     Canceled = 5,
+    Dispatching = 6,
+    Canceling = 7,
+    CancelFailed = 8,
+}
+
+impl JobTaskState {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            JobTaskState::Completed
+                | JobTaskState::Failed
+                | JobTaskState::Canceled
+                | JobTaskState::CancelFailed
+        )
+    }
 }
 
 pub struct LoadJobResult {

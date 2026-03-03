@@ -203,10 +203,13 @@ impl Display for JobStatus {
         // Get the color identification corresponding to the status
         let state_color = match self.state {
             JobTaskState::Pending => "⚪",
+            JobTaskState::Dispatching => "🟣",
             JobTaskState::Loading => "🔵",
+            JobTaskState::Canceling => "🟠",
             JobTaskState::Completed => "🟢",
             JobTaskState::Failed => "🔴",
             JobTaskState::Canceled => "⚫",
+            JobTaskState::CancelFailed => "🟤",
             JobTaskState::UNKNOWN => "Unknown",
         };
 

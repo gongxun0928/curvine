@@ -124,7 +124,7 @@ impl JobMasterClient {
             match status.state {
                 JobTaskState::Completed => break,
 
-                JobTaskState::Failed | JobTaskState::Canceled => {
+                JobTaskState::Failed | JobTaskState::Canceled | JobTaskState::CancelFailed => {
                     return err_box!(
                         "job {} {:?}: {}",
                         status.job_id,

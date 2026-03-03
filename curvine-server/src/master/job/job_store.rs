@@ -120,6 +120,9 @@ impl JobStore {
         };
 
         let old_state: JobTaskState = job.state.state();
+        if old_state.is_terminal() {
+            return Ok(());
+        }
 
         job.update_progress(task_id, progress)?;
 
@@ -139,6 +142,9 @@ impl JobStore {
     pub fn update_state(&self, job_id: &str, state: JobTaskState, message: impl Into<String>) {
         if let Some(mut job) = self.jobs.get_mut(job_id) {
             let old_state: JobTaskState = job.state.state();
+            if old_state.is_terminal() && old_state != state {
+                return;
+            }
             job.update_state(state, message);
             let new_state = state;
 

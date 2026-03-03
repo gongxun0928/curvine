@@ -58,21 +58,40 @@ impl LoadTaskRunner {
     }
 
     pub async fn run(&self) {
-        if let Err(e) = self.run0().await {
-            // The data replication process fails, set the status and report to the master
-            error!("task {} execute failed: {}", self.task.info.task_id, e);
-            let progress = self.task.set_failed(e.to_string());
-            let res = self
-                .master_client
-                .report_task(
-                    self.task.info.job.job_id.clone(),
-                    self.task.info.task_id.clone(),
-                    progress,
-                )
-                .await;
+        match self.run0().await {
+            Ok(()) => {
+                if self.task.is_cancel() {
+                    info!("task {} canceled", self.task.info.task_id);
+                    let progress = self.task.set_canceled("Task canceled by user");
+                    if let Err(e) = self
+                        .master_client
+                        .report_task(
+                            self.task.info.job.job_id.clone(),
+                            self.task.info.task_id.clone(),
+                            progress,
+                        )
+                        .await
+                    {
+                        warn!("report canceled task {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                // The data replication process fails, set the status and report to the master
+                error!("task {} execute failed: {}", self.task.info.task_id, e);
+                let progress = self.task.set_failed(e.to_string());
+                let res = self
+                    .master_client
+                    .report_task(
+                        self.task.info.job.job_id.clone(),
+                        self.task.info.task_id.clone(),
+                        progress,
+                    )
+                    .await;
 
-            if let Err(e) = res {
-                warn!("report task {}", e)
+                if let Err(e) = res {
+                    warn!("report task {}", e)
+                }
             }
         }
     }
@@ -85,10 +104,12 @@ impl LoadTaskRunner {
         let mut last_progress_time = LocalTime::mills();
         let mut read_cost_ms = 0;
         let mut total_cost_ms = 0;
+        let mut canceled = false;
 
         loop {
             if self.task.is_cancel() {
                 info!("task {} was cancelled", self.task.info.task_id);
+                canceled = true;
                 break;
             }
 
@@ -115,6 +136,10 @@ impl LoadTaskRunner {
                     self.task_timeout_ms
                 );
             }
+        }
+
+        if canceled {
+            return Ok(());
         }
 
         writer.complete().await?;

@@ -95,6 +95,7 @@ impl LoadStatusCommand {
             if status.state == JobTaskState::Completed
                 || status.state == JobTaskState::Failed
                 || status.state == JobTaskState::Canceled
+                || status.state == JobTaskState::CancelFailed
             {
                 break;
             }

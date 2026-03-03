@@ -169,6 +169,11 @@ impl LoadJobRunner {
                 self.jobs.insert(job_id, job_context);
                 // @todo Whether to cancel some tasks that may have been dispatched.
                 self.submit_all_task(tasks).await?;
+                self.jobs.update_state(
+                    &result.job_id,
+                    JobTaskState::Loading,
+                    "All subtasks dispatched to workers",
+                );
 
                 Ok(result)
             }
@@ -197,7 +202,7 @@ impl LoadJobRunner {
         source_status: FileStatus,
         mnt: &MountInfo,
     ) -> FsResult<i64> {
-        job.update_state(JobTaskState::Pending, "Assigning workers");
+        job.update_state(JobTaskState::Dispatching, "Assigning workers");
         let block_size = job.info.block_size;
 
         let mut total_size = 0;
@@ -290,7 +295,7 @@ impl LoadJobRunner {
                 );
                 self.jobs.update_state(
                     job_id,
-                    JobTaskState::Canceled,
+                    JobTaskState::CancelFailed,
                     format!(
                         "Failed to send cancel load request to worker {}: {}",
                         worker, e

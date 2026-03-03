@@ -139,16 +139,16 @@ impl JobManager {
         let assigned_workers = {
             if let Some(job) = self.jobs.get(job_id) {
                 let state: JobTaskState = job.state.state();
-                // Check whether it can be canceled
-                if state == JobTaskState::Completed
-                    || state == JobTaskState::Failed
-                    || state == JobTaskState::Canceled
-                {
+                if state.is_terminal() {
                     info!(
                         "job {} is already in final state {:?}, source_path: {}, target_path: {}",
                         job_id, state, job.info.source_path, job.info.target_path
                     );
-                    self.update_state(job_id, JobTaskState::Canceled, "Canceling job by user");
+                    return Ok(());
+                }
+
+                if state == JobTaskState::Canceling {
+                    info!("job {} is already in Canceling state", job_id);
                     return Ok(());
                 }
 
@@ -158,13 +158,28 @@ impl JobManager {
             }
         };
 
-        self.update_state(job_id, JobTaskState::Canceled, "Canceling job by user");
+        self.update_state(job_id, JobTaskState::Canceling, "Canceling job by user");
+
+        if assigned_workers.is_empty() {
+            self.update_state(
+                job_id,
+                JobTaskState::Canceled,
+                "No running worker task found, canceled locally",
+            );
+            return Ok(());
+        }
 
         let job_runner = self.create_runner();
         let job_id = job_id.to_string();
+        let jobs = self.jobs.clone();
         self.rt.spawn(async move {
             if let Err(e) = job_runner.cancel_job(&job_id, assigned_workers).await {
                 warn!("Cancel job {} error: {}", job_id, e);
+                jobs.update_state(
+                    &job_id,
+                    JobTaskState::CancelFailed,
+                    format!("Cancel RPC failed: {}", e),
+                );
             }
         });
 

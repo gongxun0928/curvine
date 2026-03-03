@@ -15,6 +15,9 @@ enum JobTaskStateProto {
   COMPLETED = 3;
   FAILED = 4;
   CANCELED = 5;
+  DISPATCHING = 6;
+  CANCELING = 7;
+  CANCEL_FAILED = 8;
 }
 
 enum JobTaskTypeProto {
