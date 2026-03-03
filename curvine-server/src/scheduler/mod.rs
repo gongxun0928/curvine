@@ -12,8 +12,5 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod common;
-pub mod master;
-pub mod scheduler;
-pub mod test;
-pub mod worker;
+mod scheduler_server;
+pub use scheduler_server::Scheduler;

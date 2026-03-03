@@ -161,6 +161,15 @@ impl ClusterConf {
         InetAddr::new(&self.master.hostname, self.master.rpc_port)
     }
 
+    pub fn scheduler_addr(&self) -> InetAddr {
+        let hostname = if self.job.scheduler_hostname.is_empty() {
+            self.master.hostname.as_str()
+        } else {
+            self.job.scheduler_hostname.as_str()
+        };
+        InetAddr::new(hostname, self.job.scheduler_rpc_port)
+    }
+
     // Get all master nodes
     pub fn master_nodes(&self) -> Vec<NodeAddr> {
         let mut map = vec![];
@@ -203,6 +212,17 @@ impl ClusterConf {
         conf.pipe_pool_idle_time = self.worker.pipe_pool_idle_time;
 
         conf.enable_send_file = self.worker.enable_send_file;
+        conf
+    }
+
+    pub fn scheduler_server_conf(&self) -> ServerConf {
+        let addr = self.scheduler_addr();
+        let mut conf = ServerConf::with_hostname(&addr.hostname, addr.port);
+        conf.name = format!("{}-scheduler", self.cluster_id);
+        conf.io_threads = self.master.io_threads;
+        conf.worker_threads = self.master.worker_threads;
+        conf.close_idle = self.master.io_close_idle;
+        conf.timeout_ms = self.master.io_timeout_ms();
         conf
     }
 

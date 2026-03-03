@@ -49,19 +49,16 @@
   - Master Job RPC 路由保留不变，但控制面实现可替换
   - 兼容现有测试与调用链（无外部 API 变更）
 
+- **Phase-4（已完成）**：独立 Scheduler 服务化前置依赖  
+  - `JobManager/LoadJobRunner` 脱离 `MasterFilesystem/MountManager` 直接依赖，改为通过 RPC 获取元数据与挂载信息
+  - 新增独立 `scheduler` 服务类型（`curvine-server --service scheduler`）
+  - 新增 `RemoteJobScheduler`，支持 Master 将 `Submit/Get/Cancel/Report` 转发到远端 Scheduler
+  - 配置开关：`job.enable_remote_scheduler` + `job.scheduler_hostname` + `job.scheduler_rpc_port`
+  - 远端模式下 Master 跳过本地 JobManager 和 TTL 调度，避免双写控制面
+
 ## 后续阶段计划（每阶段一个 commit）
 
-## Phase-4：独立 Scheduler 进程化（边界真正落地）
-
-目标：
-- 新增 `scheduler` 服务形态（独立 RPC 端口）。
-- Master 仅保留元数据路径，不再承载 Job 编排状态机。
-
-验收：
-- 关闭 Scheduler 时，`SubmitJob` 失败可解释；恢复后可继续查询/控制已有作业。
-- Master 资源曲线中，Job 编排 CPU/内存占比明显下降。
-
-## Phase-5：Worker 事件模型升级（attempt/epoch fencing）
+## Phase-5：Worker 事件模型升级（attempt/epoch fencing，可后置）
 
 目标：
 - 事件携带 `job_id + task_id + epoch + attempt + event_time`。

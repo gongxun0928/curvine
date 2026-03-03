@@ -50,6 +50,15 @@ pub struct JobConf {
 
     // Maximum concurrency allowed by worker
     pub worker_max_concurrent_tasks: usize,
+
+    // Enable forwarding job RPC from master to a remote scheduler service.
+    pub enable_remote_scheduler: bool,
+
+    // Hostname for scheduler RPC endpoint.
+    pub scheduler_hostname: String,
+
+    // RPC port for scheduler service.
+    pub scheduler_rpc_port: u16,
 }
 
 impl JobConf {
@@ -59,6 +68,9 @@ impl JobConf {
     pub const DEFAULT_TASK_TIMEOUT: &'static str = "1h";
     pub const DEFAULT_TASK_REPORT_INTERVAL: &'static str = "10s";
     pub const DEFAULT_WORKER_MAX_CONCURRENT_TASKS: usize = 100;
+    pub const DEFAULT_ENABLE_REMOTE_SCHEDULER: bool = false;
+    pub const DEFAULT_SCHEDULER_HOSTNAME: &'static str = "";
+    pub const DEFAULT_SCHEDULER_RPC_PORT: u16 = 8998;
 
     pub fn init(&mut self) -> FsResult<()> {
         self.job_life_ttl = DurationUnit::from_str(&self.job_life_ttl_str)?.as_duration();
@@ -88,6 +100,9 @@ impl Default for JobConf {
             task_report_interval_str: Self::DEFAULT_TASK_REPORT_INTERVAL.to_string(),
 
             worker_max_concurrent_tasks: Self::DEFAULT_WORKER_MAX_CONCURRENT_TASKS,
+            enable_remote_scheduler: Self::DEFAULT_ENABLE_REMOTE_SCHEDULER,
+            scheduler_hostname: Self::DEFAULT_SCHEDULER_HOSTNAME.to_string(),
+            scheduler_rpc_port: Self::DEFAULT_SCHEDULER_RPC_PORT,
         }
     }
 }

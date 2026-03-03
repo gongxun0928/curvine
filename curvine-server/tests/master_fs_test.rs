@@ -80,12 +80,7 @@ fn new_handler() -> MasterHandler {
     let rt = Arc::new(AsyncRuntime::single());
     let replication_manager =
         MasterReplicationManager::new(&fs, &conf, &rt, &journal_system.worker_manager());
-    let job_manager = Arc::new(JobManager::from_cluster_conf(
-        fs.clone(),
-        mount_manager.clone(),
-        rt.clone(),
-        &conf,
-    ));
+    let job_manager = Arc::new(JobManager::from_cluster_conf(rt.clone(), &conf).unwrap());
     let scheduler: SyncJobScheduler = Arc::new(InProcessJobScheduler::new(job_manager));
     MasterHandler::new(
         &conf,

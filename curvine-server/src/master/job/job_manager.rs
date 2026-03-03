@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use crate::common::UfsFactory;
-use crate::master::fs::MasterFilesystem;
-use crate::master::{JobPersistence, JobStore, LoadJobRunner, MountManager};
+use crate::master::{JobPersistence, JobStore, LoadJobRunner};
 use core::time::Duration;
+use curvine_client::file::CurvineFileSystem;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::executor::ScheduledExecutor;
@@ -36,37 +36,31 @@ use std::sync::Arc;
 pub struct JobManager {
     rt: Arc<Runtime>,
     jobs: JobStore,
-    master_fs: MasterFilesystem,
+    fs: CurvineFileSystem,
     factory: Arc<UfsFactory>,
-    mount_manager: Arc<MountManager>,
     job_life_ttl: Duration,
     job_cleanup_ttl: Duration,
     job_max_files: usize,
 }
 
 impl JobManager {
-    pub fn from_cluster_conf(
-        master_fs: MasterFilesystem,
-        mount_manager: Arc<MountManager>,
-        rt: Arc<Runtime>,
-        conf: &ClusterConf,
-    ) -> Self {
+    pub fn from_cluster_conf(rt: Arc<Runtime>, conf: &ClusterConf) -> FsResult<Self> {
         let factory = Arc::new(UfsFactory::with_rt(&conf.client, rt.clone()));
+        let fs = CurvineFileSystem::with_rt(conf.clone(), rt.clone())?;
         let snapshot_path = PathBuf::from(&conf.master.meta_dir)
             .join("job")
             .join("job_snapshot.json");
         let persistence = Arc::new(JobPersistence::new(snapshot_path));
 
-        Self {
+        Ok(Self {
             rt,
             jobs: JobStore::with_persistence(persistence),
-            master_fs,
+            fs,
             factory,
-            mount_manager,
             job_life_ttl: conf.job.job_life_ttl,
             job_cleanup_ttl: conf.job.job_cleanup_ttl,
             job_max_files: conf.job.job_max_files,
-        }
+        })
     }
 
     /// Start the job manager
@@ -107,7 +101,7 @@ impl JobManager {
     pub fn create_runner(&self) -> LoadJobRunner {
         LoadJobRunner::new(
             self.jobs.clone(),
-            self.master_fs.clone(),
+            self.fs.clone(),
             self.factory.clone(),
             self.job_max_files,
         )
@@ -119,7 +113,7 @@ impl JobManager {
         // Check mount info for both UFS and CV paths
         // - For UFS path: Import (UFS → Curvine)
         // - For CV path: Export (Curvine → UFS), requires mount info to determine target UFS
-        let mnt = if let Some(mnt) = self.mount_manager.get_mount_info(&source_path)? {
+        let mnt = if let Some(mnt) = self.rt.block_on(self.fs.get_mount_info(&source_path))? {
             mnt
         } else {
             return err_box!("Not found mount info for path: {}", source_path);

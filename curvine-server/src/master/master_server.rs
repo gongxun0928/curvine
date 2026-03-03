@@ -18,7 +18,7 @@ use once_cell::sync::OnceCell;
 
 use curvine_common::conf::ClusterConf;
 use curvine_web::server::{WebHandlerService, WebServer};
-use log::error;
+use log::{error, info};
 use orpc::common::{LocalTime, Logger};
 use orpc::handler::HandlerService;
 use orpc::io::net::ConnState;
@@ -30,7 +30,9 @@ use crate::master::fs::{FsRetryCache, MasterActor, MasterFilesystem};
 use crate::master::journal::JournalSystem;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::router_handler::MasterRouterHandler;
-use crate::master::{InProcessJobScheduler, JobHandler, MountManager, SyncJobScheduler};
+use crate::master::{
+    InProcessJobScheduler, JobHandler, MountManager, RemoteJobScheduler, SyncJobScheduler,
+};
 use crate::master::{JobManager, MasterHandler};
 use crate::master::{MasterMetrics, MasterMonitor, SyncWorkerManager};
 
@@ -154,14 +156,12 @@ impl Master {
             quota_manager,
         );
 
-        let job_manager = Arc::new(JobManager::from_cluster_conf(
-            fs.clone(),
-            mount_manager.clone(),
-            rt.clone(),
-            &conf,
-        ));
-        let job_scheduler: SyncJobScheduler =
-            Arc::new(InProcessJobScheduler::new(job_manager.clone()));
+        let job_manager = Arc::new(JobManager::from_cluster_conf(rt.clone(), &conf)?);
+        let job_scheduler: SyncJobScheduler = if conf.job.enable_remote_scheduler {
+            Arc::new(RemoteJobScheduler::with_conf(rt.clone(), &conf)?)
+        } else {
+            Arc::new(InProcessJobScheduler::new(job_manager.clone()))
+        };
 
         // step3: Create rpc server.
         let retry_cache = FsRetryCache::with_conf(&conf.master);
@@ -199,6 +199,8 @@ impl Master {
     }
 
     pub async fn start(mut self) -> ServerStateListener {
+        let remote_scheduler_enabled = self.rpc_server.service().conf().job.enable_remote_scheduler;
+
         // step 1: Start journal_system, raft server and raft node will be started internally
         let mut listener = self.journal_system.start().await.unwrap();
         listener.wait_role().await.unwrap();
@@ -216,16 +218,20 @@ impl Master {
         // reload mount info
         self.mount_manager.restore();
 
-        // step5: Start job manager
-        self.job_manager.start();
+        // step5: Start job manager & ttl scheduler only for local scheduler mode.
+        if !remote_scheduler_enabled {
+            self.job_manager.start();
 
-        // step6: Start TTL scheduler (requires mount_manager and job_manager)
-        if let Err(e) = self.actor.start_ttl_scheduler(
-            self.mount_manager.clone(),
-            self.job_manager.factory().clone(),
-            self.job_manager.clone(),
-        ) {
-            error!("Failed to start inode ttl scheduler: {}", e);
+            // step6: Start TTL scheduler (requires mount_manager and job_manager)
+            if let Err(e) = self.actor.start_ttl_scheduler(
+                self.mount_manager.clone(),
+                self.job_manager.factory().clone(),
+                self.job_manager.clone(),
+            ) {
+                error!("Failed to start inode ttl scheduler: {}", e);
+            }
+        } else {
+            info!("Remote scheduler mode enabled, skip local job manager and TTL scheduler");
         }
 
         rpc_status

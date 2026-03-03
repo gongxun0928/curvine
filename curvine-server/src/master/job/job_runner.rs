@@ -13,9 +13,8 @@
 // limitations under the License.
 
 use crate::common::UfsFactory;
-use crate::master::fs::policy::ChooseContext;
-use crate::master::fs::MasterFilesystem;
 use crate::master::{JobContext, JobStore, TaskDetail};
+use curvine_client::file::CurvineFileSystem;
 use curvine_common::conf::ClientConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
@@ -33,7 +32,7 @@ use std::sync::Arc;
 
 pub struct LoadJobRunner {
     jobs: JobStore,
-    master_fs: MasterFilesystem,
+    fs: CurvineFileSystem,
     factory: Arc<UfsFactory>,
     job_max_files: usize,
 }
@@ -41,30 +40,19 @@ pub struct LoadJobRunner {
 impl LoadJobRunner {
     pub fn new(
         jobs: JobStore,
-        master_fs: MasterFilesystem,
+        fs: CurvineFileSystem,
         factory: Arc<UfsFactory>,
         job_max_files: usize,
     ) -> Self {
         Self {
             jobs,
-            master_fs,
+            fs,
             factory,
             job_max_files,
         }
     }
 
-    pub fn choose_worker(&self, block_size: i64) -> FsResult<WorkerAddress> {
-        let ctx = ChooseContext::with_num(1, block_size, vec![]);
-        let worker_mgr = self.master_fs.worker_manager.read();
-        let workers = worker_mgr.choose_worker(ctx)?;
-        if let Some(worker) = workers.first() {
-            Ok(worker.clone())
-        } else {
-            err_box!("No available worker found")
-        }
-    }
-
-    fn check_job_exists(
+    async fn check_job_exists(
         &self,
         job_id: &str,
         source_status: &FileStatus,
@@ -84,7 +72,10 @@ impl LoadJobRunner {
         if !source_status.is_dir {
             // Files are generally auto-loaded and executed in parallel.
             // Validate ufs_mtime to prevent distributing a large number of duplicate tasks.
-            if let Ok(cv_status) = self.master_fs.file_status(target_path.path()) {
+            if !target_path.is_cv() {
+                return false;
+            }
+            if let Ok(cv_status) = self.fs.get_status(target_path).await {
                 if cv_status.is_expired() || !cv_status.is_complete {
                     false
                 } else {
@@ -122,13 +113,16 @@ impl LoadJobRunner {
         };
 
         let source_status = if source_path.is_cv() {
-            self.master_fs.file_status(source_path.path())?
+            self.fs.get_status(&source_path).await?
         } else {
             let ufs = self.factory.get_ufs(&mnt)?;
             ufs.get_status(&source_path).await?
         };
 
-        if self.check_job_exists(&job_id, &source_status, &target_path) {
+        if self
+            .check_job_exists(&job_id, &source_status, &target_path)
+            .await
+        {
             info!(
                 "job {}, source_path {} already exists",
                 job_id,
@@ -203,7 +197,7 @@ impl LoadJobRunner {
         mnt: &MountInfo,
     ) -> FsResult<i64> {
         job.update_state(JobTaskState::Dispatching, "Assigning workers");
-        let block_size = job.info.block_size;
+        let workers = self.load_live_workers().await?;
 
         let mut total_size = 0;
         let mut stack = LinkedList::new();
@@ -219,7 +213,7 @@ impl LoadJobRunner {
                 let dir_path = Path::from_str(status.path)?;
                 let childs = if dir_path.is_cv() {
                     // Traverse Curvine directory
-                    self.master_fs.list_status(dir_path.path())?
+                    self.fs.list_status(&dir_path).await?
                 } else {
                     // Traverse UFS directory
                     let ufs = self.factory.get_ufs(mnt)?;
@@ -230,7 +224,7 @@ impl LoadJobRunner {
                     stack.push_back(child);
                 }
             } else {
-                let worker = self.choose_worker(block_size)?;
+                let worker = workers[task_index % workers.len()].clone();
 
                 let source_path = Path::from_str(status.path)?;
 
@@ -276,6 +270,17 @@ impl LoadJobRunner {
         }
 
         Ok(total_size)
+    }
+
+    async fn load_live_workers(&self) -> FsResult<Vec<WorkerAddress>> {
+        let info = self.fs.get_master_info().await?;
+        let workers: Vec<WorkerAddress> =
+            info.live_workers.into_iter().map(|v| v.address).collect();
+        if workers.is_empty() {
+            err_box!("No available worker found")
+        } else {
+            Ok(workers)
+        }
     }
 
     pub async fn cancel_job(
