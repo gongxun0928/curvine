@@ -26,7 +26,7 @@ use curvine_common::state::{
     BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileLock, FileStatus,
     MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, WorkerAddress,
 };
-use crate::master::meta::lock_pool::InodeLockPool;
+use crate::master::meta::lock_pool::{InodeLockPool, PathLockGuard, PathLockMode};
 use curvine_common::FsResult;
 use log::{info, warn};
 use orpc::common::{LocalTime, TimeSpent};
@@ -87,6 +87,86 @@ impl FsDir {
 
     pub fn root_dir(&self) -> &InodeView {
         &self.root_dir
+    }
+
+    /// Resolve a path while acquiring locks on each traversed inode.
+    ///
+    /// This is the safe entry point for path operations. It acquires read
+    /// locks on every intermediate directory during traversal, preventing
+    /// concurrent modifications from causing data races on the BTreeMap.
+    ///
+    /// Lock modes:
+    /// - `ReadOnly`: all nodes get read locks
+    /// - `WriteParent`: ancestors read, parent of target gets write lock
+    /// - `WriteTarget`: ancestors read, target itself gets write lock
+    pub fn resolve_with_locks(
+        &self,
+        path: &str,
+        mode: PathLockMode,
+    ) -> CommonResult<(InodePath, PathLockGuard<'_>)> {
+        let components = InodeView::path_components(path)?;
+        let name = try_option!(components.last());
+        if name.is_empty() {
+            return err_box!("Path {} is invalid", path);
+        }
+
+        let mut guard = PathLockGuard::new();
+        let mut inodes: Vec<InodePtr> = Vec::with_capacity(components.len());
+        let mut cur_inode = self.root_ptr();
+        let mut index = 0;
+        let total = components.len();
+
+        while index < total {
+            let resolved_inode = match cur_inode.as_ref() {
+                InodeView::FileEntry(fe_name, id) => {
+                    match self.store.get_inode(*id, Some(fe_name))? {
+                        Some(full_inode) => InodePtr::from_owned(full_inode),
+                        None => return err_box!("Failed to load inode {} from store", id),
+                    }
+                }
+                _ => cur_inode.clone(),
+            };
+
+            let inode_id = resolved_inode.id();
+            let is_last = index == total - 1;
+            let is_parent_of_last = total >= 2 && index == total - 2;
+
+            match mode {
+                PathLockMode::WriteParent if is_parent_of_last => {
+                    guard.push_write(self.lock_pool.write(inode_id));
+                }
+                PathLockMode::WriteTarget if is_last => {
+                    guard.push_write(self.lock_pool.write(inode_id));
+                }
+                _ => {
+                    guard.push_read(self.lock_pool.read(inode_id));
+                }
+            }
+
+            inodes.push(resolved_inode);
+
+            if is_last {
+                break;
+            }
+
+            index += 1;
+            let child_name = components[index].as_str();
+            match cur_inode.as_mut() {
+                InodeView::Dir(_, d) => {
+                    if let Some(child) = d.get_child_ptr(child_name) {
+                        cur_inode = child;
+                    } else {
+                        break;
+                    }
+                }
+                InodeView::File(_, _) | InodeView::FileEntry(_, _) => {
+                    break;
+                }
+            }
+        }
+
+        let inp = InodePath::from_resolved(path.to_string(), components, inodes);
+        Ok((inp, guard))
     }
 
     fn next_inode_id(&self) -> FsResult<i64> {

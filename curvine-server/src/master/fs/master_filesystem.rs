@@ -16,6 +16,7 @@ use crate::master::fs::context::ValidateAddBlock;
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
 use crate::master::meta::inode::{InodeFile, InodePath, InodeView, PATH_SEPARATOR};
+use crate::master::meta::lock_pool::PathLockMode;
 use crate::master::meta::FsDir;
 
 use crate::master::meta::parse_glob_pattern;
@@ -87,7 +88,7 @@ impl MasterFilesystem {
 
     pub fn mkdir_with_opts<T: AsRef<str>>(&self, path: T, opts: MkdirOpts) -> FsResult<FileStatus> {
         let fs_dir = self.fs_dir.get_ref();
-        let inp = Self::resolve_path(fs_dir, path.as_ref())?;
+        let (inp, _guard) = fs_dir.resolve_with_locks(path.as_ref(), PathLockMode::WriteParent)?;
 
         // Creation of root directory is not allowed
         if inp.is_root() {
@@ -111,9 +112,6 @@ impl MasterFilesystem {
             Self::check_parent(&inp)?;
         }
 
-        // Acquire path write lock on parent
-        let _parent_lock = inp.get_inode(-2)
-            .map(|parent| fs_dir.lock_pool.write(parent.id()));
         let inp = fs_dir.mkdir(inp, opts)?;
         let last = try_option!(inp.get_last_inode());
         let status = last.to_file_status(inp.path());
@@ -127,11 +125,8 @@ impl MasterFilesystem {
 
     pub fn delete<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<bool> {
         let fs_dir = self.fs_dir.get_ref();
-        let inp = Self::resolve_path(fs_dir, path.as_ref())?;
+        let (inp, _guard) = fs_dir.resolve_with_locks(path.as_ref(), PathLockMode::WriteParent)?;
 
-        // Path write lock on parent directory
-        let _parent_lock = inp.get_inode(-2)
-            .map(|parent| fs_dir.lock_pool.write(parent.id()));
         let delete_result = fs_dir.delete(&inp, recursive)?;
 
         let mut worker_manager = self.worker_manager.write();
@@ -143,10 +138,11 @@ impl MasterFilesystem {
     pub fn rename<T: AsRef<str>>(&self, src: T, dst: T, flags: RenameFlags) -> FsResult<bool> {
         let src = src.as_ref();
         let dst = dst.as_ref();
+        let fs_dir = self.fs_dir.get_ref();
 
-        let fs_dir = self.fs_dir.write();
-        let src_inp = Self::resolve_path(&fs_dir, src)?;
-        let dst_inp = Self::resolve_path(&fs_dir, dst)?;
+        // First pass: resolve both paths with read locks to get parent IDs
+        let (src_inp, _src_guard) = fs_dir.resolve_with_locks(src, PathLockMode::ReadOnly)?;
+        let (dst_inp, _dst_guard) = fs_dir.resolve_with_locks(dst, PathLockMode::ReadOnly)?;
 
         if src_inp.is_root() {
             return err_box!("Cannot rename root path");
@@ -156,7 +152,6 @@ impl MasterFilesystem {
             return Ok(false);
         }
 
-        // dst cannot be in the src directory, /a/b -> /a/b/c is not allowed operations.
         if let Some(rest) = dst.strip_prefix(src) {
             if rest.starts_with(PATH_SEPARATOR) {
                 return err_box!(
@@ -166,6 +161,23 @@ impl MasterFilesystem {
                 );
             }
         }
+
+        // Get parent IDs for write locking
+        let src_parent_id = src_inp.get_inode(-2).map(|p| p.id())
+            .unwrap_or(src_inp.get_inode(0).unwrap().id());
+        let dst_parent_id = dst_inp.get_inode(-2).map(|p| p.id())
+            .unwrap_or(dst_inp.get_inode(0).unwrap().id());
+
+        // Drop read guards before acquiring write locks to avoid deadlock
+        drop(_src_guard);
+        drop(_dst_guard);
+
+        // Acquire write locks on both parents in deadlock-free order
+        let _guards = fs_dir.lock_pool.write_two_ordered(src_parent_id, dst_parent_id);
+
+        // Re-resolve under write locks (tree may have changed)
+        let src_inp = Self::resolve_path(fs_dir, src)?;
+        let dst_inp = Self::resolve_path(fs_dir, dst)?;
 
         if let Some(del_res) = fs_dir.rename(&src_inp, &dst_inp, flags)? {
             let mut worker_manager = self.worker_manager.write();
@@ -222,7 +234,7 @@ impl MasterFilesystem {
         }
 
         let fs_dir = self.fs_dir.get_ref();
-        let inp = Self::resolve_path(fs_dir, path)?;
+        let (inp, _guard) = fs_dir.resolve_with_locks(path, PathLockMode::WriteParent)?;
 
         let last_inode = inp.get_last_inode();
         if let Some(inode) = &last_inode {
@@ -238,10 +250,6 @@ impl MasterFilesystem {
         if !opts.create_parent {
             Self::check_parent(&inp)?;
         }
-
-        // Path write lock on parent
-        let parent_id = inp.get_inode(-2).map(|p| p.id()).unwrap_or(inp.get_inode(0).unwrap().id());
-        let _parent_lock = fs_dir.lock_pool.write(parent_id);
 
         let inp = if last_inode.is_some() {
             if flags.overwrite() {
@@ -278,7 +286,7 @@ impl MasterFilesystem {
         }
 
         let fs_dir = self.fs_dir.get_ref();
-        let inp = Self::resolve_path(fs_dir, path)?;
+        let (inp, _guard) = fs_dir.resolve_with_locks(path, PathLockMode::WriteParent)?;
 
         let inode = match inp.get_last_inode() {
             None => {
@@ -298,10 +306,6 @@ impl MasterFilesystem {
             }
         };
 
-        // Path write lock on parent for truncate/reopen
-        let _parent_lock = inp.get_inode(-2)
-            .map(|parent| fs_dir.lock_pool.write(parent.id()));
-
         if flags.truncate() {
             self.truncate(fs_dir, &inp, opts)?;
             let status = fs_dir.file_status(&inp)?;
@@ -320,18 +324,14 @@ impl MasterFilesystem {
 
     pub fn file_status<T: AsRef<str>>(&self, path: T) -> FsResult<FileStatus> {
         let fs_dir = self.fs_dir.get_ref();
-        let inp = Self::resolve_path(fs_dir, path.as_ref())?;
-        let _guard = inp.get_last_inode()
-            .map(|inode| fs_dir.lock_pool.read(inode.id()));
+        let (inp, _guard) = fs_dir.resolve_with_locks(path.as_ref(), PathLockMode::ReadOnly)?;
         let status = fs_dir.file_status(&inp)?;
         Ok(status)
     }
 
     pub fn exists<T: AsRef<str>>(&self, path: T) -> FsResult<bool> {
         let fs_dir = self.fs_dir.get_ref();
-        let inp = Self::resolve_path(fs_dir, path.as_ref())?;
-        let _guard = inp.get_last_inode()
-            .map(|inode| fs_dir.lock_pool.read(inode.id()));
+        let (inp, _guard) = fs_dir.resolve_with_locks(path.as_ref(), PathLockMode::ReadOnly)?;
         Ok(inp.get_last_inode().is_some())
     }
 
@@ -349,9 +349,7 @@ impl MasterFilesystem {
             }
             Ok(all_statuses)
         } else {
-            let inp = Self::resolve_path(fs_dir, path.as_ref())?;
-            let _guard = inp.get_last_inode()
-                .map(|inode| fs_dir.lock_pool.read(inode.id()));
+            let (inp, _guard) = fs_dir.resolve_with_locks(path.as_ref(), PathLockMode::ReadOnly)?;
             fs_dir.list_status(&inp)
         }
     }
@@ -446,8 +444,8 @@ impl MasterFilesystem {
         last_block: Option<ExtendedBlock>,
     ) -> FsResult<LocatedBlock> {
         let path = path.as_ref();
-        let fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path)?;
+        let fs_dir = self.fs_dir.get_ref();
+        let (inp, _guard) = fs_dir.resolve_with_locks(path, PathLockMode::WriteTarget)?;
         let inode = match inp.get_last_inode() {
             Some(v) => v,
             None => return err_box!("File {} not exists", inp.path()),
@@ -489,8 +487,8 @@ impl MasterFilesystem {
         only_flush: bool,
     ) -> FsResult<Option<FileBlocks>> {
         let path = path.as_ref();
-        let fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path)?;
+        let fs_dir = self.fs_dir.get_ref();
+        let (inp, _guard) = fs_dir.resolve_with_locks(path, PathLockMode::WriteTarget)?;
 
         let inode = match inp.get_last_inode() {
             None => return err_box!("File does not exist: {}", inp.path()),
@@ -499,7 +497,7 @@ impl MasterFilesystem {
         let file = inode.as_file_ref()?;
         fs_dir.complete_file(&inp, len, commit_blocks, client_name, only_flush)?;
         if only_flush {
-            let locs = self.get_block_locs(path, &fs_dir, file)?;
+            let locs = self.get_block_locs(path, fs_dir, file)?;
             let status = inode.to_file_status(path);
             Ok(Some(FileBlocks::new(status, locs)))
         } else {
@@ -563,13 +561,12 @@ impl MasterFilesystem {
     pub fn get_block_locations<T: AsRef<str>>(&self, path: T) -> FsResult<FileBlocks> {
         let fs_dir = self.fs_dir.get_ref();
         let path = path.as_ref();
-        let inp = Self::resolve_path(fs_dir, path)?;
+        let (inp, _guard) = fs_dir.resolve_with_locks(path, PathLockMode::ReadOnly)?;
 
         let inode = match inp.get_last_inode() {
             Some(v) => v,
             None => return err_ext!(FsError::file_not_found(path)),
         };
-        let _guard = fs_dir.lock_pool.read(inode.id());
         let file = inode.as_file_ref()?;
         let block_locs = self.get_block_locs(path, fs_dir, file)?;
         let locate_blocks = FileBlocks {
@@ -635,18 +632,18 @@ impl MasterFilesystem {
     }
 
     pub fn last_inode_id(&self) -> i64 {
-        let fs_dir = self.fs_dir.read();
+        let fs_dir = self.fs_dir.get_ref();
         fs_dir.last_inode_id()
     }
 
     pub fn get_file_counts(&self) -> (i64, i64) {
-        let fs_dir = self.fs_dir.read();
+        let fs_dir = self.fs_dir.get_ref();
         fs_dir.get_file_counts()
     }
 
     // Create a directory number based on rocksdb data for testing.
     pub fn create_tree(&self) -> CommonResult<InodeView> {
-        let fs_dir = self.fs_dir.read();
+        let fs_dir = self.fs_dir.get_ref();
         fs_dir.create_tree()
     }
 
@@ -658,7 +655,7 @@ impl MasterFilesystem {
     }
 
     fn block_exists(&self, id: i64) -> FsResult<bool> {
-        let fs_dir = self.fs_dir.read();
+        let fs_dir = self.fs_dir.get_ref();
         fs_dir.block_exists(id)
     }
 
@@ -718,18 +715,18 @@ impl MasterFilesystem {
         }
         drop(wm);
 
-        let fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.get_ref();
         fs_dir.block_report(batch)
     }
 
     pub fn delete_locations(&self, worker_id: u32) -> FsResult<Vec<i64>> {
-        let fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.get_ref();
         fs_dir.delete_locations(worker_id)
     }
 
     pub fn set_attr<T: AsRef<str>>(&self, path: T, opts: SetAttrOpts) -> FsResult<FileStatus> {
-        let fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+        let fs_dir = self.fs_dir.get_ref();
+        let (inp, _guard) = fs_dir.resolve_with_locks(path.as_ref(), PathLockMode::WriteTarget)?;
         fs_dir.set_attr(inp, opts)
     }
 
@@ -740,30 +737,39 @@ impl MasterFilesystem {
         force: bool,
         mode: u32,
     ) -> FsResult<()> {
-        let fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.get_ref();
         let target = target.as_ref().to_string();
-        let link = Self::resolve_path(&fs_dir, link.as_ref())?;
+        let (link, _guard) = fs_dir.resolve_with_locks(link.as_ref(), PathLockMode::WriteParent)?;
         fs_dir.symlink(target, link, force, mode)
     }
 
     pub fn link<T: AsRef<str>>(&self, src_path: T, dst_path: T) -> FsResult<()> {
-        let fs_dir = self.fs_dir.write();
-        let src_path = Self::resolve_path(&fs_dir, src_path.as_ref())?;
-        let dst_path = Self::resolve_path(&fs_dir, dst_path.as_ref())?;
-        fs_dir.link(src_path, dst_path)
+        let fs_dir = self.fs_dir.get_ref();
+        let (src_path_resolved, _src_guard) = fs_dir.resolve_with_locks(src_path.as_ref(), PathLockMode::ReadOnly)?;
+        let (dst_path_resolved, _dst_guard) = fs_dir.resolve_with_locks(dst_path.as_ref(), PathLockMode::ReadOnly)?;
+        let src_parent_id = src_path_resolved.get_inode(-2).map(|p| p.id())
+            .unwrap_or(src_path_resolved.get_inode(0).unwrap().id());
+        let dst_parent_id = dst_path_resolved.get_inode(-2).map(|p| p.id())
+            .unwrap_or(dst_path_resolved.get_inode(0).unwrap().id());
+        drop(_src_guard);
+        drop(_dst_guard);
+        let _guards = fs_dir.lock_pool.write_two_ordered(src_parent_id, dst_parent_id);
+        let src_path_resolved = Self::resolve_path(fs_dir, src_path.as_ref())?;
+        let dst_path_resolved = Self::resolve_path(fs_dir, dst_path.as_ref())?;
+        fs_dir.link(src_path_resolved, dst_path_resolved)
     }
 
     pub fn resize<T: AsRef<str>>(&self, path: T, opts: FileAllocOpts) -> FsResult<FileBlocks> {
         opts.validate()?;
 
         let path = path.as_ref();
-        let fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path)?;
+        let fs_dir = self.fs_dir.get_ref();
+        let (inp, _guard) = fs_dir.resolve_with_locks(path, PathLockMode::WriteTarget)?;
 
         let del_res = fs_dir.resize(&inp, opts)?;
         self.worker_manager.write().remove_blocks(&del_res);
 
-        self.get_file_blocks(path, &fs_dir, &inp)
+        self.get_file_blocks(path, fs_dir, &inp)
     }
 
     pub fn assign_worker<T: AsRef<str>>(
@@ -774,8 +780,8 @@ impl MasterFilesystem {
         exclude_workers: Vec<u32>,
     ) -> FsResult<LocatedBlock> {
         let path = path.as_ref();
-        let fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path)?;
+        let fs_dir = self.fs_dir.get_ref();
+        let (inp, _guard) = fs_dir.resolve_with_locks(path, PathLockMode::WriteTarget)?;
 
         let choose_workers = self.choose_worker(&inp, client_addr, exclude_workers)?;
         let block = fs_dir.assign_worker(inp, block.id, &choose_workers)?;
@@ -789,8 +795,8 @@ impl MasterFilesystem {
     pub fn get_lock<T: AsRef<str>>(&self, path: T, lock: FileLock) -> FsResult<Option<FileLock>> {
         let path = path.as_ref();
 
-        let fs_dir = self.fs_dir.read();
-        let inp = Self::resolve_path(&fs_dir, path)?;
+        let fs_dir = self.fs_dir.get_ref();
+        let (inp, _guard) = fs_dir.resolve_with_locks(path, PathLockMode::ReadOnly)?;
         let expire_ms = self.conf.lock_expire_time_ms();
 
         fs_dir.get_lock(inp, &lock, expire_ms)
@@ -799,8 +805,8 @@ impl MasterFilesystem {
     pub fn set_lock<T: AsRef<str>>(&self, path: T, lock: FileLock) -> FsResult<Option<FileLock>> {
         let path = path.as_ref();
 
-        let fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path)?;
+        let fs_dir = self.fs_dir.get_ref();
+        let (inp, _guard) = fs_dir.resolve_with_locks(path, PathLockMode::WriteTarget)?;
 
         fs_dir.set_lock(inp, lock, self.conf.lock_expire_time_ms())
     }

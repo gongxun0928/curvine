@@ -101,6 +101,12 @@ pub enum TwoWriteGuards<'a> {
 
 /// Holds all locks acquired along a path traversal (root → target).
 /// Locks are released in reverse order (LIFO) when this guard is dropped.
+///
+/// The protocol guarantees:
+/// - Every ancestor directory has a read lock held during the operation
+/// - The operation target has a read or write lock depending on the mode
+/// - This prevents concurrent modifications to intermediate directories
+///   from causing data races during path traversal
 pub struct PathLockGuard<'a> {
     _locks: Vec<LockGuard<'a>>,
 }
@@ -122,12 +128,36 @@ impl<'a> PathLockGuard<'a> {
     pub fn push_write(&mut self, guard: RwLockWriteGuard<'a, ()>) {
         self._locks.push(LockGuard::Write(guard));
     }
+
+    pub fn len(&self) -> usize {
+        self._locks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self._locks.is_empty()
+    }
 }
 
 impl Default for PathLockGuard<'_> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Determines the lock mode for path resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathLockMode {
+    /// All nodes get read locks. For read-only operations
+    /// (file_status, exists, list_status, get_block_locations).
+    ReadOnly,
+    /// Ancestors get read locks, parent (second-to-last) gets write lock.
+    /// For operations that modify a directory's children list
+    /// (mkdir, create_file, delete, symlink).
+    WriteParent,
+    /// Ancestors get read locks, target (last node) gets write lock.
+    /// For operations that modify the target inode itself
+    /// (complete_file, set_attr, add_block, resize).
+    WriteTarget,
 }
 
 #[cfg(test)]

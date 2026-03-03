@@ -31,6 +31,18 @@ pub struct InodePath {
 }
 
 impl InodePath {
+    /// Construct an InodePath from pre-resolved components and inodes.
+    /// Used by `FsDir::resolve_with_locks` which handles locking during traversal.
+    pub fn from_resolved(path: String, components: Vec<String>, inodes: Vec<InodePtr>) -> Self {
+        let name = components.last().cloned().unwrap_or_default();
+        Self {
+            path,
+            name,
+            components,
+            inodes,
+        }
+    }
+
     pub fn resolve<T: AsRef<str>>(
         root: InodePtr,
         path: T,

@@ -154,7 +154,7 @@ fn test_block_replication_e2e() -> CommonResult<()> {
     // step 6: to remove other block locations to check the replicated block effectiveness
     let fs_dir = master_filesystem.fs_dir();
     {
-        let mut fs_dir = fs_dir.write();
+        let fs_dir = fs_dir.write();
         let mut reports = vec![];
         for addr in locations {
             reports.push((
