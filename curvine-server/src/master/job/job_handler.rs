@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::{JobManager, RpcContext};
+use crate::master::{RpcContext, SyncJobScheduler};
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     CancelJobRequest, CancelJobResponse, GetJobStatusRequest, GetJobStatusResponse,
@@ -23,18 +23,17 @@ use curvine_common::utils::{ProtoUtils, SerdeUtils};
 use curvine_common::FsResult;
 use orpc::err_box;
 use orpc::message::Message;
-use std::sync::Arc;
 
 /// The master loads the task service
 /// Handle load task related requests from clients and Worker
 pub struct JobHandler {
-    job_manager: Arc<JobManager>,
+    scheduler: SyncJobScheduler,
 }
 
 impl JobHandler {
     /// Create a new Master Loading Task Service
-    pub fn new(job_manager: Arc<JobManager>) -> Self {
-        Self { job_manager }
+    pub fn new(scheduler: SyncJobScheduler) -> Self {
+        Self { scheduler }
     }
 
     /// Submit loading task
@@ -50,7 +49,7 @@ impl JobHandler {
             return err_box!("Path cannot be empty");
         }
 
-        let res = self.job_manager.submit_load_job(command)?;
+        let res = self.scheduler.submit_job(command)?;
         let response = SubmitJobResponse {
             job_id: res.job_id,
             target_path: res.target_path,
@@ -67,7 +66,7 @@ impl JobHandler {
         let req: GetJobStatusRequest = ctx.parse_header()?;
         ctx.set_audit(Some(req.job_id.clone()), None);
 
-        let status = self.job_manager.get_job_status(&req.job_id)?;
+        let status = self.scheduler.get_job_status(&req.job_id)?;
         let response = GetJobStatusResponse {
             job_id: status.job_id,
             state: status.state as i32,
@@ -89,7 +88,7 @@ impl JobHandler {
         let job_id = req.job_id;
         ctx.set_audit(Some(job_id.clone()), None);
 
-        self.job_manager.cancel_job(job_id.clone())?;
+        self.scheduler.cancel_job(&job_id)?;
 
         ctx.response(CancelJobResponse {})
     }
@@ -104,9 +103,9 @@ impl JobHandler {
         ctx.set_audit(Some(job_id.clone()), None);
 
         // Process task reports - use block_on to call async method
-        self.job_manager.update_progress(
-            req.job_id,
-            req.task_id,
+        self.scheduler.report_task(
+            &req.job_id,
+            &req.task_id,
             ProtoUtils::work_progress_from_pb(req.report),
         )?;
 

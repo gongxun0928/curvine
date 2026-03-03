@@ -24,7 +24,10 @@ use curvine_common::state::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_server::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use curvine_server::master::journal::JournalSystem;
 use curvine_server::master::replication::master_replication_manager::MasterReplicationManager;
-use curvine_server::master::{JobHandler, JobManager, Master, MasterHandler, RpcContext};
+use curvine_server::master::{
+    InProcessJobScheduler, JobHandler, JobManager, Master, MasterHandler, RpcContext,
+    SyncJobScheduler,
+};
 use orpc::common::LocalTime;
 use orpc::common::Utils;
 use orpc::message::Builder;
@@ -83,13 +86,14 @@ fn new_handler() -> MasterHandler {
         rt.clone(),
         &conf,
     ));
+    let scheduler: SyncJobScheduler = Arc::new(InProcessJobScheduler::new(job_manager));
     MasterHandler::new(
         &conf,
         fs,
         retry_cache,
         None,
         mount_manager,
-        JobHandler::new(job_manager),
+        JobHandler::new(scheduler),
         replication_manager,
     )
 }

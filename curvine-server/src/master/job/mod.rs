@@ -18,6 +18,9 @@ pub use crate::master::job::job_manager::JobManager;
 mod job_handler;
 pub use job_handler::JobHandler;
 
+mod job_scheduler;
+pub use job_scheduler::*;
+
 mod job_worker_client;
 pub use self::job_worker_client::JobWorkerClient;
 
