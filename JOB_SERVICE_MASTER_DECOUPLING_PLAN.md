@@ -42,20 +42,14 @@
   - 任务状态更新触发快照刷新
   - 补充持久化 round-trip 单测
 
+- **Phase-3（已完成）**：引入 Scheduler 控制面接口层（同进程）  
+  commit: `12c9013`
+  - 新增 `JobScheduler` 抽象与 `InProcessJobScheduler` 实现
+  - `JobHandler` 从依赖 `JobManager` 改为依赖 `JobScheduler`
+  - Master Job RPC 路由保留不变，但控制面实现可替换
+  - 兼容现有测试与调用链（无外部 API 变更）
+
 ## 后续阶段计划（每阶段一个 commit）
-
-## Phase-3：引入 Scheduler 协议层（同进程，先不拆进程）
-
-目标：
-- 在代码层抽出 Scheduler 协议接口：
-  - Scheduler <- `SubmitJob/GetJobStatus/CancelJob`
-  - Scheduler -> Worker: `AcceptJob/CancelJobToNode`
-  - Worker -> Scheduler: `ReportJobEvent/CancelResponse`
-- Master 的 Job RPC 仅做转发，不再直接编排任务细节。
-
-验收：
-- 现有 CLI 与 SDK 无感知变更。
-- 回归测试通过，状态推进与现行为兼容。
 
 ## Phase-4：独立 Scheduler 进程化（边界真正落地）
 
