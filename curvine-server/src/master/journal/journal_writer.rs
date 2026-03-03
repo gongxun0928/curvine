@@ -27,14 +27,14 @@ use std::sync::{mpsc, Mutex};
 
 enum SenderAdapter {
     Bounded(SyncSender<JournalEntry>),
-    UnBounded(Sender<JournalEntry>),
+    UnBounded(parking_lot::Mutex<Sender<JournalEntry>>),
 }
 
 impl SenderAdapter {
     fn send(&self, entry: JournalEntry) -> Result<(), SendError<JournalEntry>> {
         match self {
             SenderAdapter::Bounded(s) => s.send(entry),
-            SenderAdapter::UnBounded(s) => s.send(entry),
+            SenderAdapter::UnBounded(s) => s.lock().send(entry),
         }
     }
 }
@@ -52,7 +52,7 @@ impl JournalWriter {
     pub fn new(testing: bool, client: RaftClient, conf: &JournalConf) -> Self {
         let (sender, receiver) = if conf.writer_channel_size == 0 {
             let (sender, receiver) = mpsc::channel();
-            (SenderAdapter::UnBounded(sender), receiver)
+            (SenderAdapter::UnBounded(parking_lot::Mutex::new(sender)), receiver)
         } else {
             let (sender, receiver) = mpsc::sync_channel(conf.writer_channel_size);
             (SenderAdapter::Bounded(sender), receiver)

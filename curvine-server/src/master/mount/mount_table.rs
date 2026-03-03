@@ -137,7 +137,7 @@ impl MountTable {
         let info = mnt_opt.clone().to_info(mount_id, cv_path, ufs_path);
         self.unprotected_add_mount(info.clone())?;
 
-        let mut fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.write();
         fs_dir.store_mount(info, true)?;
         Ok(())
     }
@@ -171,7 +171,7 @@ impl MountTable {
         inner.mountpath2id.remove(mount_path);
         inner.mountid2entry.remove(&mount_id);
 
-        let mut fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.write();
         fs_dir.unmount(mount_id)?;
 
         Ok(())

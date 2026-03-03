@@ -26,6 +26,7 @@ use curvine_common::state::{
     BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileLock, FileStatus,
     MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, WorkerAddress,
 };
+use crate::master::meta::lock_pool::InodeLockPool;
 use curvine_common::FsResult;
 use log::{info, warn};
 use orpc::common::{LocalTime, TimeSpent};
@@ -41,6 +42,7 @@ pub struct FsDir {
     pub(crate) store: InodeStore,
     pub(crate) journal_writer: JournalWriter,
     pub(crate) evictor: Arc<dyn Evictor>,
+    pub(crate) lock_pool: InodeLockPool,
 }
 
 impl FsDir {
@@ -62,6 +64,7 @@ impl FsDir {
             store: state,
             journal_writer,
             evictor,
+            lock_pool: InodeLockPool::new(),
         };
         fs_dir.update_last_inode_id(last_inode_id)?;
 
@@ -95,7 +98,7 @@ impl FsDir {
         self.store.get_ttl_bucket_list()
     }
 
-    pub fn mkdir(&mut self, mut inp: InodePath, opts: MkdirOpts) -> FsResult<InodePath> {
+    pub fn mkdir(&self, mut inp: InodePath, opts: MkdirOpts) -> FsResult<InodePath> {
         // Create parent directory
         inp = self.create_parent_dir(inp, opts.parent_opts())?;
 
@@ -107,7 +110,7 @@ impl FsDir {
     // Create the first subdirectory that does not exist.
     // 1. If all directories on the path already exist, skip and return successful.
     // 2. If the parent directory does not exist, an error is returned.
-    fn create_single_dir(&mut self, mut inp: InodePath, opts: MkdirOpts) -> FsResult<InodePath> {
+    fn create_single_dir(&self, mut inp: InodePath, opts: MkdirOpts) -> FsResult<InodePath> {
         let op_ms = LocalTime::mills();
 
         if inp.is_full() || inp.is_root() {
@@ -128,7 +131,7 @@ impl FsDir {
     }
 
     // Create all previous directories that may be missing on the path.
-    fn create_parent_dir(&mut self, mut inp: InodePath, opts: MkdirOpts) -> FsResult<InodePath> {
+    fn create_parent_dir(&self, mut inp: InodePath, opts: MkdirOpts) -> FsResult<InodePath> {
         let mut index = inp.existing_len();
 
         // The parent directory already exists and does not need to be created.
@@ -145,7 +148,7 @@ impl FsDir {
     }
 
     // Delete files or directories
-    pub fn delete(&mut self, inp: &InodePath, recursive: bool) -> FsResult<DeleteResult> {
+    pub fn delete(&self, inp: &InodePath, recursive: bool) -> FsResult<DeleteResult> {
         let op_ms = LocalTime::mills();
 
         if inp.is_root() {
@@ -168,7 +171,7 @@ impl FsDir {
     }
 
     pub(crate) fn unprotected_delete(
-        &mut self,
+        &self,
         inp: &InodePath,
         mtime: i64,
     ) -> FsResult<DeleteResult> {
@@ -219,7 +222,7 @@ impl FsDir {
     }
 
     pub fn rename(
-        &mut self,
+        &self,
         src_inp: &InodePath,
         dst_inp: &InodePath,
         flags: RenameFlags,
@@ -237,7 +240,7 @@ impl FsDir {
     }
 
     pub(crate) fn unprotected_rename(
-        &mut self,
+        &self,
         src_inp: &InodePath,
         dst_inp: &InodePath,
         mtime: i64,
@@ -309,7 +312,7 @@ impl FsDir {
         Ok(del_res)
     }
 
-    pub fn create_file(&mut self, mut inp: InodePath, opts: CreateFileOpts) -> FsResult<InodePath> {
+    pub fn create_file(&self, mut inp: InodePath, opts: CreateFileOpts) -> FsResult<InodePath> {
         let op_ms = LocalTime::mills();
         if inp.get_last_inode().is_some() {
             return err_ext!(FsError::file_exists(inp.path()));
@@ -328,7 +331,7 @@ impl FsDir {
     }
 
     pub(crate) fn add_last_inode(
-        &mut self,
+        &self,
         mut inp: InodePath,
         child: InodeView,
     ) -> FsResult<InodePath> {
@@ -419,7 +422,7 @@ impl FsDir {
     }
 
     pub fn acquire_new_block(
-        &mut self,
+        &self,
         inp: &InodePath,
         commit_blocks: Vec<CommitBlock>,
         choose_workers: &[WorkerAddress],
@@ -457,7 +460,7 @@ impl FsDir {
     }
 
     pub fn complete_file(
-        &mut self,
+        &self,
         inp: &InodePath,
         len: i64,
         commit_block: Vec<CommitBlock>,
@@ -502,7 +505,7 @@ impl FsDir {
     }
 
     pub fn reopen_file(
-        &mut self,
+        &self,
         inp: &InodePath,
         client_name: impl AsRef<str>,
     ) -> FsResult<FileStatus> {
@@ -560,7 +563,7 @@ impl FsDir {
     /// If file doesn't exist, create a new one.
     /// Returns DeleteResult containing blocks that need to be removed from workers.
     pub fn overwrite_file(
-        &mut self,
+        &self,
         inp: &InodePath,
         opts: CreateFileOpts,
     ) -> FsResult<DeleteResult> {
@@ -672,7 +675,7 @@ impl FsDir {
         self.store.get_file_counts()
     }
 
-    pub fn block_report(&mut self, blocks: Vec<(bool, i64, BlockLocation)>) -> FsResult<()> {
+    pub fn block_report(&self, blocks: Vec<(bool, i64, BlockLocation)>) -> FsResult<()> {
         let mut batch = self.store.new_batch();
         for (add, id, loc) in blocks {
             if add {
@@ -700,7 +703,7 @@ impl FsDir {
         self.journal_writer.take_entries()
     }
 
-    pub fn store_mount(&mut self, info: MountInfo, send_log: bool) -> FsResult<()> {
+    pub fn store_mount(&self, info: MountInfo, send_log: bool) -> FsResult<()> {
         // Create parent directory
         let op_ms = LocalTime::mills();
         self.store.store.add_mountpoint(info.mount_id, &info)?;
@@ -712,12 +715,12 @@ impl FsDir {
         Ok(())
     }
 
-    pub fn unprotected_store_mount(&mut self, info: MountInfo) -> FsResult<()> {
+    pub fn unprotected_store_mount(&self, info: MountInfo) -> FsResult<()> {
         self.store.store.add_mountpoint(info.mount_id, &info)?;
         Ok(())
     }
 
-    pub fn unmount(&mut self, id: u32) -> FsResult<()> {
+    pub fn unmount(&self, id: u32) -> FsResult<()> {
         // Create parent directory
         let op_ms = LocalTime::mills();
         self.store.store.remove_mountpoint(id)?;
@@ -725,7 +728,7 @@ impl FsDir {
         Ok(())
     }
 
-    pub fn unprotected_unmount(&mut self, id: u32) -> FsResult<()> {
+    pub fn unprotected_unmount(&self, id: u32) -> FsResult<()> {
         self.store.store.remove_mountpoint(id)?;
         Ok(())
     }
@@ -738,7 +741,7 @@ impl FsDir {
         self.store.get_mount_point(id)
     }
 
-    pub fn set_attr(&mut self, inp: InodePath, opts: SetAttrOpts) -> FsResult<FileStatus> {
+    pub fn set_attr(&self, inp: InodePath, opts: SetAttrOpts) -> FsResult<FileStatus> {
         let op_ms = LocalTime::mills();
 
         let inode = match inp.get_last_inode() {
@@ -751,7 +754,7 @@ impl FsDir {
         Ok(inode.to_file_status(inp.path()))
     }
 
-    pub fn unprotected_set_attr(&mut self, inode: InodePtr, opts: SetAttrOpts) -> FsResult<()> {
+    pub fn unprotected_set_attr(&self, inode: InodePtr, opts: SetAttrOpts) -> FsResult<()> {
         let child_opts = opts.child_opts();
         let recursive = opts.recursive;
         let parent_inode_id = inode.id();
@@ -796,7 +799,7 @@ impl FsDir {
     }
 
     pub fn symlink(
-        &mut self,
+        &self,
         target: String,
         link: InodePath,
         force: bool,
@@ -813,7 +816,7 @@ impl FsDir {
     }
 
     pub fn unprotected_symlink(
-        &mut self,
+        &self,
         mut link: InodePath,
         new_inode: InodeFile,
         force: bool,
@@ -854,7 +857,7 @@ impl FsDir {
     }
 
     // Create a link to an existing file
-    pub fn link(&mut self, src_path: InodePath, dst_path: InodePath) -> FsResult<()> {
+    pub fn link(&self, src_path: InodePath, dst_path: InodePath) -> FsResult<()> {
         let op_ms = LocalTime::mills();
 
         // Get the original inode ID and update nlink in memory if it's a direct File
@@ -892,7 +895,7 @@ impl FsDir {
     }
 
     pub fn unprotected_link(
-        &mut self,
+        &self,
         mut new_path: InodePath,
         original_inode_id: i64,
         op_ms: u64,
@@ -945,7 +948,7 @@ impl FsDir {
     /// 2. Complete the file operation to update metadata state
     /// 3. Collect locations of blocks to be deleted
     /// 4. Persist changes to store and write journal entry
-    pub fn resize(&mut self, inp: &InodePath, opts: FileAllocOpts) -> FsResult<DeleteResult> {
+    pub fn resize(&self, inp: &InodePath, opts: FileAllocOpts) -> FsResult<DeleteResult> {
         let op_ms = LocalTime::mills();
 
         let mut inode = match inp.get_last_inode() {
@@ -977,7 +980,7 @@ impl FsDir {
     }
 
     pub fn assign_worker(
-        &mut self,
+        &self,
         inp: InodePath,
         block_id: i64,
         workers: &[WorkerAddress],
