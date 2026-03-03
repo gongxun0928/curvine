@@ -166,7 +166,7 @@ impl LoadJobRunner {
                 );
 
                 let tasks = job_context.tasks.clone();
-                self.jobs.insert(job_id, job_context);
+                self.jobs.insert_job(job_id, job_context);
                 // @todo Whether to cancel some tasks that may have been dispatched.
                 self.submit_all_task(tasks).await?;
                 self.jobs.update_state(

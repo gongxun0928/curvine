@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::JobContext;
+use crate::master::{JobContext, JobPersistence};
 use curvine_common::state::{JobTaskProgress, JobTaskState};
 use curvine_common::FsResult;
+use log::{info, warn};
 use orpc::err_box;
 use orpc::sync::FastDashMap;
 use std::collections::HashMap;
@@ -57,6 +58,7 @@ impl JobCallback {
 pub struct JobStore {
     jobs: Arc<FastDashMap<String, JobContext>>,
     callbacks: Arc<RwLock<HashMap<String, Vec<JobCallback>>>>,
+    persistence: Option<Arc<JobPersistence>>,
 }
 
 impl Default for JobStore {
@@ -70,7 +72,78 @@ impl JobStore {
         JobStore {
             jobs: Arc::new(FastDashMap::default()),
             callbacks: Arc::new(RwLock::new(HashMap::new())),
+            persistence: None,
         }
+    }
+
+    pub fn with_persistence(persistence: Arc<JobPersistence>) -> Self {
+        let store = JobStore {
+            jobs: Arc::new(FastDashMap::default()),
+            callbacks: Arc::new(RwLock::new(HashMap::new())),
+            persistence: Some(persistence.clone()),
+        };
+
+        match persistence.load() {
+            Ok(jobs) => {
+                if !jobs.is_empty() {
+                    info!(
+                        "Restore {} jobs from snapshot {}",
+                        jobs.len(),
+                        persistence.path().display()
+                    );
+                    store.restore_jobs(jobs);
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Load jobs snapshot {} failed: {}",
+                    persistence.path().display(),
+                    e
+                );
+            }
+        }
+
+        store
+    }
+
+    fn restore_jobs(&self, jobs: Vec<JobContext>) {
+        for job in jobs {
+            self.jobs.insert(job.info.job_id.clone(), job);
+        }
+    }
+
+    fn persist_all_jobs(&self) {
+        let Some(persistence) = &self.persistence else {
+            return;
+        };
+
+        let jobs: Vec<JobContext> = self
+            .jobs
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+        if let Err(e) = persistence.save(&jobs) {
+            warn!(
+                "Persist jobs snapshot {} failed: {}",
+                persistence.path().display(),
+                e
+            );
+        }
+    }
+
+    pub fn insert_job(&self, job_id: String, job: JobContext) {
+        self.jobs.insert(job_id, job);
+        self.persist_all_jobs();
+    }
+
+    pub fn remove_job(&self, job_id: impl AsRef<str>) -> Option<(String, JobContext)> {
+        let job_id = job_id.as_ref();
+        let removed = self.jobs.remove(job_id);
+        self.remove_callbacks(job_id);
+        if removed.is_some() {
+            self.persist_all_jobs();
+        }
+        removed
     }
 
     pub fn register_callback(&self, job_id: String, callback: JobCallback) {
@@ -134,6 +207,10 @@ impl JobStore {
             drop(job);
 
             self.trigger_callbacks(&job_id_owned, old_state, new_state, &job_clone);
+            self.persist_all_jobs();
+        } else {
+            drop(job);
+            self.persist_all_jobs();
         }
 
         Ok(())
@@ -153,6 +230,10 @@ impl JobStore {
                 drop(job);
 
                 self.trigger_callbacks(job_id, old_state, new_state, &job_clone);
+                self.persist_all_jobs();
+            } else {
+                drop(job);
+                self.persist_all_jobs();
             }
         }
     }

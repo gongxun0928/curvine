@@ -27,5 +27,8 @@ pub use job_store::JobStore;
 mod job_context;
 pub use self::job_context::*;
 
+mod job_persistence;
+pub use self::job_persistence::JobPersistence;
+
 mod job_runner;
 pub use self::job_runner::LoadJobRunner;

@@ -14,7 +14,7 @@
 
 use crate::common::UfsFactory;
 use crate::master::fs::MasterFilesystem;
-use crate::master::{JobStore, LoadJobRunner, MountManager};
+use crate::master::{JobPersistence, JobStore, LoadJobRunner, MountManager};
 use core::time::Duration;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
@@ -29,6 +29,7 @@ use orpc::common::LocalTime;
 use orpc::runtime::{LoopTask, RpcRuntime, Runtime};
 use orpc::sync::channel::BlockingChannel;
 use orpc::{err_box, err_ext};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Load the Task Manager
@@ -51,10 +52,14 @@ impl JobManager {
         conf: &ClusterConf,
     ) -> Self {
         let factory = Arc::new(UfsFactory::with_rt(&conf.client, rt.clone()));
+        let snapshot_path = PathBuf::from(&conf.master.meta_dir)
+            .join("job")
+            .join("job_snapshot.json");
+        let persistence = Arc::new(JobPersistence::new(snapshot_path));
 
         Self {
             rt,
-            jobs: JobStore::new(),
+            jobs: JobStore::with_persistence(persistence),
             master_fs,
             factory,
             mount_manager,
@@ -224,7 +229,7 @@ impl LoopTask for JobCleanupTask {
         }
 
         for job_id in jobs_to_remove {
-            if let Some(v) = self.jobs.remove(&job_id) {
+            if let Some(v) = self.jobs.remove_job(&job_id) {
                 info!("Removing expired job: {:?}", v.1.info);
             }
         }
