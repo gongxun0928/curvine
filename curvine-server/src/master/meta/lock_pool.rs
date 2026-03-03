@@ -106,8 +106,8 @@ pub struct PathLockGuard<'a> {
 }
 
 enum LockGuard<'a> {
-    Read(RwLockReadGuard<'a, ()>),
-    Write(RwLockWriteGuard<'a, ()>),
+    Read(#[allow(dead_code)] RwLockReadGuard<'a, ()>),
+    Write(#[allow(dead_code)] RwLockWriteGuard<'a, ()>),
 }
 
 impl<'a> PathLockGuard<'a> {

@@ -81,13 +81,13 @@ impl MasterFilesystem {
     }
 
     pub fn print_tree(&self) {
-        let fs_dir = self.fs_dir.read();
+        let fs_dir = self.fs_dir.get_ref();
         fs_dir.print_tree();
     }
 
     pub fn mkdir_with_opts<T: AsRef<str>>(&self, path: T, opts: MkdirOpts) -> FsResult<FileStatus> {
-        let fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+        let fs_dir = self.fs_dir.get_ref();
+        let inp = Self::resolve_path(fs_dir, path.as_ref())?;
 
         // Creation of root directory is not allowed
         if inp.is_root() {
@@ -126,9 +126,12 @@ impl MasterFilesystem {
     }
 
     pub fn delete<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<bool> {
-        let fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+        let fs_dir = self.fs_dir.get_ref();
+        let inp = Self::resolve_path(fs_dir, path.as_ref())?;
 
+        // Path write lock on parent directory
+        let _parent_lock = inp.get_inode(-2)
+            .map(|parent| fs_dir.lock_pool.write(parent.id()));
         let delete_result = fs_dir.delete(&inp, recursive)?;
 
         let mut worker_manager = self.worker_manager.write();
@@ -218,8 +221,8 @@ impl MasterFilesystem {
             );
         }
 
-        let fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path)?;
+        let fs_dir = self.fs_dir.get_ref();
+        let inp = Self::resolve_path(fs_dir, path)?;
 
         let last_inode = inp.get_last_inode();
         if let Some(inode) = &last_inode {
@@ -236,9 +239,13 @@ impl MasterFilesystem {
             Self::check_parent(&inp)?;
         }
 
+        // Path write lock on parent
+        let parent_id = inp.get_inode(-2).map(|p| p.id()).unwrap_or(inp.get_inode(0).unwrap().id());
+        let _parent_lock = fs_dir.lock_pool.write(parent_id);
+
         let inp = if last_inode.is_some() {
             if flags.overwrite() {
-                self.truncate(&fs_dir, &inp, opts)?;
+                self.truncate(fs_dir, &inp, opts)?;
             } else {
                 return err_ext!(FsError::file_exists(inp.path()));
             }
@@ -270,13 +277,12 @@ impl MasterFilesystem {
             return self.get_block_locations(path);
         }
 
-        let fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path)?;
+        let fs_dir = self.fs_dir.get_ref();
+        let inp = Self::resolve_path(fs_dir, path)?;
 
         let inode = match inp.get_last_inode() {
             None => {
                 return if flags.create() {
-                    drop(fs_dir);
                     let status = self.create_with_opts(path, opts, flags)?;
                     Ok(FileBlocks::new(status, vec![]))
                 } else {
@@ -292,8 +298,12 @@ impl MasterFilesystem {
             }
         };
 
+        // Path write lock on parent for truncate/reopen
+        let _parent_lock = inp.get_inode(-2)
+            .map(|parent| fs_dir.lock_pool.write(parent.id()));
+
         if flags.truncate() {
-            self.truncate(&fs_dir, &inp, opts)?;
+            self.truncate(fs_dir, &inp, opts)?;
             let status = fs_dir.file_status(&inp)?;
             return Ok(FileBlocks::new(status, vec![]));
         }
@@ -301,7 +311,7 @@ impl MasterFilesystem {
         let status = fs_dir.reopen_file(&inp, opts.client_name)?;
         let file = inode.as_file_ref()?;
         let blocks = if !file.blocks.is_empty() {
-            self.get_block_locs(path, &fs_dir, file)?
+            self.get_block_locs(path, fs_dir, file)?
         } else {
             vec![]
         };
@@ -309,7 +319,7 @@ impl MasterFilesystem {
     }
 
     pub fn file_status<T: AsRef<str>>(&self, path: T) -> FsResult<FileStatus> {
-        let fs_dir = self.fs_dir.as_ref();
+        let fs_dir = self.fs_dir.get_ref();
         let inp = Self::resolve_path(fs_dir, path.as_ref())?;
         let _guard = inp.get_last_inode()
             .map(|inode| fs_dir.lock_pool.read(inode.id()));
@@ -318,7 +328,7 @@ impl MasterFilesystem {
     }
 
     pub fn exists<T: AsRef<str>>(&self, path: T) -> FsResult<bool> {
-        let fs_dir = self.fs_dir.as_ref();
+        let fs_dir = self.fs_dir.get_ref();
         let inp = Self::resolve_path(fs_dir, path.as_ref())?;
         let _guard = inp.get_last_inode()
             .map(|inode| fs_dir.lock_pool.read(inode.id()));
@@ -326,7 +336,7 @@ impl MasterFilesystem {
     }
 
     pub fn list_status<T: AsRef<str>>(&self, path: T) -> FsResult<Vec<FileStatus>> {
-        let fs_dir = self.fs_dir.as_ref();
+        let fs_dir = self.fs_dir.get_ref();
         let (is_glob_pattern, _) = parse_glob_pattern(path.as_ref());
         if is_glob_pattern {
             let paths = Self::resolve_path_by_glob_pattern(fs_dir, path.as_ref())?;
@@ -551,7 +561,7 @@ impl MasterFilesystem {
     }
 
     pub fn get_block_locations<T: AsRef<str>>(&self, path: T) -> FsResult<FileBlocks> {
-        let fs_dir = self.fs_dir.as_ref();
+        let fs_dir = self.fs_dir.get_ref();
         let path = path.as_ref();
         let inp = Self::resolve_path(fs_dir, path)?;
 

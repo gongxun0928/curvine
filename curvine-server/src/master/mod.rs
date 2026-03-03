@@ -108,7 +108,7 @@ impl SyncFsDir {
 
     /// Access FsDir WITHOUT global lock. Caller MUST use path locks
     /// from `FsDir.lock_pool` to protect concurrent access.
-    pub fn as_ref(&self) -> &FsDir {
+    pub fn get_ref(&self) -> &FsDir {
         unsafe { &*self.inner.fs_dir.get() }
     }
 }
