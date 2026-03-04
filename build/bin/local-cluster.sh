@@ -52,6 +52,44 @@ print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+is_remote_scheduler_enabled() {
+    if [ ! -f "$CURVINE_CONF_FILE" ]; then
+        echo "false"
+        return
+    fi
+
+    awk '
+        BEGIN { in_job = 0; enabled = "false" }
+        /^\[job\]/ { in_job = 1; next }
+        /^\[/ { in_job = 0 }
+        in_job && $1 ~ /^enable_remote_scheduler/ {
+            gsub(/[[:space:]]/, "", $0);
+            split($0, kv, "=");
+            if (tolower(kv[2]) == "true") {
+                enabled = "true";
+            }
+            print enabled;
+            exit;
+        }
+        END {
+            if (NR > 0 && enabled == "false") {
+                print "false";
+            }
+        }
+    ' "$CURVINE_CONF_FILE" | tail -n 1
+}
+
+setup_services() {
+    local remote_enabled
+    remote_enabled=$(is_remote_scheduler_enabled)
+    if [ "$remote_enabled" = "true" ]; then
+        SERVICES=("scheduler" "master" "worker")
+        print_info "Remote scheduler mode detected, services: scheduler master worker"
+    else
+        SERVICES=("master" "worker")
+    fi
+}
+
 # Check service status
 check_service_status() {
     local service=$1
@@ -74,6 +112,7 @@ check_service_status() {
 
 # Start all services
 start_all() {
+    setup_services
     print_info "Starting Curvine local cluster..."
     
     # Check if there is already a service running
@@ -105,6 +144,7 @@ start_all() {
 
 # Stop all services
 stop_all() {
+    setup_services
     print_info "Stopping Curvine local cluster..."
     
     # Stop service in reverse order
@@ -122,16 +162,19 @@ stop_all() {
             local pid=$(cat "$CURVINE_HOME/${service}.pid")
             if kill -0 "$pid" > /dev/null 2>&1; then
                 print_warn "$service is still running (PID: $pid)"
-                Still_running=true
+                still_running=true
             fi
         fi
     done
     
     if [ "$still_running" = true ] && [ "$1" = "force" ]; then
         print_warn "Force killing remaining processes..."
-        pkill -9 -f "curvine"
         for service in "${SERVICES[@]}"; do
             if [ -f "$CURVINE_HOME/${service}.pid" ]; then
+                pid=$(cat "$CURVINE_HOME/${service}.pid")
+                if kill -0 "$pid" > /dev/null 2>&1; then
+                    kill -9 "$pid" > /dev/null 2>&1
+                fi
                 rm -f "$CURVINE_HOME/${service}.pid"
             fi
         done
@@ -150,6 +193,7 @@ restart_all() {
 
 # Show all service status
 show_status() {
+    setup_services
     print_info "Curvine local cluster status:"
     echo "-----------------------------------"
     

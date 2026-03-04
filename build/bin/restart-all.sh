@@ -17,6 +17,9 @@
 
 # Get the absolute path to the directory where the script is located
 BIN_DIR="$(cd "`dirname "$0"`"; pwd)"
+CURVINE_HOME="$(cd "$BIN_DIR/.."; pwd)"
+
+. "$CURVINE_HOME/conf/curvine-env.sh"
 
 # Close all services and restart.
 
@@ -40,17 +43,47 @@ wait_for_process() {
     return 1
 }
 
+is_remote_scheduler_enabled() {
+    if [ ! -f "$CURVINE_CONF_FILE" ]; then
+        echo "false"
+        return
+    fi
+
+    awk '
+        BEGIN { in_job = 0; enabled = "false" }
+        /^\[job\]/ { in_job = 1; next }
+        /^\[/ { in_job = 0 }
+        in_job && $1 ~ /^enable_remote_scheduler/ {
+            gsub(/[[:space:]]/, "", $0);
+            split($0, kv, "=");
+            if (tolower(kv[2]) == "true") {
+                enabled = "true";
+            }
+            print enabled;
+            exit;
+        }
+        END {
+            if (NR > 0 && enabled == "false") {
+                print "false";
+            }
+        }
+    ' "$CURVINE_CONF_FILE" | tail -n 1
+}
+
 umount -l /curvine-fuse
-pkill -9 -f "curvine"
+"${BIN_DIR}/curvine-fuse.sh" stop > /dev/null 2>&1
+"${BIN_DIR}/local-cluster.sh" stop force
 
 # Wait a moment for processes to be killed
 sleep 3
 
-# Start master and worker services
-${BIN_DIR}/curvine-master.sh start
-${BIN_DIR}/curvine-worker.sh start
+# Start cluster services
+"${BIN_DIR}/local-cluster.sh" start force
 
-# Wait for master and worker to start
+# Wait for services to start
+if [ "$(is_remote_scheduler_enabled)" = "true" ]; then
+wait_for_process "scheduler"
+fi
 wait_for_process "master"
 wait_for_process "worker"
 

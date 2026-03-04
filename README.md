@@ -154,6 +154,9 @@ bin/curvine-master.sh start
 
 # Start the worker node
 bin/curvine-worker.sh start
+
+# Optional: when [job].enable_remote_scheduler=true, also start scheduler
+bin/curvine-scheduler.sh start
 ```
 
 Mount the file system

@@ -37,6 +37,15 @@ data_dir = [
 log = { level = "info", log_dir = "stdout", file_name = "worker.log" }
 enable_s3_gateway = false
 
+# Job scheduling configuration
+[job]
+# Enable forwarding job control-plane RPC from Master to external Scheduler.
+enable_remote_scheduler = false
+# If empty, Scheduler hostname defaults to [master].hostname.
+scheduler_hostname = ""
+# Scheduler RPC port when running `curvine-server --service scheduler`.
+scheduler_rpc_port = 8998
+
 
 # Customer service configuration.
 [client]

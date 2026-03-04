@@ -182,6 +182,9 @@ bin/curvine-master.sh start
 
 # Start the worker node
 bin/curvine-worker.sh start
+
+# 可选：当 [job].enable_remote_scheduler=true 时，还需启动 scheduler
+bin/curvine-scheduler.sh start
 ```
 
 挂载文件系统

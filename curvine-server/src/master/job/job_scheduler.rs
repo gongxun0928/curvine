@@ -14,6 +14,7 @@
 
 use crate::master::JobManager;
 use curvine_common::conf::ClusterConf;
+use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     CancelJobRequest, CancelJobResponse, GetJobStatusRequest, GetJobStatusResponse,
@@ -91,7 +92,8 @@ impl RemoteJobScheduler {
         R: PMessage + Default,
     {
         let msg = Builder::new_rpc(code).proto_header(header).build();
-        let rep = self.client.rpc_check(msg)?;
+        let rep = self.client.rpc(msg)?;
+        rep.check_error_ext::<FsError>()?;
         Ok(rep.parse_header()?)
     }
 }

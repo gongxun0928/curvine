@@ -56,6 +56,12 @@
   - 配置开关：`job.enable_remote_scheduler` + `job.scheduler_hostname` + `job.scheduler_rpc_port`
   - 远端模式下 Master 跳过本地 JobManager 和 TTL 调度，避免双写控制面
 
+- **Phase-4.1（已完成）**：拆分运行闭环与运维入口补齐  
+  - 增加运维脚本：`curvine-scheduler.sh`，并让 `local-cluster.sh/restart-all.sh` 自动识别远端模式启动/停止 scheduler
+  - 配置样例与文档补齐：`etc/curvine-cluster.toml` 新增 `[job]` 远端调度配置示例
+  - 修复 `RemoteJobScheduler` 错误解码，保持 `FsError` 语义（不再把业务错误降级为 `IO`）
+  - 新增真实服务联通测试：`scheduler_split_test`（非 mock，验证远端 client 与真实 job handler 可互通）
+
 ## 后续阶段计划（每阶段一个 commit）
 
 ## Phase-5：Worker 事件模型升级（attempt/epoch fencing，可后置）
