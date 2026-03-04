@@ -15,7 +15,7 @@
 use crate::master::fs::context::ValidateAddBlock;
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
-use crate::master::meta::inode::{InodeFile, InodePath, InodeView, PATH_SEPARATOR};
+use crate::master::meta::inode::{InodeFile, InodePath, InodeView, PATH_SEPARATOR, ROOT_INODE_ID};
 use crate::master::meta::lock_pool::PathLockMode;
 use crate::master::meta::FsDir;
 
@@ -140,14 +140,6 @@ impl MasterFilesystem {
         let dst = dst.as_ref();
         let fs_dir = self.fs_dir.get_ref();
 
-        // First pass: resolve both paths with read locks to get parent IDs
-        let (src_inp, _src_guard) = fs_dir.resolve_with_locks(src, PathLockMode::ReadOnly)?;
-        let (dst_inp, _dst_guard) = fs_dir.resolve_with_locks(dst, PathLockMode::ReadOnly)?;
-
-        if src_inp.is_root() {
-            return err_box!("Cannot rename root path");
-        }
-
         if src == dst {
             return Ok(false);
         }
@@ -162,24 +154,20 @@ impl MasterFilesystem {
             }
         }
 
-        // Get parent IDs for write locking
-        let src_parent_id = src_inp.get_inode(-2).map(|p| p.id())
-            .unwrap_or(src_inp.get_inode(0).unwrap().id());
-        let dst_parent_id = dst_inp.get_inode(-2).map(|p| p.id())
-            .unwrap_or(dst_inp.get_inode(0).unwrap().id());
-
-        // Drop read guards before acquiring write locks to avoid deadlock
-        drop(_src_guard);
-        drop(_dst_guard);
-
-        // Acquire write locks on both parents in deadlock-free order
-        let _guards = fs_dir.lock_pool.write_two_ordered(src_parent_id, dst_parent_id);
-
-        // Re-resolve under write locks (tree may have changed)
+        // Serialize namespace mutations while resolving + applying rename.
+        // All path-based operations acquire at least a root read lock, so a
+        // root write lock prevents concurrent tree reshaping in this critical section.
+        let _namespace_guard = fs_dir.lock_pool.write(ROOT_INODE_ID);
         let src_inp = Self::resolve_path(fs_dir, src)?;
         let dst_inp = Self::resolve_path(fs_dir, dst)?;
+        if src_inp.is_root() {
+            return err_box!("Cannot rename root path");
+        }
 
-        if let Some(del_res) = fs_dir.rename(&src_inp, &dst_inp, flags)? {
+        let del_res = fs_dir.rename(&src_inp, &dst_inp, flags)?;
+        drop(_namespace_guard);
+
+        if let Some(del_res) = del_res {
             let mut worker_manager = self.worker_manager.write();
             worker_manager.remove_blocks(&del_res);
         }
@@ -342,7 +330,8 @@ impl MasterFilesystem {
             let paths = Self::resolve_path_by_glob_pattern(fs_dir, path.as_ref())?;
             let mut all_statuses = Vec::new();
             for path in &paths {
-                let _guard = path.get_last_inode()
+                let _guard = path
+                    .get_last_inode()
                     .map(|inode| fs_dir.lock_pool.read(inode.id()));
                 let statuses = fs_dir.list_status(path)?;
                 all_statuses.extend(statuses);
@@ -745,15 +734,7 @@ impl MasterFilesystem {
 
     pub fn link<T: AsRef<str>>(&self, src_path: T, dst_path: T) -> FsResult<()> {
         let fs_dir = self.fs_dir.get_ref();
-        let (src_path_resolved, _src_guard) = fs_dir.resolve_with_locks(src_path.as_ref(), PathLockMode::ReadOnly)?;
-        let (dst_path_resolved, _dst_guard) = fs_dir.resolve_with_locks(dst_path.as_ref(), PathLockMode::ReadOnly)?;
-        let src_parent_id = src_path_resolved.get_inode(-2).map(|p| p.id())
-            .unwrap_or(src_path_resolved.get_inode(0).unwrap().id());
-        let dst_parent_id = dst_path_resolved.get_inode(-2).map(|p| p.id())
-            .unwrap_or(dst_path_resolved.get_inode(0).unwrap().id());
-        drop(_src_guard);
-        drop(_dst_guard);
-        let _guards = fs_dir.lock_pool.write_two_ordered(src_parent_id, dst_parent_id);
+        let _namespace_guard = fs_dir.lock_pool.write(ROOT_INODE_ID);
         let src_path_resolved = Self::resolve_path(fs_dir, src_path.as_ref())?;
         let dst_path_resolved = Self::resolve_path(fs_dir, dst_path.as_ref())?;
         fs_dir.link(src_path_resolved, dst_path_resolved)
