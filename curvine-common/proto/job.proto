@@ -17,6 +17,18 @@ enum JobTaskStateProto {
   CANCELED = 5;
 }
 
+// Job-level state for the Scheduler architecture
+enum JobStateProto {
+  JOB_PENDING = 0;
+  JOB_DISPATCHING = 1;
+  JOB_RUNNING = 2;
+  JOB_COMPLETED = 3;
+  JOB_FAILED = 4;
+  JOB_CANCELING = 5;
+  JOB_CANCELED = 6;
+  JOB_CANCEL_FAILED = 7;
+}
+
 enum JobTaskTypeProto {
   LOAD = 1;
 }
@@ -29,6 +41,8 @@ message JobTaskProgressProto {
   required string message = 5;
 }
 
+
+// ========== Client <-> Scheduler API (external) ==========
 
 // Submit a load job request
 message SubmitJobRequest {
@@ -66,6 +80,9 @@ message GetJobStatusResponse {
 
 }
 
+
+// ========== Legacy Master <-> Worker API ==========
+
 message SubmitTaskRequest {
   required JobTaskTypeProto task_type = 1;
   required bytes task_command = 2;
@@ -82,4 +99,45 @@ message TaskReportRequest {
 }
 
 message TaskReportResponse {
+}
+
+
+// ========== Scheduler <-> TaskNode (Worker) API (internal) ==========
+
+// Scheduler dispatches a whole job to a worker node
+message AcceptJobRequest {
+  required string job_id = 1;
+  required JobTaskTypeProto job_type = 2;
+  required uint64 epoch = 3;
+  required uint32 attempt = 4;
+  required bytes job_command = 5;
+}
+
+message AcceptJobResponse {
+  required bool accepted = 1;
+  optional string reason = 2;
+}
+
+// Scheduler sends cancel to a specific worker node
+message CancelJobToNodeRequest {
+  required string job_id = 1;
+  required uint64 epoch = 2;
+}
+
+message CancelJobToNodeResponse {
+  required bool success = 1;
+  optional string reason = 2;
+}
+
+// Worker reports job event back to Scheduler
+message ReportJobEventRequest {
+  required string job_id = 1;
+  required uint64 epoch = 2;
+  required uint32 attempt = 3;
+  required JobStateProto state = 4;
+  required JobTaskProgressProto progress = 5;
+  optional string message = 6;
+}
+
+message ReportJobEventResponse {
 }

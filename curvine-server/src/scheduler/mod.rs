@@ -12,8 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod common;
-pub mod master;
-pub mod scheduler;
-pub mod test;
-pub mod worker;
+pub mod job_meta_store;
+pub mod scheduler_state;
+pub mod scheduler_handler;
+pub mod scheduler_worker_client;
+pub mod dispatcher;
+mod scheduler_server;
+
+pub use scheduler_server::Scheduler;
+pub use dispatcher::WorkerRegistry;

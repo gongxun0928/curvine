@@ -19,9 +19,10 @@ use crate::worker::task::TaskManager;
 use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::*;
-use curvine_common::state::LoadTaskInfo;
+use curvine_common::state::{LoadJobCommand, LoadTaskInfo};
 use curvine_common::utils::SerdeUtils;
 use curvine_common::FsResult;
+use log::info;
 use orpc::err_box;
 use orpc::handler::MessageHandler;
 use orpc::message::{Builder, Message, RequestStatus};
@@ -45,6 +46,10 @@ impl MessageHandler for WorkerHandler {
             RpcCode::SubmitTask => self.task_submit(msg),
 
             RpcCode::CancelJob => self.cancel_job(msg),
+
+            // New Scheduler -> Worker protocol
+            RpcCode::AcceptJob => self.accept_job(msg),
+            RpcCode::CancelJobToNode => self.cancel_job_to_node(msg),
 
             RpcCode::SubmitBlockReplicationJob => self.replication_handler.handle(msg),
 
@@ -112,5 +117,46 @@ impl WorkerHandler {
         let req: CancelJobRequest = msg.parse_header()?;
         self.task_manager.cancel_job(req.job_id)?;
         Ok(msg.success())
+    }
+
+    /// Handle AcceptJob from the Scheduler: accept a whole job for execution.
+    pub fn accept_job(&self, msg: &Message) -> FsResult<Message> {
+        let req: AcceptJobRequest = msg.parse_header()?;
+        let command: LoadJobCommand = SerdeUtils::deserialize(&req.job_command)?;
+
+        info!(
+            "AcceptJob: job_id={}, epoch={}, attempt={}",
+            req.job_id, req.epoch, req.attempt
+        );
+
+        // Store epoch/attempt for fencing (TaskManager can validate)
+        let accepted = self
+            .task_manager
+            .accept_scheduler_job(&req.job_id, req.epoch, req.attempt, command);
+
+        let response = AcceptJobResponse {
+            accepted: accepted.is_ok(),
+            reason: accepted.err().map(|e| e.to_string()),
+        };
+
+        Ok(Builder::success(msg).proto_header(response).build())
+    }
+
+    /// Handle CancelJobToNode from the Scheduler.
+    pub fn cancel_job_to_node(&self, msg: &Message) -> FsResult<Message> {
+        let req: CancelJobToNodeRequest = msg.parse_header()?;
+
+        info!(
+            "CancelJobToNode: job_id={}, epoch={}",
+            req.job_id, req.epoch
+        );
+
+        let result = self.task_manager.cancel_job(&req.job_id);
+        let response = CancelJobToNodeResponse {
+            success: result.is_ok(),
+            reason: result.err().map(|e| e.to_string()),
+        };
+
+        Ok(Builder::success(msg).proto_header(response).build())
     }
 }

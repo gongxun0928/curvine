@@ -14,7 +14,7 @@
 
 use crate::alloc::allocator_type_name;
 use crate::conf::CliConf;
-use crate::conf::{ClientConf, FuseConf, JobConf, JournalConf, MasterConf, WorkerConf};
+use crate::conf::{ClientConf, FuseConf, JobConf, JournalConf, MasterConf, SchedulerConf, WorkerConf};
 use crate::rocksdb::DBConf;
 use crate::version;
 use log::info;
@@ -60,6 +60,8 @@ pub struct ClusterConf {
 
     pub job: JobConf,
 
+    pub scheduler: SchedulerConf,
+
     pub cli: CliConf,
 }
 
@@ -100,6 +102,7 @@ impl ClusterConf {
         conf.client.init()?;
         conf.fuse.init()?;
         conf.job.init()?;
+        conf.scheduler.init()?;
 
         if conf.client.master_addrs.is_empty() {
             for peer in &mut conf.journal.journal_addrs {
@@ -291,6 +294,7 @@ impl Default for ClusterConf {
             fuse: FuseConf::default(),
             s3_gateway: Default::default(),
             job: Default::default(),
+            scheduler: Default::default(),
             cli: Default::default(),
         }
     }

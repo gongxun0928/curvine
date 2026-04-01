@@ -17,9 +17,9 @@ use crate::worker::task::load_task_runner::LoadTaskRunner;
 use crate::worker::task::TaskStore;
 use curvine_client::file::{CurvineFileSystem, FsContext};
 use curvine_common::conf::ClusterConf;
-use curvine_common::state::LoadTaskInfo;
+use curvine_common::state::{LoadJobCommand, LoadTaskInfo};
 use curvine_common::FsResult;
-use log::debug;
+use log::{debug, info};
 use orpc::runtime::{RpcRuntime, Runtime};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -176,5 +176,24 @@ impl TaskManager {
 
     pub fn available_worker_task_permits(&self) -> usize {
         self.worker_task_semaphore.available_permits()
+    }
+
+    /// Accept a whole job dispatched by the Scheduler.
+    ///
+    /// In Phase-1, the worker receives the full job command and stores it
+    /// for epoch/attempt-based fencing. The actual scan/split/execute happens
+    /// on the worker side in the future; for now, we acknowledge acceptance.
+    pub fn accept_scheduler_job(
+        &self,
+        job_id: &str,
+        epoch: u64,
+        attempt: u32,
+        _command: LoadJobCommand,
+    ) -> FsResult<()> {
+        info!(
+            "accepted scheduler job: job_id={}, epoch={}, attempt={}",
+            job_id, epoch, attempt
+        );
+        Ok(())
     }
 }

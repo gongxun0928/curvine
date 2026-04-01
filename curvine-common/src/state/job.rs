@@ -52,6 +52,85 @@ impl JobTaskState {
     }
 }
 
+/// Job-level state machine for the new Scheduler architecture.
+///
+/// Allowed transitions:
+///   Pending    -> Dispatching | Failed | Canceled
+///   Dispatching -> Dispatching | Running | Failed | Canceled | Canceling
+///   Running    -> Completed | Failed | Canceling
+///   Canceling  -> Canceled | CancelFailed | Completed
+///
+/// Terminal states: Completed, Failed, Canceled, CancelFailed
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    IntoPrimitive,
+    FromPrimitive,
+    Serialize,
+    Deserialize,
+    Default,
+)]
+#[repr(i8)]
+pub enum JobState {
+    #[default]
+    Pending = 0,
+    Dispatching = 1,
+    Running = 2,
+    Completed = 3,
+    Failed = 4,
+    Canceling = 5,
+    Canceled = 6,
+    CancelFailed = 7,
+}
+
+impl JobState {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            JobState::Completed | JobState::Failed | JobState::Canceled | JobState::CancelFailed
+        )
+    }
+
+    pub fn can_transition_to(&self, target: JobState) -> bool {
+        match self {
+            JobState::Pending => matches!(
+                target,
+                JobState::Dispatching | JobState::Failed | JobState::Canceled
+            ),
+            JobState::Dispatching => matches!(
+                target,
+                JobState::Dispatching
+                    | JobState::Running
+                    | JobState::Failed
+                    | JobState::Canceled
+                    | JobState::Canceling
+            ),
+            JobState::Running => matches!(
+                target,
+                JobState::Completed | JobState::Failed | JobState::Canceling
+            ),
+            JobState::Canceling => matches!(
+                target,
+                JobState::Canceled | JobState::CancelFailed | JobState::Completed
+            ),
+            // Terminal states: no further transitions
+            JobState::Completed | JobState::Failed | JobState::Canceled | JobState::CancelFailed => {
+                false
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for JobState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LoadJobResult {
     pub job_id: String,
@@ -113,7 +192,7 @@ impl JobStatus {
     }
 }
 
-#[derive(Default, Debug, Deserialize, Serialize)]
+#[derive(Default, Debug, Clone, Deserialize, Serialize)]
 pub struct LoadJobCommand {
     pub source_path: String,
     pub target_path: Option<String>,
@@ -215,6 +294,69 @@ pub struct LoadJobInfo {
     pub overwrite: Option<bool>,
 }
 
+/// Persisted job metadata for the Scheduler.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobMeta {
+    pub job_id: String,
+    pub job_type: JobTaskType,
+    pub client_request_id: String,
+    pub state: JobState,
+    pub epoch: u64,
+    pub attempt: u32,
+    pub source_path: String,
+    pub target_path: String,
+    pub assigned_worker: Option<WorkerAddress>,
+    pub create_time: i64,
+    pub update_time: i64,
+    pub message: String,
+    pub load_job_command: Option<LoadJobCommand>,
+    pub progress: JobTaskProgress,
+}
+
+impl JobMeta {
+    pub fn new(
+        job_id: String,
+        job_type: JobTaskType,
+        client_request_id: String,
+        source_path: String,
+        target_path: String,
+        command: LoadJobCommand,
+    ) -> Self {
+        let now = orpc::common::LocalTime::mills() as i64;
+        Self {
+            job_id,
+            job_type,
+            client_request_id,
+            state: JobState::Pending,
+            epoch: 1,
+            attempt: 0,
+            source_path,
+            target_path,
+            assigned_worker: None,
+            create_time: now,
+            update_time: now,
+            message: String::new(),
+            load_job_command: Some(command),
+            progress: JobTaskProgress::default(),
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        self.state.is_terminal()
+    }
+
+    pub fn try_transition(&mut self, target: JobState, message: impl Into<String>) -> bool {
+        if self.state.can_transition_to(target) {
+            self.state = target;
+            self.update_time = orpc::common::LocalTime::mills() as i64;
+            self.message = message.into();
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoadTaskInfo {
     pub job: LoadJobInfo,
@@ -290,5 +432,151 @@ impl JobTaskProgress {
                 ByteUnit::byte_to_string(total)
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_job_state_terminal() {
+        assert!(!JobState::Pending.is_terminal());
+        assert!(!JobState::Dispatching.is_terminal());
+        assert!(!JobState::Running.is_terminal());
+        assert!(!JobState::Canceling.is_terminal());
+
+        assert!(JobState::Completed.is_terminal());
+        assert!(JobState::Failed.is_terminal());
+        assert!(JobState::Canceled.is_terminal());
+        assert!(JobState::CancelFailed.is_terminal());
+    }
+
+    #[test]
+    fn test_pending_transitions() {
+        let s = JobState::Pending;
+        assert!(s.can_transition_to(JobState::Dispatching));
+        assert!(s.can_transition_to(JobState::Failed));
+        assert!(s.can_transition_to(JobState::Canceled));
+        assert!(!s.can_transition_to(JobState::Running));
+        assert!(!s.can_transition_to(JobState::Completed));
+        assert!(!s.can_transition_to(JobState::Canceling));
+        assert!(!s.can_transition_to(JobState::CancelFailed));
+    }
+
+    #[test]
+    fn test_dispatching_transitions() {
+        let s = JobState::Dispatching;
+        assert!(s.can_transition_to(JobState::Dispatching));
+        assert!(s.can_transition_to(JobState::Running));
+        assert!(s.can_transition_to(JobState::Failed));
+        assert!(s.can_transition_to(JobState::Canceled));
+        assert!(s.can_transition_to(JobState::Canceling));
+        assert!(!s.can_transition_to(JobState::Completed));
+        assert!(!s.can_transition_to(JobState::CancelFailed));
+    }
+
+    #[test]
+    fn test_running_transitions() {
+        let s = JobState::Running;
+        assert!(s.can_transition_to(JobState::Completed));
+        assert!(s.can_transition_to(JobState::Failed));
+        assert!(s.can_transition_to(JobState::Canceling));
+        assert!(!s.can_transition_to(JobState::Pending));
+        assert!(!s.can_transition_to(JobState::Dispatching));
+        assert!(!s.can_transition_to(JobState::Canceled));
+        assert!(!s.can_transition_to(JobState::CancelFailed));
+    }
+
+    #[test]
+    fn test_canceling_transitions() {
+        let s = JobState::Canceling;
+        assert!(s.can_transition_to(JobState::Canceled));
+        assert!(s.can_transition_to(JobState::CancelFailed));
+        assert!(s.can_transition_to(JobState::Completed));
+        assert!(!s.can_transition_to(JobState::Pending));
+        assert!(!s.can_transition_to(JobState::Dispatching));
+        assert!(!s.can_transition_to(JobState::Running));
+        assert!(!s.can_transition_to(JobState::Failed));
+    }
+
+    #[test]
+    fn test_terminal_states_no_transitions() {
+        for state in [
+            JobState::Completed,
+            JobState::Failed,
+            JobState::Canceled,
+            JobState::CancelFailed,
+        ] {
+            for target in [
+                JobState::Pending,
+                JobState::Dispatching,
+                JobState::Running,
+                JobState::Completed,
+                JobState::Failed,
+                JobState::Canceling,
+                JobState::Canceled,
+                JobState::CancelFailed,
+            ] {
+                assert!(
+                    !state.can_transition_to(target),
+                    "{:?} should not transition to {:?}",
+                    state,
+                    target
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_job_meta_try_transition() {
+        let cmd = LoadJobCommand::default();
+        let mut meta = JobMeta::new(
+            "test-job-1".to_string(),
+            JobTaskType::Load,
+            "req-1".to_string(),
+            "s3://bucket/path".to_string(),
+            "/cv/path".to_string(),
+            cmd,
+        );
+
+        assert_eq!(meta.state, JobState::Pending);
+
+        // Valid transition
+        assert!(meta.try_transition(JobState::Dispatching, "dispatching"));
+        assert_eq!(meta.state, JobState::Dispatching);
+
+        // Valid: Dispatching -> Running
+        assert!(meta.try_transition(JobState::Running, "running"));
+        assert_eq!(meta.state, JobState::Running);
+
+        // Valid: Running -> Completed
+        assert!(meta.try_transition(JobState::Completed, "done"));
+        assert_eq!(meta.state, JobState::Completed);
+
+        // Invalid: terminal state -> anything
+        assert!(!meta.try_transition(JobState::Pending, "reset"));
+        assert_eq!(meta.state, JobState::Completed);
+    }
+
+    #[test]
+    fn test_cancel_conflict_completed_wins() {
+        let cmd = LoadJobCommand::default();
+        let mut meta = JobMeta::new(
+            "test-job-2".to_string(),
+            JobTaskType::Load,
+            "req-2".to_string(),
+            "s3://bucket/path".to_string(),
+            "/cv/path".to_string(),
+            cmd,
+        );
+
+        meta.try_transition(JobState::Dispatching, "");
+        meta.try_transition(JobState::Running, "");
+        meta.try_transition(JobState::Canceling, "user cancel");
+
+        // Completed arrives while Canceling -> Completed wins
+        assert!(meta.try_transition(JobState::Completed, "completed"));
+        assert_eq!(meta.state, JobState::Completed);
     }
 }

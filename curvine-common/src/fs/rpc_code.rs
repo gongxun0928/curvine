@@ -72,6 +72,11 @@ pub enum RpcCode {
 
     MetricsReport = 60,
 
+    // Scheduler <-> TaskNode (Worker) internal protocol
+    AcceptJob = 50,
+    CancelJobToNode = 51,
+    ReportJobEvent = 52,
+
     // block interface.
     WriteBlock = 80,
     ReadBlock = 81,
