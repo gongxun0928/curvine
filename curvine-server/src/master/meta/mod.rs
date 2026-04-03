@@ -34,3 +34,9 @@ pub use glob_utils::*;
 
 mod lock_meta;
 pub use self::lock_meta::LockMeta;
+
+mod sharded_inode_table;
+pub use self::sharded_inode_table::ShardedInodeTable;
+
+mod lock_metrics;
+pub use self::lock_metrics::{LockMetrics, LockOp, LockWaitHoldGuard};
