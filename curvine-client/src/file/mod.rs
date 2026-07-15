@@ -17,6 +17,7 @@ pub use self::curvine_filesystem::*;
 
 mod fs_client;
 pub use self::fs_client::FsClient;
+pub(crate) use self::fs_client::{BatchAddBlockRequest, BatchCompleteFileRequest};
 
 mod fs_writer_base;
 pub use self::fs_writer_base::FsWriterBase;

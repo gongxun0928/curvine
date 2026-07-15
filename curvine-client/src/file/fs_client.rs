@@ -29,10 +29,171 @@ use prost::Message as PMessage;
 use std::collections::LinkedList;
 use std::sync::Arc;
 
+#[derive(Debug, Clone)]
+pub(crate) struct BatchAddBlockRequest {
+    pub path: Path,
+    pub inode_id: i64,
+    pub commit_blocks: Vec<CommitBlock>,
+    pub file_len: i64,
+    pub last_block: Option<ExtendedBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BatchCompleteFileRequest {
+    pub path: Path,
+    pub inode_id: i64,
+    pub len: i64,
+    pub commit_blocks: Vec<CommitBlock>,
+    pub only_flush: bool,
+}
+
 #[derive(Clone)]
 pub struct FsClient {
     context: Arc<FsContext>,
     connector: Arc<ClusterConnector>,
+}
+
+fn check_batch_outcome_count(operation: &str, expected: usize, actual: usize) -> FsResult<()> {
+    if actual != expected {
+        return err_box!(
+            "{} batch outcome count mismatch, expected {}, actual {}",
+            operation,
+            expected,
+            actual
+        );
+    }
+    Ok(())
+}
+
+fn decode_create_batch_response(
+    expected: usize,
+    response: CreateFilesBatchResponse,
+) -> FsResult<Vec<Result<FileStatus, String>>> {
+    if response.outcomes.is_empty() {
+        check_batch_outcome_count("create file", expected, response.file_statuses.len())?;
+        return Ok(response
+            .file_statuses
+            .into_iter()
+            .map(|status| Ok(ProtoUtils::file_status_from_pb(status)))
+            .collect());
+    }
+    check_batch_outcome_count("create file", expected, response.outcomes.len())?;
+    Ok(response
+        .outcomes
+        .into_iter()
+        .map(|outcome| {
+            outcome
+                .file_status
+                .map(ProtoUtils::file_status_from_pb)
+                .ok_or_else(|| {
+                    outcome
+                        .error
+                        .unwrap_or_else(|| "create file failed".to_string())
+                })
+        })
+        .collect())
+}
+
+fn decode_add_block_batch_response(
+    expected: usize,
+    response: AddBlocksBatchResponse,
+) -> FsResult<Vec<Result<LocatedBlock, String>>> {
+    if response.outcomes.is_empty() {
+        check_batch_outcome_count("add block", expected, response.blocks.len())?;
+        return Ok(response
+            .blocks
+            .into_iter()
+            .map(|block| Ok(ProtoUtils::located_block_from_pb(block)))
+            .collect());
+    }
+    check_batch_outcome_count("add block", expected, response.outcomes.len())?;
+    Ok(response
+        .outcomes
+        .into_iter()
+        .map(|outcome| {
+            outcome
+                .block
+                .map(ProtoUtils::located_block_from_pb)
+                .ok_or_else(|| {
+                    outcome
+                        .error
+                        .unwrap_or_else(|| "add block failed".to_string())
+                })
+        })
+        .collect())
+}
+
+fn decode_complete_batch_response(
+    expected: usize,
+    response: CompleteFilesBatchResponse,
+) -> FsResult<Vec<Result<(), String>>> {
+    if response.outcomes.is_empty() {
+        check_batch_outcome_count("complete file", expected, response.results.len())?;
+        return Ok(response
+            .results
+            .into_iter()
+            .map(|success| {
+                if success {
+                    Ok(())
+                } else {
+                    Err("complete file failed".to_string())
+                }
+            })
+            .collect());
+    }
+    check_batch_outcome_count("complete file", expected, response.outcomes.len())?;
+    Ok(response
+        .outcomes
+        .into_iter()
+        .map(|outcome| {
+            if outcome.success {
+                Ok(())
+            } else {
+                Err(outcome
+                    .error
+                    .unwrap_or_else(|| "complete file failed".to_string()))
+            }
+        })
+        .collect())
+}
+
+fn encode_batch_add_block_request(
+    request: BatchAddBlockRequest,
+    exclude_workers: Vec<u32>,
+    client_address: ClientAddressProto,
+) -> AddBlockRequest {
+    AddBlockRequest {
+        path: request.path.encode(),
+        commit_blocks: request
+            .commit_blocks
+            .into_iter()
+            .map(ProtoUtils::commit_block_to_pb)
+            .collect(),
+        exclude_workers,
+        located: true,
+        client_address,
+        file_len: request.file_len,
+        last_block: request.last_block.map(ProtoUtils::extend_block_to_pb),
+        inode_id: Some(request.inode_id),
+    }
+}
+
+fn encode_batch_complete_file_request(
+    request: BatchCompleteFileRequest,
+    client_name: String,
+) -> CompleteFileRequest {
+    CompleteFileRequest {
+        path: request.path.encode(),
+        len: request.len,
+        client_name,
+        commit_blocks: request
+            .commit_blocks
+            .into_iter()
+            .map(ProtoUtils::commit_block_to_pb)
+            .collect(),
+        only_flush: request.only_flush,
+        inode_id: Some(request.inode_id),
+    }
 }
 
 impl FsClient {
@@ -75,7 +236,8 @@ impl FsClient {
     pub async fn create_files_batch(
         &self,
         requests: Vec<(String, CreateFileOpts, OpenFlags)>,
-    ) -> FsResult<Vec<FileStatus>> {
+    ) -> FsResult<Vec<Result<FileStatus, String>>> {
+        let expected = requests.len();
         let pb_requests: Vec<CreateFileRequest> = requests
             .into_iter()
             .map(|(path, opts, flags)| CreateFileRequest {
@@ -87,14 +249,11 @@ impl FsClient {
 
         let header = CreateFilesBatchRequest {
             requests: pb_requests,
+            supports_outcomes: Some(true),
         };
 
         let rep: CreateFilesBatchResponse = self.rpc(RpcCode::CreateFilesBatch, header).await?;
-        Ok(rep
-            .file_statuses
-            .into_iter()
-            .map(ProtoUtils::file_status_from_pb)
-            .collect())
+        decode_create_batch_response(expected, rep)
     }
 
     pub async fn create_with_opts(
@@ -321,33 +480,28 @@ impl FsClient {
         Ok(locate_block)
     }
 
-    pub async fn add_blocks_batch(&self, requests: Vec<String>) -> FsResult<Vec<LocatedBlock>> {
+    pub(crate) async fn add_blocks_batch(
+        &self,
+        requests: Vec<BatchAddBlockRequest>,
+    ) -> FsResult<Vec<Result<LocatedBlock, String>>> {
+        let expected = requests.len();
         let pb_requests: Vec<AddBlockRequest> = requests
             .into_iter()
-            .map(|path| {
-                let commit_blocks: Vec<CommitBlockProto> = Vec::new();
-                AddBlockRequest {
-                    path,
-                    commit_blocks,
-                    exclude_workers: self.context.exclude_workers(),
-                    located: true,
-                    client_address: self.context.client_addr_pb(),
-                    file_len: 0,
-                    last_block: None,
-                    inode_id: None,
-                }
+            .map(|request| {
+                encode_batch_add_block_request(
+                    request,
+                    self.context.exclude_workers(),
+                    self.context.client_addr_pb(),
+                )
             })
             .collect();
 
         let header = AddBlocksBatchRequest {
             requests: pb_requests,
+            supports_outcomes: Some(true),
         };
         let rep: AddBlocksBatchResponse = self.rpc(RpcCode::AddBlocksBatch, header).await?;
-        Ok(rep
-            .blocks
-            .into_iter()
-            .map(ProtoUtils::located_block_from_pb)
-            .collect())
+        decode_add_block_batch_response(expected, rep)
     }
 
     pub async fn complete_file(
@@ -401,34 +555,25 @@ impl FsClient {
         Ok(rep.file_blocks.map(ProtoUtils::file_blocks_from_pb))
     }
 
-    pub async fn complete_files_batch(
+    pub(crate) async fn complete_files_batch(
         &self,
-        requests: Vec<(String, i64, Vec<CommitBlock>, String, bool)>,
-    ) -> FsResult<Vec<bool>> {
+        requests: Vec<BatchCompleteFileRequest>,
+    ) -> FsResult<Vec<Result<(), String>>> {
+        let expected = requests.len();
         let pb_requests: Vec<CompleteFileRequest> = requests
             .into_iter()
-            .map(|(path, len, commit_blocks, client_name, only_flush)| {
-                let commit_blocks = commit_blocks
-                    .into_iter()
-                    .map(ProtoUtils::commit_block_to_pb)
-                    .collect();
-                CompleteFileRequest {
-                    path,
-                    len,
-                    client_name,
-                    commit_blocks,
-                    only_flush,
-                    inode_id: None,
-                }
+            .map(|request| {
+                encode_batch_complete_file_request(request, self.context().clone_client_name())
             })
             .collect();
 
         let header = CompleteFilesBatchRequest {
             requests: pb_requests,
+            supports_outcomes: Some(true),
         };
 
         let rep: CompleteFilesBatchResponse = self.rpc(RpcCode::CompleteFilesBatch, header).await?;
-        Ok(rep.results)
+        decode_complete_batch_response(expected, rep)
     }
 
     pub async fn get_block_locations(&self, path: &Path) -> FsResult<FileBlocks> {
@@ -631,5 +776,178 @@ impl FsClient {
 
     pub fn client_addr(&self) -> &ClientAddress {
         &self.context.client_addr
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_structured_batch_outcomes_in_request_order() {
+        let create = decode_create_batch_response(
+            2,
+            CreateFilesBatchResponse {
+                file_statuses: Vec::new(),
+                outcomes: vec![
+                    CreateFileBatchOutcome {
+                        file_status: Some(FileStatusProto {
+                            id: 101,
+                            path: "/batch/ok".to_string(),
+                            name: "ok".to_string(),
+                            ..Default::default()
+                        }),
+                        error: None,
+                    },
+                    CreateFileBatchOutcome {
+                        file_status: None,
+                        error: Some("create failed".to_string()),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        assert!(matches!(&create[0], Ok(status) if status.id == 101));
+        assert_eq!(create[1].as_ref().unwrap_err(), "create failed");
+
+        let add = decode_add_block_batch_response(
+            2,
+            AddBlocksBatchResponse {
+                blocks: Vec::new(),
+                outcomes: vec![
+                    AddBlockBatchOutcome {
+                        block: Some(LocatedBlockProto {
+                            block: ExtendedBlockProto {
+                                id: 202,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }),
+                        error: None,
+                    },
+                    AddBlockBatchOutcome {
+                        block: None,
+                        error: Some("add failed".to_string()),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        assert!(matches!(&add[0], Ok(block) if block.block.id == 202));
+        assert_eq!(add[1].as_ref().unwrap_err(), "add failed");
+
+        let complete = decode_complete_batch_response(
+            2,
+            CompleteFilesBatchResponse {
+                results: Vec::new(),
+                outcomes: vec![
+                    CompleteFileBatchOutcome {
+                        success: true,
+                        error: None,
+                    },
+                    CompleteFileBatchOutcome {
+                        success: false,
+                        error: Some("complete failed".to_string()),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        assert!(complete[0].is_ok());
+        assert_eq!(complete[1].as_ref().unwrap_err(), "complete failed");
+    }
+
+    #[test]
+    fn rejects_batch_outcome_count_mismatch() {
+        let error = decode_complete_batch_response(
+            2,
+            CompleteFilesBatchResponse {
+                results: Vec::new(),
+                outcomes: vec![CompleteFileBatchOutcome {
+                    success: true,
+                    error: None,
+                }],
+            },
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("complete file batch outcome count mismatch"));
+    }
+
+    #[test]
+    fn decodes_legacy_batch_responses() {
+        let create = decode_create_batch_response(
+            1,
+            CreateFilesBatchResponse {
+                file_statuses: vec![FileStatusProto {
+                    id: 401,
+                    path: "/legacy/create".to_string(),
+                    name: "create".to_string(),
+                    ..Default::default()
+                }],
+                outcomes: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(&create[0], Ok(status) if status.id == 401));
+
+        let add = decode_add_block_batch_response(
+            1,
+            AddBlocksBatchResponse {
+                blocks: vec![LocatedBlockProto {
+                    block: ExtendedBlockProto {
+                        id: 402,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }],
+                outcomes: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(&add[0], Ok(block) if block.block.id == 402));
+
+        let complete = decode_complete_batch_response(
+            2,
+            CompleteFilesBatchResponse {
+                results: vec![true, false],
+                outcomes: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert!(complete[0].is_ok());
+        assert_eq!(complete[1].as_ref().unwrap_err(), "complete file failed");
+    }
+
+    #[test]
+    fn batch_metadata_requests_preserve_inode_identity() {
+        let add = encode_batch_add_block_request(
+            BatchAddBlockRequest {
+                path: Path::from_str("/batch/add").unwrap(),
+                inode_id: 301,
+                commit_blocks: Vec::new(),
+                file_len: 0,
+                last_block: None,
+            },
+            Vec::new(),
+            ClientAddressProto::default(),
+        );
+        assert_eq!(add.path, "/batch/add");
+        assert_eq!(add.inode_id, Some(301));
+
+        let complete = encode_batch_complete_file_request(
+            BatchCompleteFileRequest {
+                path: Path::from_str("/batch/complete").unwrap(),
+                inode_id: 302,
+                len: 7,
+                commit_blocks: Vec::new(),
+                only_flush: false,
+            },
+            "batch-client".to_string(),
+        );
+        assert_eq!(complete.path, "/batch/complete");
+        assert_eq!(complete.inode_id, Some(302));
+        assert_eq!(complete.client_name, "batch-client");
     }
 }

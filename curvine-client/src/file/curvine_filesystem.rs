@@ -13,7 +13,10 @@
 // limitations under the License.
 
 use crate::block::BatchBlockWriter;
-use crate::file::{FsClient, FsContext, FsReader, FsWriter, FsWriterBase};
+use crate::file::{
+    BatchAddBlockRequest, BatchCompleteFileRequest, FsClient, FsContext, FsReader, FsWriter,
+    FsWriterBase,
+};
 use crate::ClientMetrics;
 use async_stream::stream;
 use bytes::BytesMut;
@@ -21,7 +24,7 @@ use curvine_common::alloc::allocator_type_name;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, FsKind, ListStream, Path, Reader, Writer};
-use curvine_common::state::{CommitBlock, FreeResult, ListOptions};
+use curvine_common::state::{CommitBlock, FreeResult, ListOptions, LocatedBlock, WorkerAddress};
 use curvine_common::state::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
     MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, SetAttrOpts,
@@ -29,11 +32,13 @@ use curvine_common::state::{
 use curvine_common::utils::ProtoUtils;
 use curvine_common::version::GIT_VERSION;
 use curvine_common::FsResult;
+use futures::future::join_all;
 use log::info;
 use log::warn;
 use orpc::client::ClientConf;
 use orpc::err_box;
 use orpc::runtime::{RpcRuntime, Runtime};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -42,6 +47,44 @@ use tokio::time::timeout;
 pub struct CurvineFileSystem {
     pub(crate) fs_context: Arc<FsContext>,
     pub(crate) fs_client: Arc<FsClient>,
+}
+
+const MAX_BATCH_FILES: usize = 1024;
+
+struct BatchFileItem<'a> {
+    input_index: usize,
+    path: &'a Path,
+    content: &'a str,
+    inode_id: Option<i64>,
+    block: Option<LocatedBlock>,
+    error: Option<FsError>,
+}
+
+impl BatchFileItem<'_> {
+    fn is_active(&self) -> bool {
+        self.error.is_none()
+    }
+
+    fn fail(&mut self, stage: &str, error: impl std::fmt::Display) {
+        if self.error.is_none() {
+            self.error = Some(FsError::common(format!(
+                "batch {} failed for {}: {}",
+                stage, self.path, error
+            )));
+        }
+    }
+}
+
+struct WorkerBatchPlan {
+    worker: WorkerAddress,
+    item_indices: Vec<usize>,
+    payload_len: usize,
+}
+
+struct WorkerBatchWriter {
+    worker: WorkerAddress,
+    item_indices: Vec<usize>,
+    writer: BatchBlockWriter,
 }
 
 impl CurvineFileSystem {
@@ -390,91 +433,420 @@ impl CurvineFileSystem {
         }
     }
 
-    pub async fn write_batch_string(&self, files: &[(Path, &str)]) -> FsResult<()> {
-        let chunk_size = self.fs_context().write_chunk_size();
-        let mut batch = Vec::with_capacity(files.len());
-        let mut batch_memory = 0;
-
-        for (path, content) in files.iter() {
-            let content_size: usize = content.len();
-
-            if content_size >= chunk_size {
-                self.write_string(path, content.to_string()).await?;
-                continue;
+    /// Writes files independently while batching the one-block small-file path.
+    ///
+    /// The outer result is reserved for structurally invalid input. Duplicate
+    /// paths are rejected because a batch does not define ordering between
+    /// multiple writes to the same inode. Each inner result maps to the file at
+    /// the same input index. A stage-wide failure is copied only to the items
+    /// affected by that stage, so outcomes already determined for unrelated
+    /// files remain visible to the caller.
+    pub async fn write_batch_string(&self, files: &[(Path, &str)]) -> FsResult<Vec<FsResult<()>>> {
+        let mut paths = HashSet::with_capacity(files.len());
+        for (path, _) in files {
+            if !paths.insert(path.encode()) {
+                return err_box!("duplicate path in batch write: {}", path);
             }
+        }
 
-            if batch_memory + content_size > chunk_size {
-                self.handle_batch_files(&batch).await?;
+        let batch_file_size = self
+            .conf()
+            .client
+            .small_file_size
+            .max(0)
+            .min(self.fs_context.block_size().max(0)) as usize;
+        let batch_file_size = batch_file_size.min(self.fs_context.write_chunk_size());
+        let mut outcomes: Vec<Option<FsResult<()>>> =
+            std::iter::repeat_with(|| None).take(files.len()).collect();
+        let mut batch = Vec::with_capacity(files.len().min(MAX_BATCH_FILES));
+
+        for (input_index, (path, content)) in files.iter().enumerate() {
+            if content.is_empty() || content.len() <= batch_file_size {
+                batch.push((input_index, path, *content));
+                if batch.len() == MAX_BATCH_FILES {
+                    self.finish_batch_items(&mut outcomes, &batch).await;
+                    batch.clear();
+                }
+            } else {
+                // Preserve input order across the batch/standalone boundary.
+                // Earlier small files may create paths that affect this write.
+                self.finish_batch_items(&mut outcomes, &batch).await;
                 batch.clear();
-                batch_memory = 0;
+                outcomes[input_index] = Some(self.write_string(path, *content).await);
             }
-
-            batch.push((path, content));
-            batch_memory += content_size;
         }
+        self.finish_batch_items(&mut outcomes, &batch).await;
 
-        // Final flush
-        if !batch.is_empty() {
-            self.handle_batch_files(&batch).await?;
-        }
-
-        Ok(())
+        outcomes
+            .into_iter()
+            .enumerate()
+            .map(|(index, outcome)| {
+                outcome.ok_or_else(|| {
+                    FsError::common(format!("missing batch write outcome at index {}", index))
+                })
+            })
+            .collect()
     }
 
-    async fn handle_batch_files(&self, files: &[(&Path, &str)]) -> FsResult<()> {
+    async fn finish_batch_items(
+        &self,
+        outcomes: &mut [Option<FsResult<()>>],
+        files: &[(usize, &Path, &str)],
+    ) {
+        for (input_index, result) in self.handle_batch_files(files).await {
+            outcomes[input_index] = Some(result);
+        }
+    }
+
+    fn group_batch_files_by_worker(
+        items: &[BatchFileItem<'_>],
+        payload_limit: usize,
+    ) -> Vec<WorkerBatchPlan> {
+        let mut plans: Vec<WorkerBatchPlan> = Vec::new();
+        let mut latest_plan_indices: HashMap<WorkerAddress, usize> = HashMap::new();
+        for (item_index, item) in items.iter().enumerate() {
+            let Some(block) = item.block.as_ref().filter(|_| item.is_active()) else {
+                continue;
+            };
+            for worker in &block.locs {
+                let next_payload = item.content.len();
+                let existing_index = latest_plan_indices.get(worker).copied().filter(|index| {
+                    let plan = &plans[*index];
+                    plan.item_indices.len() < MAX_BATCH_FILES
+                        && plan.payload_len.saturating_add(next_payload) <= payload_limit
+                });
+                if let Some(index) = existing_index {
+                    let plan = &mut plans[index];
+                    plan.item_indices.push(item_index);
+                    plan.payload_len += next_payload;
+                } else {
+                    let index = plans.len();
+                    plans.push(WorkerBatchPlan {
+                        worker: worker.clone(),
+                        item_indices: vec![item_index],
+                        payload_len: next_payload,
+                    });
+                    latest_plan_indices.insert(worker.clone(), index);
+                }
+            }
+        }
+        plans
+    }
+
+    fn fail_worker_items(
+        items: &mut [BatchFileItem<'_>],
+        indices: &[usize],
+        stage: &str,
+        worker: &WorkerAddress,
+        error: impl std::fmt::Display,
+    ) {
+        for index in indices {
+            items[*index].fail(stage, format_args!("worker {}: {}", worker, error));
+        }
+    }
+
+    async fn handle_batch_files(
+        &self,
+        files: &[(usize, &Path, &str)],
+    ) -> Vec<(usize, FsResult<()>)> {
         if files.is_empty() {
-            return Ok(());
+            return Vec::new();
         }
 
-        // Step 1: Batch create files
-        let mut create_requests = Vec::with_capacity(files.len());
-        for (path, _) in files {
-            let opts = self.create_opts_builder().create_parent(true).build();
-            let flags = OpenFlags::new_write_only()
-                .set_create(true)
-                .set_overwrite(true);
-            create_requests.push((path.encode(), opts, flags));
+        let mut items = files
+            .iter()
+            .map(|(input_index, path, content)| BatchFileItem {
+                input_index: *input_index,
+                path,
+                content,
+                inode_id: None,
+                block: None,
+                error: None,
+            })
+            .collect::<Vec<_>>();
+        let create_requests = items
+            .iter()
+            .map(|item| {
+                let opts = self.create_opts_builder().create_parent(true).build();
+                let flags = OpenFlags::new_write_only()
+                    .set_create(true)
+                    .set_overwrite(true);
+                (item.path.encode(), opts, flags)
+            })
+            .collect();
+
+        match self.fs_client.create_files_batch(create_requests).await {
+            Ok(results) => {
+                for (item, result) in items.iter_mut().zip(results) {
+                    match result {
+                        Ok(status) => item.inode_id = Some(status.id),
+                        Err(error) => item.fail("create", error),
+                    }
+                }
+            }
+            Err(error) => {
+                for item in &mut items {
+                    item.fail("create", &error);
+                }
+                return items
+                    .into_iter()
+                    .map(|item| (item.input_index, Err(item.error.unwrap())))
+                    .collect();
+            }
         }
 
-        let file_statuses = self.fs_client().create_files_batch(create_requests).await?;
-
-        // Step 2: Batch allocate blocks
-        let mut add_block_requests = Vec::with_capacity(file_statuses.len());
-        for ((path, _content), _status) in files.iter().zip(file_statuses.iter()) {
-            add_block_requests.push(path.encode());
+        let add_indices = items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                (item.is_active() && !item.content.is_empty()).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let add_requests = add_indices
+            .iter()
+            .map(|index| {
+                let item = &items[*index];
+                BatchAddBlockRequest {
+                    path: (*item.path).clone(),
+                    inode_id: item
+                        .inode_id
+                        .expect("active batch file must preserve its inode id"),
+                    commit_blocks: Vec::new(),
+                    file_len: 0,
+                    last_block: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        if !add_requests.is_empty() {
+            match self.fs_client.add_blocks_batch(add_requests).await {
+                Ok(results) => {
+                    for (index, result) in add_indices.iter().zip(results) {
+                        match result {
+                            Ok(block) if block.locs.is_empty() => {
+                                items[*index].fail("allocate block", "no available worker")
+                            }
+                            Ok(block) => items[*index].block = Some(block),
+                            Err(error) => items[*index].fail("allocate block", error),
+                        }
+                    }
+                }
+                Err(error) => {
+                    for index in &add_indices {
+                        items[*index].fail("allocate block", &error);
+                    }
+                }
+            }
         }
 
-        let allocated_blocks: Vec<curvine_common::state::LocatedBlock> = self
-            .fs_client()
-            .add_blocks_batch(add_block_requests)
-            .await?;
-
-        // The allocated blocks should correspond to the add_block_requests sent above.
-        let mut batch_writer =
-            BatchBlockWriter::new(self.fs_context.clone(), allocated_blocks).await?;
-
-        // Write all data (no flushing yet)
-        batch_writer.write(files).await?;
-
-        // Step 4: Complete all files at worker side
-        let commit_blocks = batch_writer.complete().await?;
-
-        // Step 5: Batch complete at master side
-        let mut complete_requests: Vec<(String, i64, Vec<CommitBlock>, String, bool)> =
-            Vec::with_capacity(files.len());
-        for ((path, content), commit_block) in files.iter().zip(commit_blocks.iter()) {
-            complete_requests.push((
-                path.encode(),
-                content.len() as i64,
-                vec![commit_block.clone()],
-                self.fs_context().clone_client_name(),
-                false,
-            ));
+        let plans =
+            Self::group_batch_files_by_worker(&items, self.fs_context.write_chunk_size().max(1));
+        let mut writers = Vec::with_capacity(plans.len());
+        for plan in plans {
+            let blocks = plan
+                .item_indices
+                .iter()
+                .filter_map(|index| {
+                    items[*index]
+                        .block
+                        .as_ref()
+                        .map(|block| block.block.clone())
+                })
+                .collect::<Vec<_>>();
+            match BatchBlockWriter::new(self.fs_context.clone(), blocks, plan.worker.clone()).await
+            {
+                Ok((writer, results)) => {
+                    for (index, success) in plan.item_indices.iter().zip(results) {
+                        if !success {
+                            items[*index].fail(
+                                "open block",
+                                format_args!("worker {} rejected the block", plan.worker),
+                            );
+                        }
+                    }
+                    writers.push(WorkerBatchWriter {
+                        worker: plan.worker,
+                        item_indices: plan.item_indices,
+                        writer,
+                    });
+                }
+                Err(error) => {
+                    self.fs_context.add_failed_worker(&plan.worker);
+                    Self::fail_worker_items(
+                        &mut items,
+                        &plan.item_indices,
+                        "open block",
+                        &plan.worker,
+                        error,
+                    );
+                }
+            }
         }
-        self.fs_client()
-            .complete_files_batch(complete_requests)
-            .await?;
-        Ok(())
+
+        let write_results = join_all(writers.iter_mut().map(|group| {
+            let active = group
+                .item_indices
+                .iter()
+                .map(|index| items[*index].is_active())
+                .collect::<Vec<_>>();
+            let group_files = group
+                .item_indices
+                .iter()
+                .map(|index| (items[*index].path, items[*index].content))
+                .collect::<Vec<_>>();
+            async move {
+                let result = group.writer.write(&group_files, &active).await;
+                (active, result)
+            }
+        }))
+        .await;
+        for (group, (active, result)) in writers.iter().zip(write_results) {
+            match result {
+                Ok(results) => {
+                    for ((index, was_active), success) in
+                        group.item_indices.iter().zip(active).zip(results)
+                    {
+                        if was_active && !success {
+                            items[*index].fail(
+                                "write block",
+                                format_args!("worker {} rejected the data", group.worker),
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.fs_context.add_failed_worker(&group.worker);
+                    Self::fail_worker_items(
+                        &mut items,
+                        &group.item_indices,
+                        "write block",
+                        &group.worker,
+                        error,
+                    );
+                }
+            }
+        }
+
+        let complete_results = join_all(writers.iter_mut().map(|group| {
+            let cancels = group
+                .item_indices
+                .iter()
+                .map(|index| !items[*index].is_active())
+                .collect::<Vec<_>>();
+            async move {
+                let result = group.writer.complete(&cancels).await;
+                (cancels, result)
+            }
+        }))
+        .await;
+        for (group, (cancels, result)) in writers.iter().zip(complete_results) {
+            match result {
+                Ok(results) => {
+                    for ((index, cancel), success) in
+                        group.item_indices.iter().zip(cancels).zip(results)
+                    {
+                        if !cancel && !success {
+                            items[*index].fail(
+                                "complete block",
+                                format_args!("worker {} rejected the block", group.worker),
+                            );
+                        } else if cancel && !success {
+                            log::warn!(
+                                "failed to cancel batch block for {} on worker {}",
+                                items[*index].path,
+                                group.worker
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.fs_context.add_failed_worker(&group.worker);
+                    for (index, cancel) in group.item_indices.iter().zip(cancels) {
+                        if cancel {
+                            log::warn!(
+                                "failed to cancel batch block for {} on worker {}: {}",
+                                items[*index].path,
+                                group.worker,
+                                error
+                            );
+                        } else {
+                            items[*index].fail(
+                                "complete block",
+                                format_args!("worker {}: {}", group.worker, error),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let complete_indices = items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| item.is_active().then_some(index))
+            .collect::<Vec<_>>();
+        let complete_requests = complete_indices
+            .iter()
+            .map(|index| {
+                let item = &items[*index];
+                let commit_blocks = item
+                    .block
+                    .as_ref()
+                    .map(|block| {
+                        let mut commit = CommitBlock::from(block);
+                        commit.block_len = item.content.len() as i64;
+                        vec![commit]
+                    })
+                    .unwrap_or_default();
+                BatchCompleteFileRequest {
+                    path: (*item.path).clone(),
+                    inode_id: item
+                        .inode_id
+                        .expect("active batch file must preserve its inode id"),
+                    len: item.content.len() as i64,
+                    commit_blocks,
+                    only_flush: false,
+                }
+            })
+            .collect::<Vec<_>>();
+        if !complete_requests.is_empty() {
+            match self.fs_client.complete_files_batch(complete_requests).await {
+                Ok(results) => {
+                    for (index, result) in complete_indices.iter().zip(results) {
+                        if let Err(error) = result {
+                            items[*index].fail("complete file", error);
+                        }
+                    }
+                }
+                Err(error) => {
+                    for index in &complete_indices {
+                        items[*index].fail("complete file", &error);
+                    }
+                }
+            }
+        }
+
+        // Best-effort cleanup for files that were created but never completed.
+        // Keep the original per-file error as the caller-visible outcome.
+        for item in &items {
+            if item.inode_id.is_none() || item.is_active() {
+                continue;
+            }
+            if let Err(error) = self.fs_client.delete(item.path, false).await {
+                log::warn!(
+                    "failed to cleanup incomplete batch file {}: {}",
+                    item.path,
+                    error
+                );
+            }
+        }
+
+        items
+            .into_iter()
+            .map(|item| {
+                let result = item.error.map_or(Ok(()), Err);
+                (item.input_index, result)
+            })
+            .collect()
     }
 }
 
@@ -542,5 +914,71 @@ impl FileSystem<FsWriter, FsReader> for CurvineFileSystem {
 
     async fn list_stream(&self, path: &Path, opts: ListOptions) -> FsResult<ListStream> {
         self.list_stream(path, opts).await
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use curvine_common::state::{ExtendedBlock, FileType, StorageType};
+
+    fn worker(worker_id: u32) -> WorkerAddress {
+        WorkerAddress {
+            worker_id,
+            ..Default::default()
+        }
+    }
+
+    fn item<'a>(
+        input_index: usize,
+        path: &'a Path,
+        content: &'a str,
+        block_id: i64,
+        locs: Vec<WorkerAddress>,
+    ) -> BatchFileItem<'a> {
+        BatchFileItem {
+            input_index,
+            path,
+            content,
+            inode_id: Some(input_index as i64 + 1),
+            block: Some(LocatedBlock {
+                block: ExtendedBlock::new(block_id, 0, StorageType::Disk, FileType::File),
+                locs,
+            }),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn groups_by_worker_and_splits_at_payload_limit() {
+        let worker_1 = worker(1);
+        let worker_2 = worker(2);
+        let paths = [
+            Path::from_str("/batch/0").unwrap(),
+            Path::from_str("/batch/1").unwrap(),
+            Path::from_str("/batch/2").unwrap(),
+        ];
+        let items = vec![
+            item(
+                0,
+                &paths[0],
+                "aaaa",
+                10,
+                vec![worker_1.clone(), worker_2.clone()],
+            ),
+            item(1, &paths[1], "bbbb", 11, vec![worker_1.clone()]),
+            item(2, &paths[2], "ccccc", 12, vec![worker_1.clone()]),
+        ];
+
+        let plans = CurvineFileSystem::group_batch_files_by_worker(&items, 8);
+
+        assert_eq!(plans.len(), 3);
+        assert_eq!(plans[0].worker, worker_1);
+        assert_eq!(plans[0].item_indices, vec![0, 1]);
+        assert_eq!(plans[0].payload_len, 8);
+        assert_eq!(plans[1].worker, worker_2);
+        assert_eq!(plans[1].item_indices, vec![0]);
+        assert_eq!(plans[2].worker, worker_1);
+        assert_eq!(plans[2].item_indices, vec![2]);
     }
 }

@@ -16,8 +16,8 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse,
-    BlocksBatchCommitRequest, BlocksBatchWriteRequest, BlocksBatchWriteResponse, DataHeaderProto,
-    FileWriteData, FilesBatchWriteRequest,
+    BlocksBatchCommitRequest, BlocksBatchCommitResponse, BlocksBatchWriteRequest,
+    BlocksBatchWriteResponse, FileWriteData, FilesBatchWriteRequest, FilesBatchWriteResponse,
 };
 use curvine_common::state::{ExtendedBlock, FileAllocOpts, FileType, StorageType};
 use curvine_common::utils::ProtoUtils;
@@ -52,6 +52,28 @@ fn worker_fault_test_serial() -> MutexGuard<'static, ()> {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn batch_commit_request(
+    blocks: &[ExtendedBlock],
+    block_size: i64,
+    req_id: i64,
+    seq_id: i32,
+    cancel: bool,
+) -> BlocksBatchCommitRequest {
+    BlocksBatchCommitRequest {
+        blocks: blocks
+            .iter()
+            .cloned()
+            .map(ProtoUtils::extend_block_to_pb)
+            .collect(),
+        off: 0,
+        block_size,
+        req_id,
+        seq_id,
+        cancel,
+        cancel_flags: Vec::new(),
+    }
 }
 
 // Test the worker interface function.
@@ -214,31 +236,22 @@ fn test_worker_batch_short_circuit_complete_uses_open_context_without_server_fil
         .build();
     let response: BlocksBatchWriteResponse = client.rpc_check(open_msg)?.parse_header()?;
     assert_eq!(response.responses.len(), blocks.len());
-    assert!(response
-        .responses
-        .iter()
-        .all(|response| response.path.is_some()));
+    assert_eq!(response.results.len(), blocks.len());
+    assert!(response.results.iter().all(|result| result
+        .response
+        .as_ref()
+        .is_some_and(|response| response.path.is_some())));
 
-    let complete = BlocksBatchCommitRequest {
-        blocks: blocks
-            .iter()
-            .cloned()
-            .map(ProtoUtils::extend_block_to_pb)
-            .collect(),
-        off: 0,
-        block_size,
-        req_id: open_req_id,
-        seq_id: 1,
-        cancel: false,
-    };
+    let complete = batch_commit_request(&blocks, block_size, open_req_id, 1, false);
     let complete_msg = Builder::new()
         .code(RpcCode::WriteBlocksBatch)
         .request(RequestStatus::Complete)
-        .req_id(complete.req_id)
+        .req_id(open_req_id)
         .seq_id(1)
         .proto_header(complete)
         .build();
-    let _: Message = client.rpc_check(complete_msg)?;
+    let response: BlocksBatchCommitResponse = client.rpc_check(complete_msg)?.parse_header()?;
+    assert_eq!(response.results, vec![true, true]);
 
     Ok(())
 }
@@ -278,6 +291,132 @@ fn test_worker_batch_short_circuit_complete_requires_open_connection() -> Common
         .build();
     let _: BlocksBatchWriteResponse = open_client.rpc_check(open_msg)?.parse_header()?;
 
+    let complete = batch_commit_request(&blocks, block_size, req_id, 1, false);
+    let complete_msg = Builder::new()
+        .code(RpcCode::WriteBlocksBatch)
+        .request(RequestStatus::Complete)
+        .req_id(req_id)
+        .seq_id(1)
+        .proto_header(complete)
+        .build();
+    assert!(complete_client.rpc_check(complete_msg).is_err());
+
+    Ok(())
+}
+
+#[test]
+fn test_worker_batch_open_failure_is_per_block() -> CommonResult<()> {
+    let conf = start_worker();
+    let client = conf.worker_sync_client()?;
+    let block_size = CHUNK_SIZE as i64;
+    let req_id = Utils::req_id();
+    let mut blocks = [
+        ExtendedBlock::new(Utils::req_id().abs(), 0, StorageType::Disk, FileType::File),
+        ExtendedBlock::new(Utils::req_id().abs(), 0, StorageType::Disk, FileType::File),
+    ];
+    blocks[1].alloc_opts = Some(FileAllocOpts::with_truncate(block_size + 1));
+
+    let open = BlocksBatchWriteRequest {
+        blocks: blocks
+            .iter()
+            .cloned()
+            .map(ProtoUtils::extend_block_to_pb)
+            .collect(),
+        off: 0,
+        block_size,
+        req_id,
+        seq_id: 0,
+        chunk_size: CHUNK_SIZE,
+        short_circuit: false,
+        client_name: "test".to_string(),
+    };
+    let open_msg = Builder::new()
+        .code(RpcCode::WriteBlocksBatch)
+        .request(RequestStatus::Open)
+        .req_id(req_id)
+        .seq_id(0)
+        .proto_header(open)
+        .build();
+    let response: BlocksBatchWriteResponse = client.rpc_check(open_msg)?.parse_header()?;
+    assert_eq!(response.results.len(), blocks.len());
+    // Partial open failures leave legacy `responses` empty so request indices
+    // cannot be misaligned with a dense success subset.
+    assert!(response.responses.is_empty());
+    assert!(response.results[0].response.is_some());
+    assert!(response.results[1].response.is_none());
+    assert!(response.results[1].error.is_some());
+
+    let cancel = batch_commit_request(&blocks, block_size, req_id, 1, true);
+    let cancel_msg = Builder::new()
+        .code(RpcCode::WriteBlocksBatch)
+        .request(RequestStatus::Cancel)
+        .req_id(req_id)
+        .seq_id(1)
+        .proto_header(cancel)
+        .build();
+    let response: BlocksBatchCommitResponse = client.rpc_check(cancel_msg)?.parse_header()?;
+    assert_eq!(response.results, vec![true, true]);
+
+    Ok(())
+}
+
+#[test]
+fn test_worker_batch_write_failure_does_not_stop_other_blocks() -> CommonResult<()> {
+    let conf = start_worker();
+    let client = conf.worker_sync_client()?;
+    let block_size = 8;
+    let req_id = Utils::req_id();
+    let mut blocks = [
+        ExtendedBlock::new(Utils::req_id().abs(), 0, StorageType::Disk, FileType::File),
+        ExtendedBlock::new(Utils::req_id().abs(), 0, StorageType::Disk, FileType::File),
+    ];
+
+    let open = BlocksBatchWriteRequest {
+        blocks: blocks
+            .iter()
+            .cloned()
+            .map(ProtoUtils::extend_block_to_pb)
+            .collect(),
+        off: 0,
+        block_size,
+        req_id,
+        seq_id: 0,
+        chunk_size: CHUNK_SIZE,
+        short_circuit: false,
+        client_name: "test".to_string(),
+    };
+    let open_msg = Builder::new()
+        .code(RpcCode::WriteBlocksBatch)
+        .request(RequestStatus::Open)
+        .req_id(req_id)
+        .seq_id(0)
+        .proto_header(open)
+        .build();
+    let _: BlocksBatchWriteResponse = client.rpc_check(open_msg)?.parse_header()?;
+
+    let contents = ["too-large", "ok"];
+    let write = FilesBatchWriteRequest {
+        files: contents
+            .iter()
+            .map(|content| FileWriteData {
+                path: String::new(),
+                content: content.as_bytes().to_vec(),
+            })
+            .collect(),
+        req_id,
+        seq_id: 1,
+    };
+    let write_msg = Builder::new()
+        .code(RpcCode::WriteBlocksBatch)
+        .request(RequestStatus::Running)
+        .req_id(req_id)
+        .seq_id(1)
+        .proto_header(write)
+        .build();
+    let response: FilesBatchWriteResponse = client.rpc_check(write_msg)?.parse_header()?;
+    assert_eq!(response.results, vec![false, true]);
+
+    blocks[1].len = contents[1].len() as i64;
     let complete = BlocksBatchCommitRequest {
         blocks: blocks
             .iter()
@@ -287,17 +426,155 @@ fn test_worker_batch_short_circuit_complete_requires_open_connection() -> Common
         off: 0,
         block_size,
         req_id,
-        seq_id: 1,
+        seq_id: 2,
         cancel: false,
+        cancel_flags: vec![true, false],
     };
     let complete_msg = Builder::new()
         .code(RpcCode::WriteBlocksBatch)
         .request(RequestStatus::Complete)
         .req_id(req_id)
-        .seq_id(1)
+        .seq_id(2)
         .proto_header(complete)
         .build();
-    assert!(complete_client.rpc_check(complete_msg).is_err());
+    let response: BlocksBatchCommitResponse = client.rpc_check(complete_msg)?.parse_header()?;
+    assert_eq!(response.results, vec![true, true]);
+
+    assert!(block_read_bytes(blocks[0].id, 1, &conf).is_err());
+    assert_eq!(
+        block_read_bytes(blocks[1].id, contents[1].len() as i64, &conf)?,
+        contents[1].as_bytes()
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_worker_batch_invalid_complete_aborts_all_open_blocks() -> CommonResult<()> {
+    let conf = start_worker();
+    let client = conf.worker_sync_client()?;
+    let block_size = CHUNK_SIZE as i64;
+    let blocks = [
+        ExtendedBlock::new(Utils::req_id().abs(), 0, StorageType::Disk, FileType::File),
+        ExtendedBlock::new(Utils::req_id().abs(), 0, StorageType::Disk, FileType::File),
+    ];
+    let req_id = Utils::req_id();
+    let open = BlocksBatchWriteRequest {
+        blocks: blocks
+            .iter()
+            .cloned()
+            .map(ProtoUtils::extend_block_to_pb)
+            .collect(),
+        off: 0,
+        block_size,
+        req_id,
+        seq_id: 0,
+        chunk_size: CHUNK_SIZE,
+        short_circuit: true,
+        client_name: "test".to_string(),
+    };
+    let open_msg = Builder::new()
+        .code(RpcCode::WriteBlocksBatch)
+        .request(RequestStatus::Open)
+        .req_id(req_id)
+        .seq_id(0)
+        .proto_header(open)
+        .build();
+    let response: BlocksBatchWriteResponse = client.rpc_check(open_msg)?.parse_header()?;
+    let paths: Vec<_> = response
+        .results
+        .into_iter()
+        .map(|result| {
+            result
+                .response
+                .expect("batch open response")
+                .path
+                .expect("short-circuit path")
+        })
+        .collect();
+    assert!(paths.iter().all(|path| std::path::Path::new(path).exists()));
+
+    // Report only one of the two opened blocks to trigger batch-wide count validation.
+    let invalid_complete = batch_commit_request(&blocks[..1], block_size, req_id, 1, false);
+    let complete_msg = Builder::new()
+        .code(RpcCode::WriteBlocksBatch)
+        .request(RequestStatus::Complete)
+        .req_id(req_id)
+        .seq_id(1)
+        .proto_header(invalid_complete)
+        .build();
+    assert!(client.rpc_check(complete_msg).is_err());
+
+    assert!(paths
+        .iter()
+        .all(|path| !std::path::Path::new(path).exists()));
+    Ok(())
+}
+
+#[test]
+fn test_worker_batch_invalid_write_aborts_all_open_blocks() -> CommonResult<()> {
+    let conf = start_worker();
+    let client = conf.worker_sync_client()?;
+    let block_size = CHUNK_SIZE as i64;
+    let req_id = Utils::req_id();
+    let blocks = [
+        ExtendedBlock::new(Utils::req_id().abs(), 0, StorageType::Disk, FileType::File),
+        ExtendedBlock::new(Utils::req_id().abs(), 0, StorageType::Disk, FileType::File),
+    ];
+    let open = BlocksBatchWriteRequest {
+        blocks: blocks
+            .iter()
+            .cloned()
+            .map(ProtoUtils::extend_block_to_pb)
+            .collect(),
+        off: 0,
+        block_size,
+        req_id,
+        seq_id: 0,
+        chunk_size: CHUNK_SIZE,
+        short_circuit: true,
+        client_name: "test".to_string(),
+    };
+    let open_msg = Builder::new()
+        .code(RpcCode::WriteBlocksBatch)
+        .request(RequestStatus::Open)
+        .req_id(req_id)
+        .seq_id(0)
+        .proto_header(open)
+        .build();
+    let response: BlocksBatchWriteResponse = client.rpc_check(open_msg)?.parse_header()?;
+    let paths = response
+        .results
+        .into_iter()
+        .map(|result| {
+            result
+                .response
+                .expect("batch open response")
+                .path
+                .expect("short-circuit path")
+        })
+        .collect::<Vec<_>>();
+    assert!(paths.iter().all(|path| std::path::Path::new(path).exists()));
+
+    let invalid_write = FilesBatchWriteRequest {
+        files: vec![FileWriteData {
+            path: String::new(),
+            content: b"only-one-item".to_vec(),
+        }],
+        req_id,
+        seq_id: 1,
+    };
+    let write_msg = Builder::new()
+        .code(RpcCode::WriteBlocksBatch)
+        .request(RequestStatus::Running)
+        .req_id(req_id)
+        .seq_id(1)
+        .proto_header(invalid_write)
+        .build();
+    assert!(client.rpc_check(write_msg).is_err());
+    assert!(paths
+        .iter()
+        .all(|path| !std::path::Path::new(path).exists()));
 
     Ok(())
 }
@@ -357,39 +634,42 @@ fn test_worker_batch_remote_write_complete_and_read_back() -> CommonResult<()> {
         .build();
     let _: Message = client.rpc_check(write_msg)?;
 
-    let non_flush = DataHeaderProto {
-        offset: 0,
-        flush: false,
-        is_last: false,
-    };
-    let non_flush_msg = Builder::new()
-        .code(RpcCode::WriteBlock)
-        .request(RequestStatus::Running)
-        .req_id(req_id)
-        .seq_id(2)
-        .proto_header(non_flush)
-        .build();
-    assert!(client.rpc_check(non_flush_msg).is_err());
-
-    let flush = DataHeaderProto {
-        offset: 0,
-        flush: true,
-        is_last: false,
-    };
-    let flush_msg = Builder::new()
-        .code(RpcCode::WriteBlock)
-        .request(RequestStatus::Running)
-        .req_id(req_id)
-        .seq_id(3)
-        .proto_header(flush)
-        .build();
-    let _: Message = client.rpc_check(flush_msg)?;
-
     for (block, content) in blocks.iter_mut().zip(contents) {
         block.len = content.len() as i64;
     }
 
-    let complete = BlocksBatchCommitRequest {
+    let complete = batch_commit_request(&blocks, block_size, req_id, 2, false);
+    let complete_msg = Builder::new()
+        .code(RpcCode::WriteBlocksBatch)
+        .request(RequestStatus::Complete)
+        .req_id(req_id)
+        .seq_id(2)
+        .proto_header(complete)
+        .build();
+    let response: BlocksBatchCommitResponse = client.rpc_check(complete_msg)?.parse_header()?;
+    assert_eq!(response.results, vec![true, true]);
+    for (block, content) in blocks.iter().zip(contents) {
+        assert_eq!(
+            block_read_bytes(block.id, content.len() as i64, &conf)?,
+            content.as_bytes()
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_worker_batch_finalize_failure_is_per_block_and_cleans_up() -> CommonResult<()> {
+    let conf = start_worker();
+    let client = conf.worker_sync_client()?;
+    let block_size = CHUNK_SIZE as i64;
+    let req_id = Utils::req_id();
+    let mut blocks = [
+        ExtendedBlock::new(Utils::req_id().abs(), 0, StorageType::Disk, FileType::File),
+        ExtendedBlock::new(Utils::req_id().abs(), 0, StorageType::Disk, FileType::File),
+    ];
+
+    let open = BlocksBatchWriteRequest {
         blocks: blocks
             .iter()
             .cloned()
@@ -398,22 +678,111 @@ fn test_worker_batch_remote_write_complete_and_read_back() -> CommonResult<()> {
         off: 0,
         block_size,
         req_id,
-        seq_id: 4,
-        cancel: false,
+        seq_id: 0,
+        chunk_size: CHUNK_SIZE,
+        short_circuit: false,
+        client_name: "test".to_string(),
     };
+    let open_msg = Builder::new()
+        .code(RpcCode::WriteBlocksBatch)
+        .request(RequestStatus::Open)
+        .req_id(req_id)
+        .seq_id(0)
+        .proto_header(open)
+        .build();
+    let _: BlocksBatchWriteResponse = client.rpc_check(open_msg)?.parse_header()?;
+
+    let contents = ["batch-finalize-fails", "batch-finalize-succeeds"];
+    let write = FilesBatchWriteRequest {
+        files: contents
+            .iter()
+            .map(|content| FileWriteData {
+                path: String::new(),
+                content: content.as_bytes().to_vec(),
+            })
+            .collect(),
+        req_id,
+        seq_id: 1,
+    };
+    let write_msg = Builder::new()
+        .code(RpcCode::WriteBlocksBatch)
+        .request(RequestStatus::Running)
+        .req_id(req_id)
+        .seq_id(1)
+        .proto_header(write)
+        .build();
+    let _: Message = client.rpc_check(write_msg)?;
+
+    // Deliberately report the wrong committed length for block 0 so the real
+    // VfsDataset::finalize_block length check fails while block 1 can still commit.
+    blocks[0].len = contents[0].len() as i64 + 1;
+    blocks[1].len = contents[1].len() as i64;
+    let complete = batch_commit_request(&blocks, block_size, req_id, 2, false);
     let complete_msg = Builder::new()
         .code(RpcCode::WriteBlocksBatch)
         .request(RequestStatus::Complete)
         .req_id(req_id)
-        .seq_id(4)
+        .seq_id(2)
         .proto_header(complete)
         .build();
-    let _: Message = client.rpc_check(complete_msg)?;
-    for (block, content) in blocks.iter().zip(contents) {
-        assert_eq!(
-            block_read_bytes(block.id, content.len() as i64, &conf)?,
-            content.as_bytes()
-        );
+    let response: BlocksBatchCommitResponse = client.rpc_check(complete_msg)?.parse_header()?;
+    assert_eq!(response.results, vec![false, true]);
+
+    assert!(block_read_bytes(blocks[0].id, contents[0].len() as i64, &conf).is_err());
+    assert_eq!(
+        block_read_bytes(blocks[1].id, contents[1].len() as i64, &conf)?,
+        contents[1].as_bytes()
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_worker_batch_cancel_reports_success_and_cleans_up_each_block() -> CommonResult<()> {
+    let conf = start_worker();
+    let client = conf.worker_sync_client()?;
+    let block_size = CHUNK_SIZE as i64;
+    let req_id = Utils::req_id();
+    let blocks = [
+        ExtendedBlock::new(Utils::req_id().abs(), 0, StorageType::Disk, FileType::File),
+        ExtendedBlock::new(Utils::req_id().abs(), 0, StorageType::Disk, FileType::File),
+    ];
+
+    let open = BlocksBatchWriteRequest {
+        blocks: blocks
+            .iter()
+            .cloned()
+            .map(ProtoUtils::extend_block_to_pb)
+            .collect(),
+        off: 0,
+        block_size,
+        req_id,
+        seq_id: 0,
+        chunk_size: CHUNK_SIZE,
+        short_circuit: false,
+        client_name: "test".to_string(),
+    };
+    let open_msg = Builder::new()
+        .code(RpcCode::WriteBlocksBatch)
+        .request(RequestStatus::Open)
+        .req_id(req_id)
+        .seq_id(0)
+        .proto_header(open)
+        .build();
+    let _: BlocksBatchWriteResponse = client.rpc_check(open_msg)?.parse_header()?;
+
+    let cancel = batch_commit_request(&blocks, block_size, req_id, 1, true);
+    let cancel_msg = Builder::new()
+        .code(RpcCode::WriteBlocksBatch)
+        .request(RequestStatus::Cancel)
+        .req_id(req_id)
+        .seq_id(1)
+        .proto_header(cancel)
+        .build();
+    let response: BlocksBatchCommitResponse = client.rpc_check(cancel_msg)?.parse_header()?;
+    assert_eq!(response.results, vec![true, true]);
+    for block in blocks {
+        assert!(block_read_bytes(block.id, 1, &conf).is_err());
     }
 
     Ok(())
@@ -532,6 +901,151 @@ fn test_worker_fault_http_control_plane_e2e() -> CommonResult<()> {
     let write_ck = block_write(healthy_block, &conf)?;
     let read_ck = block_read(healthy_block, &conf)?;
     assert_eq!(write_ck, read_ck);
+
+    Ok(())
+}
+
+#[test]
+fn test_worker_batch_disconnect_aborts_open_blocks() -> CommonResult<()> {
+    let conf = start_worker();
+    let client = conf.worker_sync_client()?;
+    let block_size = CHUNK_SIZE as i64;
+    let req_id = Utils::req_id();
+    let blocks = [
+        ExtendedBlock::new(Utils::req_id().abs(), 0, StorageType::Disk, FileType::File),
+        ExtendedBlock::new(Utils::req_id().abs(), 0, StorageType::Disk, FileType::File),
+    ];
+    let open = BlocksBatchWriteRequest {
+        blocks: blocks
+            .iter()
+            .cloned()
+            .map(ProtoUtils::extend_block_to_pb)
+            .collect(),
+        off: 0,
+        block_size,
+        req_id,
+        seq_id: 0,
+        chunk_size: CHUNK_SIZE,
+        short_circuit: true,
+        client_name: "test".to_string(),
+    };
+    let open_msg = Builder::new()
+        .code(RpcCode::WriteBlocksBatch)
+        .request(RequestStatus::Open)
+        .req_id(req_id)
+        .seq_id(0)
+        .proto_header(open)
+        .build();
+    let opened: BlocksBatchWriteResponse = client.rpc_check(open_msg)?.parse_header()?;
+    let paths = opened
+        .results
+        .into_iter()
+        .map(|result| {
+            result
+                .response
+                .expect("successful batch open")
+                .path
+                .expect("short-circuit path")
+        })
+        .collect::<Vec<_>>();
+    assert!(paths.iter().all(|path| std::path::Path::new(path).exists()));
+
+    drop(client);
+    for _ in 0..100 {
+        if paths
+            .iter()
+            .all(|path| !std::path::Path::new(path).exists())
+        {
+            return Ok(());
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    orpc::err_box!(
+        "batch disconnect did not abort all open blocks: {:?}",
+        paths
+    )
+}
+
+#[test]
+fn test_worker_batch_second_open_aborts_previous_state() -> CommonResult<()> {
+    let conf = start_worker();
+    let client = conf.worker_sync_client()?;
+    let block_size = CHUNK_SIZE as i64;
+    let first_req_id = Utils::req_id();
+    let second_req_id = Utils::req_id();
+    let first_blocks = [
+        ExtendedBlock::new(Utils::req_id().abs(), 0, StorageType::Disk, FileType::File),
+        ExtendedBlock::new(Utils::req_id().abs(), 0, StorageType::Disk, FileType::File),
+    ];
+    let second_blocks = [
+        ExtendedBlock::new(Utils::req_id().abs(), 0, StorageType::Disk, FileType::File),
+        ExtendedBlock::new(Utils::req_id().abs(), 0, StorageType::Disk, FileType::File),
+    ];
+
+    let open_batch = |blocks: &[ExtendedBlock], req_id| {
+        Builder::new()
+            .code(RpcCode::WriteBlocksBatch)
+            .request(RequestStatus::Open)
+            .req_id(req_id)
+            .seq_id(0)
+            .proto_header(BlocksBatchWriteRequest {
+                blocks: blocks
+                    .iter()
+                    .cloned()
+                    .map(ProtoUtils::extend_block_to_pb)
+                    .collect(),
+                off: 0,
+                block_size,
+                req_id,
+                seq_id: 0,
+                chunk_size: CHUNK_SIZE,
+                short_circuit: true,
+                client_name: "test".to_string(),
+            })
+            .build()
+    };
+
+    let first: BlocksBatchWriteResponse = client
+        .rpc_check(open_batch(&first_blocks, first_req_id))?
+        .parse_header()?;
+    let first_paths = first
+        .results
+        .into_iter()
+        .map(|result| result.response.unwrap().path.unwrap())
+        .collect::<Vec<_>>();
+    assert!(first_paths
+        .iter()
+        .all(|path| std::path::Path::new(path).exists()));
+
+    let second: BlocksBatchWriteResponse = client
+        .rpc_check(open_batch(&second_blocks, second_req_id))?
+        .parse_header()?;
+    let second_paths = second
+        .results
+        .into_iter()
+        .map(|result| result.response.unwrap().path.unwrap())
+        .collect::<Vec<_>>();
+    assert!(first_paths
+        .iter()
+        .all(|path| !std::path::Path::new(path).exists()));
+    assert!(second_paths
+        .iter()
+        .all(|path| std::path::Path::new(path).exists()));
+
+    let cancel = batch_commit_request(&second_blocks, block_size, second_req_id, 1, true);
+    let cancel_msg = Builder::new()
+        .code(RpcCode::WriteBlocksBatch)
+        .request(RequestStatus::Cancel)
+        .req_id(second_req_id)
+        .seq_id(1)
+        .proto_header(cancel)
+        .build();
+    let response: BlocksBatchCommitResponse = client.rpc_check(cancel_msg)?.parse_header()?;
+    assert_eq!(response.results, vec![true, true]);
+    assert!(second_paths
+        .iter()
+        .all(|path| !std::path::Path::new(path).exists()));
+
     Ok(())
 }
 

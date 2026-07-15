@@ -24,6 +24,7 @@ use log::{info, warn};
 use orpc::common::{ByteUnit, TimeSpent};
 use orpc::handler::MessageHandler;
 use orpc::message::{Builder, Message, RequestStatus};
+use orpc::sys::DataSlice;
 use orpc::{err_box, ternary, try_option_mut, CommonResult};
 use std::mem;
 
@@ -182,21 +183,51 @@ impl WriteHandler {
         Ok(Builder::success(msg).proto_header(response).build())
     }
 
-    fn check_context(context: &WriteContext, msg: &Message) -> FsResult<()> {
-        if context.req_id != msg.req_id() {
+    pub(crate) fn check_req_id(context: &WriteContext, req_id: i64) -> FsResult<()> {
+        if context.req_id != req_id {
             return err_box!(
                 "Request id mismatch, expected {}, actual {}",
                 context.req_id,
-                msg.req_id()
+                req_id
             );
         }
         Ok(())
     }
 
+    pub(crate) fn write_data(
+        file: &mut BlockWriteContext,
+        data: &DataSlice,
+        io_slow_us: u64,
+        metrics: &'static WorkerMetrics,
+    ) -> FsResult<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let spend = TimeSpent::new();
+        file.write_region(data)?;
+
+        let used = spend.used_us();
+        if used >= io_slow_us {
+            warn!(
+                "Slow write data from disk cost: {}us (threshold={}us), path: {} ",
+                used,
+                io_slow_us,
+                file.path()
+            );
+        }
+        metrics.write_bytes.inc_by(data.len() as i64);
+        metrics.write_time_us.inc_by(used as i64);
+        metrics.write_count.inc();
+        Ok(())
+    }
+
     pub fn write(&mut self, msg: &Message) -> FsResult<Message> {
+        let io_slow_us = self.io_slow_us;
+        let metrics = self.metrics;
         let file = try_option_mut!(self.file);
         let context = try_option_mut!(self.context);
-        Self::check_context(context, msg)?;
+        Self::check_req_id(context, msg.req_id())?;
 
         if msg.header_len() > 0 {
             let header: DataHeaderProto = msg.parse_header()?;
@@ -212,35 +243,75 @@ impl WriteHandler {
             }
         }
 
-        let data_len = msg.data_len() as i64;
-        if data_len > 0 {
-            let spend = TimeSpent::new();
-            file.write_region(&msg.data)?;
-
-            let used = spend.used_us();
-            if used >= self.io_slow_us {
-                warn!(
-                    "Slow write data from disk cost: {}us (threshold={}us), path: {} ",
-                    used,
-                    self.io_slow_us,
-                    file.path()
-                );
-            }
-            self.metrics.write_bytes.inc_by(msg.data_len() as i64);
-            self.metrics.write_time_us.inc_by(used as i64);
-            self.metrics.write_count.inc();
-        }
+        Self::write_data(file, &msg.data, io_slow_us, metrics)?;
 
         Ok(msg.success())
     }
 
-    fn commit_block(&self, block: &ExtendedBlock, commit: bool) -> FsResult<()> {
-        if commit {
-            self.store.finalize_block(block)?;
-        } else {
-            self.store.abort_block(block)?;
+    pub(crate) fn complete_block(
+        store: &BlockStore,
+        file: Option<BlockWriteContext>,
+        opened: Option<&WriteContext>,
+        requested: &WriteContext,
+        commit: bool,
+    ) -> FsResult<()> {
+        let opened_block = opened.map(|context| &context.block);
+        let mut file = file;
+        let result = (|| {
+            if let Some(opened) = opened {
+                if opened.req_id != requested.req_id {
+                    return err_box!(
+                        "Request id mismatch, expected {}, actual {}",
+                        opened.req_id,
+                        requested.req_id
+                    );
+                }
+                if opened.block.id != requested.block.id
+                    || opened.block.storage_type != requested.block.storage_type
+                    || opened.block.file_type != requested.block.file_type
+                {
+                    return err_box!(
+                        "write block mismatch: opened={:?}, completed={:?}",
+                        opened.block,
+                        requested.block
+                    );
+                }
+            }
+
+            if requested.block.len > requested.block_size {
+                return err_box!(
+                    "Invalid block length: {}, block size: {}",
+                    requested.block.len,
+                    requested.block_size
+                );
+            }
+
+            if !commit {
+                drop(file.take());
+                store.abort_block(opened_block.unwrap_or(&requested.block))?;
+                return Ok(());
+            }
+
+            if let Some(file) = file.as_mut() {
+                file.flush()?;
+            }
+            drop(file.take());
+            store.finalize_block(&requested.block)?;
+            Ok(())
+        })();
+
+        if result.is_err() {
+            drop(file.take());
+            if let Some(opened_block) = opened_block {
+                if let Err(abort_error) = store.abort_block(opened_block) {
+                    warn!(
+                        "failed to abort block {} after completion error: {}",
+                        opened_block.id, abort_error
+                    );
+                }
+            }
         }
-        Ok(())
+        result
     }
 
     pub fn complete(&mut self, msg: &Message, commit: bool) -> FsResult<Message> {
@@ -252,51 +323,47 @@ impl WriteHandler {
             };
         }
 
-        if let Some(context) = self.context.take() {
-            Self::check_context(&context, msg)?;
-        }
-        let context = WriteContext::from_req(msg)?;
-
-        let file = self.file.take();
-        if let Some(mut file) = file {
-            if let Err(flush_err) = file.flush() {
-                drop(file);
-                if let Err(abort_err) = self.store.abort_block(&context.block) {
-                    log::warn!(
-                        "failed to abort block {} after flush error: {}",
-                        context.block.id,
-                        abort_err
-                    );
+        let opened = self.context.take();
+        let requested = if msg.header_len() == 0 {
+            let Some(opened) = opened.as_ref() else {
+                drop(self.file.take());
+                return err_box!("write completion without open context");
+            };
+            WriteContext {
+                block: opened.block.clone(),
+                req_id: msg.req_id(),
+                chunk_size: opened.chunk_size,
+                short_circuit: opened.short_circuit,
+                off: opened.off,
+                block_size: opened.block_size,
+            }
+        } else {
+            match WriteContext::from_req(msg) {
+                Ok(requested) => requested,
+                Err(error) => {
+                    drop(self.file.take());
+                    if let Some(opened) = opened.as_ref() {
+                        if let Err(abort_error) = self.store.abort_block(&opened.block) {
+                            warn!(
+                                "failed to abort block {} after invalid completion request: {}",
+                                opened.block.id, abort_error
+                            );
+                        }
+                    }
+                    return Err(error);
                 }
-                return Err(flush_err.into());
             }
-            drop(file);
-        }
-
-        if context.block.len > context.block_size {
-            if let Err(abort_err) = self.store.abort_block(&context.block) {
-                log::warn!(
-                    "failed to abort block {} after length check failed: {}",
-                    context.block.id,
-                    abort_err
-                );
-            }
-            return err_box!(
-                "Invalid block length: {}, block size: {}",
-                context.block.len,
-                context.block_size
-            );
-        }
-
-        self.commit_block(&context.block, commit)?;
+        };
+        let file = self.file.take();
+        Self::complete_block(&self.store, file, opened.as_ref(), &requested, commit)?;
         self.is_commit = true;
 
         info!(
             "write block end for req_id {}, is commit: {}, off: {}, len: {}",
             msg.req_id(),
             commit,
-            context.off,
-            context.block.len
+            requested.off,
+            requested.block.len
         );
 
         Ok(msg.success())

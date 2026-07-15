@@ -358,30 +358,50 @@ impl MasterHandler {
 
     pub fn create_files_batch(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: CreateFilesBatchRequest = ctx.parse_header()?;
+        let supports_outcomes = header.supports_outcomes.unwrap_or(false);
 
-        let mut results = Vec::with_capacity(header.requests.len());
+        let mut file_statuses = Vec::with_capacity(header.requests.len());
+        let mut outcomes = Vec::with_capacity(header.requests.len());
         for (index, req) in header.requests.into_iter().enumerate() {
             let opts = ProtoUtils::create_opts_from_pb(req.opts);
             let flags = OpenFlags::new(req.flags);
 
             // Generate unique req_id for each file in batch
             let unique_req_id = ctx.msg.req_id() + index as i64;
-            let status = self.create_file0(unique_req_id, req.path, opts, flags)?;
-            results.push(status);
+            let outcome = match self.create_file0(unique_req_id, req.path, opts, flags) {
+                Ok(status) => {
+                    let status = ProtoUtils::file_status_to_pb(status);
+                    if !supports_outcomes {
+                        file_statuses.push(status.clone());
+                    }
+                    CreateFileBatchOutcome {
+                        file_status: Some(status),
+                        error: None,
+                    }
+                }
+                Err(error) if supports_outcomes => CreateFileBatchOutcome {
+                    file_status: None,
+                    error: Some(error.to_string()),
+                },
+                Err(error) => return Err(error),
+            };
+            if supports_outcomes {
+                outcomes.push(outcome);
+            }
         }
 
         let rep_header = CreateFilesBatchResponse {
-            file_statuses: results
-                .into_iter()
-                .map(ProtoUtils::file_status_to_pb)
-                .collect(),
+            file_statuses,
+            outcomes,
         };
         ctx.response_buf(rep_header, &mut self.buf)
     }
 
     pub fn add_blocks_batch(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: AddBlocksBatchRequest = ctx.parse_header()?;
-        let mut results = Vec::with_capacity(header.requests.len());
+        let supports_outcomes = header.supports_outcomes.unwrap_or(false);
+        let mut blocks = Vec::with_capacity(header.requests.len());
+        let mut outcomes = Vec::with_capacity(header.requests.len());
         for req in header.requests {
             let path = req.path;
             let client_addr = ProtoUtils::client_address_from_pb(req.client_address);
@@ -392,7 +412,7 @@ impl MasterHandler {
                 .collect();
 
             let last_block = req.last_block.map(ProtoUtils::extend_block_from_pb);
-            let located_block = self.fs.add_block(
+            let outcome = match self.fs.add_block(
                 path,
                 req.inode_id,
                 client_addr,
@@ -400,39 +420,73 @@ impl MasterHandler {
                 req.exclude_workers,
                 req.file_len,
                 last_block,
-            )?;
-            results.push(ProtoUtils::located_block_to_pb(located_block));
+            ) {
+                Ok(block) => {
+                    let block = ProtoUtils::located_block_to_pb(block);
+                    if !supports_outcomes {
+                        blocks.push(block.clone());
+                    }
+                    AddBlockBatchOutcome {
+                        block: Some(block),
+                        error: None,
+                    }
+                }
+                Err(error) if supports_outcomes => AddBlockBatchOutcome {
+                    block: None,
+                    error: Some(error.to_string()),
+                },
+                Err(error) => return Err(error),
+            };
+            if supports_outcomes {
+                outcomes.push(outcome);
+            }
         }
 
-        let rep_header = AddBlocksBatchResponse { blocks: results };
+        let rep_header = AddBlocksBatchResponse { blocks, outcomes };
         ctx.response_buf(rep_header, &mut self.buf)
     }
 
     pub fn complete_files_batch(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: CompleteFilesBatchRequest = ctx.parse_header()?;
+        let supports_outcomes = header.supports_outcomes.unwrap_or(false);
 
-        let mut results = Vec::new();
+        let mut results = Vec::with_capacity(header.requests.len());
+        let mut outcomes = Vec::with_capacity(header.requests.len());
         for req in header.requests {
             let commit_blocks = req
                 .commit_blocks
                 .into_iter()
                 .map(ProtoUtils::commit_block_from_pb)
                 .collect();
-            let result = self
-                .fs
-                .complete_file(
-                    req.path,
-                    req.inode_id,
-                    req.len,
-                    commit_blocks,
-                    req.client_name,
-                    req.only_flush,
-                )
-                .is_ok();
-            results.push(result);
+            let outcome = match self.fs.complete_file(
+                req.path,
+                req.inode_id,
+                req.len,
+                commit_blocks,
+                req.client_name,
+                req.only_flush,
+            ) {
+                Ok(_) => {
+                    if !supports_outcomes {
+                        results.push(true);
+                    }
+                    CompleteFileBatchOutcome {
+                        success: true,
+                        error: None,
+                    }
+                }
+                Err(error) if supports_outcomes => CompleteFileBatchOutcome {
+                    success: false,
+                    error: Some(error.to_string()),
+                },
+                Err(error) => return Err(error),
+            };
+            if supports_outcomes {
+                outcomes.push(outcome);
+            }
         }
 
-        let rep_header = CompleteFilesBatchResponse { results };
+        let rep_header = CompleteFilesBatchResponse { results, outcomes };
         ctx.response_buf(rep_header, &mut self.buf)
     }
 

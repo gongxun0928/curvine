@@ -148,7 +148,16 @@ message BlocksBatchWriteRequest {
 
 
 message BlocksBatchWriteResponse {
+    // Legacy dense success list. Populated only when every open succeeds so
+    // indices stay aligned with the request. Prefer `results` for per-item
+    // outcomes, especially when the batch can partially fail.
     repeated BlockWriteResponse responses = 1;
+    repeated BlockBatchOpenResult results = 2;
+}
+
+message BlockBatchOpenResult {
+    optional BlockWriteResponse response = 1;
+    optional string error = 2;
 }
 
 message BlocksBatchCommitRequest {
@@ -158,6 +167,7 @@ message BlocksBatchCommitRequest {
     required int64 req_id = 4;
     required int32 seq_id = 5;
     required bool cancel = 6;
+    repeated bool cancel_flags = 7;
 }
 
 message BlocksBatchCommitResponse {

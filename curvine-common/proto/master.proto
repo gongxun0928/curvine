@@ -57,19 +57,35 @@ message CreateFileResponse {
 }
 
 message CreateFilesBatchRequest {  
-    repeated CreateFileRequest requests = 1;  
-}  
-  
-message CreateFilesBatchResponse {  
-    repeated FileStatusProto file_statuses = 1;  
-}  
+    repeated CreateFileRequest requests = 1;
+    // When true, Master returns per-item `outcomes` and leaves legacy dense
+    // success lists empty. Old clients must keep this unset/false.
+    optional bool supports_outcomes = 2 [default = false];
+}
+
+message CreateFileBatchOutcome {
+    optional FileStatusProto file_status = 1;
+    optional string error = 2;
+}
+
+message CreateFilesBatchResponse {
+    repeated FileStatusProto file_statuses = 1;
+    repeated CreateFileBatchOutcome outcomes = 2;
+}
   
 message CompleteFilesBatchRequest {  
-    repeated CompleteFileRequest requests = 1;  
+    repeated CompleteFileRequest requests = 1;
+    optional bool supports_outcomes = 2 [default = false];
 }  
   
-message CompleteFilesBatchResponse {  
-    repeated bool results = 1;  
+message CompleteFileBatchOutcome {
+    required bool success = 1;
+    optional string error = 2;
+}
+
+message CompleteFilesBatchResponse {
+    repeated bool results = 1;
+    repeated CompleteFileBatchOutcome outcomes = 2;
 }
 
 message OpenFileRequest {
@@ -155,11 +171,18 @@ message AddBlockResponse {
 
 // apply for allocation of blocks batch
 message AddBlocksBatchRequest {  
-    repeated AddBlockRequest requests = 1;  
-}  
-  
-message AddBlocksBatchResponse {  
-    repeated LocatedBlockProto blocks = 1;  
+    repeated AddBlockRequest requests = 1;
+    optional bool supports_outcomes = 2 [default = false];
+}
+
+message AddBlockBatchOutcome {
+    optional LocatedBlockProto block = 1;
+    optional string error = 2;
+}
+
+message AddBlocksBatchResponse {
+    repeated LocatedBlockProto blocks = 1;
+    repeated AddBlockBatchOutcome outcomes = 2;
 }
 
 message RequestReplacementWorkerRequest {

@@ -111,7 +111,6 @@ impl WorkerHandler {
                     Some(BlockHandler::BatchWriter(_)),
                     RpcCode::WriteBlocksBatch
                 )
-                | (Some(BlockHandler::BatchWriter(_)), RpcCode::WriteBlock)
         )
     }
 

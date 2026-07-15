@@ -14,9 +14,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use crate::block::{
-    BlockClientPool, BlockReadContext, CreateBatchBlockContext, CreateBlockContext,
-};
+use crate::block::{BatchBlockOpenResult, BlockClientPool, BlockReadContext, CreateBlockContext};
 use crate::file::FsContext;
 use curvine_common::conf::ClientConf;
 use curvine_common::error::FsError;
@@ -24,8 +22,9 @@ use curvine_common::fs::Path;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse,
-    BlocksBatchCommitRequest, BlocksBatchWriteRequest, BlocksBatchWriteResponse, DataHeaderProto,
-    FileWriteData, FilesBatchWriteRequest,
+    BlocksBatchCommitRequest, BlocksBatchCommitResponse, BlocksBatchWriteRequest,
+    BlocksBatchWriteResponse, DataHeaderProto, FileWriteData, FilesBatchWriteRequest,
+    FilesBatchWriteResponse,
 };
 use curvine_common::state::{ExtendedBlock, StorageType, WorkerAddress};
 use curvine_common::utils::ProtoUtils;
@@ -35,9 +34,53 @@ use orpc::common::LocalTime;
 use orpc::error::ErrorExt;
 use orpc::message::{Builder, Message, RequestStatus};
 use orpc::sys::DataSlice;
-use orpc::{try_option_ref, CommonResult};
+use orpc::{err_box, try_option_ref, CommonResult};
 use std::sync::Arc;
 use std::time::Duration;
+
+fn check_batch_result_count(operation: &str, expected: usize, actual: usize) -> FsResult<()> {
+    if expected != actual {
+        return err_box!(
+            "batch {} result count mismatch, expected {}, actual {}",
+            operation,
+            expected,
+            actual
+        );
+    }
+    Ok(())
+}
+
+fn decode_batch_open_response(
+    expected: usize,
+    response: BlocksBatchWriteResponse,
+) -> FsResult<Vec<BatchBlockOpenResult>> {
+    check_batch_result_count("open", expected, response.results.len())?;
+    Ok(response
+        .results
+        .into_iter()
+        .map(|result| match result.response {
+            Some(response) => Ok(CreateBlockContext {
+                id: response.id,
+                off: response.off,
+                block_size: response.block_size,
+                storage_type: StorageType::from(response.storage_type),
+                path: response.path,
+            }),
+            None => Err(result
+                .error
+                .unwrap_or_else(|| "batch block open failed".to_string())),
+        })
+        .collect())
+}
+
+fn decode_batch_bool_results(
+    operation: &str,
+    expected: usize,
+    results: Vec<bool>,
+) -> FsResult<Vec<bool>> {
+    check_batch_result_count(operation, expected, results.len())?;
+    Ok(results)
+}
 
 pub struct BlockClient {
     client: Option<RpcClient>,
@@ -319,7 +362,7 @@ impl BlockClient {
         seq_id: i32,
         chunk_size: i32,
         short_circuit: bool,
-    ) -> FsResult<CreateBatchBlockContext> {
+    ) -> FsResult<Vec<BatchBlockOpenResult>> {
         let blocks_pb: Vec<_> = blocks
             .iter()
             .map(|block| ProtoUtils::extend_block_to_pb(block.clone()))
@@ -346,20 +389,7 @@ impl BlockClient {
 
         let rep = self.rpc(msg).await?;
         let rep_header: BlocksBatchWriteResponse = rep.parse_header()?;
-        let mut batch_context = CreateBatchBlockContext::new(req_id);
-
-        for response in rep_header.responses {
-            let context = CreateBlockContext {
-                id: response.id,
-                off: response.off,
-                block_size: response.block_size,
-                storage_type: StorageType::from(response.storage_type),
-                path: response.path,
-            };
-            batch_context.push(context);
-        }
-
-        Ok(batch_context)
+        decode_batch_open_response(blocks.len(), rep_header)
     }
 
     pub async fn write_commit_batch(
@@ -369,8 +399,9 @@ impl BlockClient {
         block_size: i64,
         req_id: i64,
         seq_id: i32,
-        cancel: bool,
-    ) -> FsResult<()> {
+        cancels: &[bool],
+    ) -> FsResult<Vec<bool>> {
+        check_batch_result_count("commit request", blocks.len(), cancels.len())?;
         // Convert blocks to protobuf
         let blocks_pb: Vec<_> = blocks
             .iter()
@@ -383,10 +414,11 @@ impl BlockClient {
             block_size,
             req_id,
             seq_id,
-            cancel,
+            cancel: cancels.iter().all(|cancel| *cancel),
+            cancel_flags: cancels.to_vec(),
         };
 
-        let status = if cancel {
+        let status = if cancels.iter().all(|cancel| *cancel) {
             RequestStatus::Cancel
         } else {
             RequestStatus::Complete
@@ -400,8 +432,9 @@ impl BlockClient {
             .proto_header(header)
             .build();
 
-        let _ = self.rpc(msg).await?;
-        Ok(())
+        let response = self.rpc(msg).await?;
+        let response: BlocksBatchCommitResponse = response.parse_header()?;
+        decode_batch_bool_results("commit", blocks.len(), response.results)
     }
 
     pub async fn write_files_batch(
@@ -409,7 +442,7 @@ impl BlockClient {
         files: &[(&Path, &str)],
         req_id: i64,
         seq_id: i32,
-    ) -> CommonResult<()> {
+    ) -> FsResult<Vec<bool>> {
         let file_data: Vec<_> = files
             .iter()
             .map(|(path, content)| FileWriteData {
@@ -432,8 +465,9 @@ impl BlockClient {
             .proto_header(header)
             .build();
 
-        let _ = self.rpc(msg).await?;
-        Ok(())
+        let response = self.rpc(msg).await?;
+        let response: FilesBatchWriteResponse = response.parse_header()?;
+        decode_batch_bool_results("write", files.len(), response.results)
     }
 }
 
@@ -453,5 +487,52 @@ impl Drop for BlockClient {
                 pool.release(client);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curvine_common::proto::{BlockBatchOpenResult, BlockWriteResponse};
+
+    #[test]
+    fn decodes_batch_open_results_in_request_order() {
+        let response = BlocksBatchWriteResponse {
+            responses: Vec::new(),
+            results: vec![
+                BlockBatchOpenResult {
+                    response: Some(BlockWriteResponse {
+                        id: 11,
+                        block_size: 1024,
+                        ..Default::default()
+                    }),
+                    error: None,
+                },
+                BlockBatchOpenResult {
+                    response: None,
+                    error: Some("open failed".to_string()),
+                },
+            ],
+        };
+
+        let results = decode_batch_open_response(2, response).unwrap();
+        assert!(matches!(&results[0], Ok(context) if context.id == 11));
+        assert_eq!(results[1].as_ref().unwrap_err(), "open failed");
+    }
+
+    #[test]
+    fn rejects_batch_result_count_mismatch() {
+        assert!(decode_batch_bool_results("write", 2, vec![true]).is_err());
+        assert!(decode_batch_open_response(
+            2,
+            BlocksBatchWriteResponse {
+                responses: Vec::new(),
+                results: vec![BlockBatchOpenResult {
+                    response: None,
+                    error: Some("failed".to_string()),
+                }],
+            },
+        )
+        .is_err());
     }
 }

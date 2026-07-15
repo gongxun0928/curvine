@@ -15,6 +15,7 @@
 use curvine_common::proto::BlockReadResponse;
 use curvine_common::state::StorageType;
 
+#[derive(Debug)]
 pub struct CreateBlockContext {
     pub id: i64,
     pub off: i64,
@@ -22,6 +23,8 @@ pub struct CreateBlockContext {
     pub path: Option<String>,
     pub storage_type: StorageType,
 }
+
+pub type BatchBlockOpenResult = Result<CreateBlockContext, String>;
 
 pub struct BlockReadContext {
     pub id: i64,
@@ -38,31 +41,5 @@ impl BlockReadContext {
             path: req.path,
             storage_type: StorageType::from(req.storage_type),
         }
-    }
-}
-
-pub struct CreateBatchBlockContext {
-    pub contexts: Vec<CreateBlockContext>,
-    pub batch_id: i64,
-}
-
-impl CreateBatchBlockContext {
-    pub fn new(batch_id: i64) -> Self {
-        Self {
-            contexts: Vec::new(),
-            batch_id,
-        }
-    }
-
-    pub fn push(&mut self, context: CreateBlockContext) {
-        self.contexts.push(context);
-    }
-
-    pub fn len(&self) -> usize {
-        self.contexts.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.contexts.is_empty()
     }
 }

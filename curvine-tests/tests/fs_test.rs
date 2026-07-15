@@ -298,7 +298,7 @@ async fn test_batch_writing(fs: &CurvineFileSystem) -> CommonResult<()> {
         Ok(String::from_utf8(buffer.to_vec())?)
     }
 
-    let num_files = 5;
+    let num_files = 6;
     let small_file_size = 10; // 1KB per file
     let large_file_size = 65; // 1KB per file
     let test_small_data = "x".repeat(small_file_size);
@@ -308,14 +308,20 @@ async fn test_batch_writing(fs: &CurvineFileSystem) -> CommonResult<()> {
     for i in 0..num_files {
         let path_str = format!("/batch_test/batch/file_{}.txt", i);
         let path = Path::from_str(path_str)?;
-        if i == num_files - 1 {
+        if i == num_files - 2 {
             batch_files.push((path.clone(), test_large_data.as_str()));
+            continue;
+        }
+        if i == num_files - 1 {
+            batch_files.push((path, ""));
             continue;
         }
         batch_files.push((path, test_small_data.as_str()));
     }
 
-    fs.write_batch_string(&batch_files).await?;
+    let outcomes = fs.write_batch_string(&batch_files).await?;
+    assert_eq!(outcomes.len(), batch_files.len());
+    assert!(outcomes.iter().all(Result::is_ok));
     // Using batch
     // Get block locations for all files
     let mut results = Vec::new();
@@ -329,7 +335,7 @@ async fn test_batch_writing(fs: &CurvineFileSystem) -> CommonResult<()> {
         let status = fs.get_status(path).await?;
 
         let content = read_file_content(fs, path).await?;
-        if i == num_files - 1 {
+        if i == num_files - 2 {
             assert_eq!(
                 status.len, large_file_size as i64,
                 "File {} length mismatch",
@@ -342,6 +348,9 @@ async fn test_batch_writing(fs: &CurvineFileSystem) -> CommonResult<()> {
                 i
             );
             assert_eq!(content, test_large_data, "File {} content mismatch", i);
+        } else if i == num_files - 1 {
+            assert_eq!(status.len, 0, "empty file length mismatch");
+            assert!(content.is_empty(), "empty file content mismatch");
         } else {
             assert_eq!(
                 status.len, small_file_size as i64,
@@ -359,6 +368,37 @@ async fn test_batch_writing(fs: &CurvineFileSystem) -> CommonResult<()> {
 
         println!("Verified file_{}: len={}, content matches", i, status.len);
     }
+
+    // One metadata failure must not hide the outcome or stop an independent file.
+    let conflict = Path::from_str("/batch_test/batch/conflict")?;
+    fs.mkdir(&conflict, true).await?;
+    let independent = Path::from_str("/batch_test/batch/independent.txt")?;
+    let partial = vec![(independent.clone(), "ok"), (conflict, "must fail")];
+    let outcomes = fs.write_batch_string(&partial).await?;
+    assert!(outcomes[0].is_ok());
+    assert!(outcomes[1].is_err());
+    assert_eq!(read_file_content(fs, &independent).await?, "ok");
+
+    // A standalone fallback must not overtake earlier pending small files.
+    let order_parent = Path::from_str("/batch_test/order/parent")?;
+    let order_child = Path::from_str("/batch_test/order/parent/child")?;
+    let ordered = vec![
+        (order_parent.clone(), "small"),
+        (order_child.clone(), test_large_data.as_str()),
+    ];
+    let outcomes = fs.write_batch_string(&ordered).await?;
+    assert!(outcomes[0].is_ok());
+    assert!(outcomes[1].is_err());
+    assert_eq!(read_file_content(fs, &order_parent).await?, "small");
+    assert!(!fs.exists(&order_child).await?);
+
+    // Duplicate paths are structurally invalid and must fail before any I/O.
+    let duplicate = Path::from_str("/batch_test/batch/duplicate.txt")?;
+    let duplicates = vec![(duplicate.clone(), "first"), (duplicate.clone(), "second")];
+    let error = fs.write_batch_string(&duplicates).await.unwrap_err();
+    assert!(error.to_string().contains("duplicate path"));
+    assert!(!fs.exists(&duplicate).await?);
+
     println!("✓ All {} files written and verified correctly", num_files);
     Ok(())
 }
