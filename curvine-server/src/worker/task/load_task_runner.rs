@@ -369,7 +369,7 @@ impl LoadTaskRunner {
                     // segment onto the pre-resized target.
                     if task.is_cancel() {
                         let _ = writer.cancel().await;
-                        return FsResult::Ok(0);
+                        return err_box!("Task {} was cancelled", task.info.task_id);
                     }
                     if LocalTime::mills() > deadline_ms {
                         let _ = writer.cancel().await;
@@ -433,6 +433,14 @@ impl LoadTaskRunner {
                 }
                 Ok(Err(e)) => {
                     Self::abort_remaining(&handles, idx + 1);
+                    // A stream can observe cancellation after the parent checked
+                    // before awaiting it. Treat that cancellation as the same
+                    // soft exit as the serial path, but never continue to cache
+                    // validation stamping below.
+                    if self.task.is_cancel() {
+                        info!("task {} was cancelled", self.task.info.task_id);
+                        return Ok(());
+                    }
                     return Err(e);
                 }
                 Err(e) => {
@@ -448,6 +456,22 @@ impl LoadTaskRunner {
                     self.task_timeout_ms
                 );
             }
+        }
+
+        // A pre-resized target already reports src_len even when a stream was
+        // cancelled before writing its segment. Stamp cache validity only after
+        // every byte was copied and cancellation has not won the final race.
+        let is_cancelled = self.task.is_cancel();
+        if !Self::can_stamp_parallel_cache(written, src_len, is_cancelled) {
+            if is_cancelled {
+                info!("task {} was cancelled", self.task.info.task_id);
+                return Ok(());
+            }
+            return err_box!(
+                "parallel load wrote {} bytes, expected {}",
+                written,
+                src_len
+            );
         }
 
         // ufs -> cv: stamp the source mtime onto the cached file (cache validity).
@@ -477,6 +501,10 @@ impl LoadTaskRunner {
     /// abort is best-effort (it fires at the next await point); combined with the
     /// in-loop is_cancel()/deadline checks this bounds how long a stream can run
     /// past the parent's decision to stop.
+    fn can_stamp_parallel_cache(written: i64, src_len: i64, is_cancelled: bool) -> bool {
+        !is_cancelled && written == src_len
+    }
+
     fn abort_remaining(handles: &[orpc::runtime::JoinHandle<FsResult<i64>>], from: usize) {
         for h in handles.iter().skip(from) {
             h.abort();
@@ -692,4 +720,17 @@ mod tests {
         assert_eq!(LoadTaskRunner::stream_count(1024 * MB, 0, 8), 8);
         assert_eq!(LoadTaskRunner::stream_count(1024 * MB, 256 * MB, 0), 1);
     }
+
+    #[test]
+    fn cancelled_or_incomplete_parallel_copy_cannot_stamp_cache_validity() {
+        // Before the fix, a cancelled final stream returned Ok(0), and the
+        // pre-resized target could receive a matching ufs_mtime despite only
+        // partial data having been copied.
+        assert!(!LoadTaskRunner::can_stamp_parallel_cache(0, 8 * MB, true));
+        assert!(!LoadTaskRunner::can_stamp_parallel_cache(7 * MB, 8 * MB, false));
+
+        // A complete, non-cancelled copy remains eligible to stamp cache validity.
+        assert!(LoadTaskRunner::can_stamp_parallel_cache(8 * MB, 8 * MB, false));
+    }
+
 }
