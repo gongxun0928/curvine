@@ -29,6 +29,7 @@ use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel,
 use orpc::sync::{AtomicCounter, AtomicLong, ErrorMonitor};
 use orpc::sys::DataSlice;
 use std::sync::Arc;
+use tokio::sync::watch;
 
 enum WriteTask {
     Write(i64, Bytes, Option<FuseResponse>),
@@ -62,6 +63,20 @@ pub struct FuseWriter {
     /// `stream_write_queue_depth` guard. (The `path_type` label is captured as a
     /// local and moved into the writer task, not stored here.)
     metrics_enabled: bool,
+    drain_rx: watch::Receiver<bool>,
+}
+
+pub(crate) struct FuseWriterDrain {
+    drain_rx: watch::Receiver<bool>,
+}
+
+impl FuseWriterDrain {
+    pub async fn wait(mut self) {
+        let closed = *self.drain_rx.borrow();
+        if !closed {
+            let _ = self.drain_rx.changed().await;
+        }
+    }
 }
 
 /// Drop a dequeued task's `stream_write_queue_depth` guard, decrementing the gauge
@@ -90,6 +105,7 @@ impl FuseWriter {
         // the writer task for the per-IO observe (same as FuseReader).
         let path_type = writer.path_type();
         let metrics_enabled = conf.metrics_enabled;
+        let (drain_tx, drain_rx) = watch::channel(false);
 
         let len1 = len.clone();
         let mtime1 = mtime.clone();
@@ -105,6 +121,7 @@ impl FuseWriter {
                     monitor.set_error(e);
                 }
             }
+            let _ = drain_tx.send(true);
         });
 
         Self {
@@ -117,6 +134,13 @@ impl FuseWriter {
             mtime,
             write_ver,
             metrics_enabled,
+            drain_rx,
+        }
+    }
+
+    pub(crate) fn drain(&self) -> FuseWriterDrain {
+        FuseWriterDrain {
+            drain_rx: self.drain_rx.clone(),
         }
     }
 

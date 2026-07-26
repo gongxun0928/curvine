@@ -44,13 +44,13 @@ impl<T> Default for SharedState<T> {
 /// `release_with_cleanup` must not call back into this map with the same key;
 /// doing so would wait on the same per-key mutex.
 pub struct AsyncSharedMap<K, T> {
-    inner: FastDashMap<K, Arc<Mutex<SharedState<T>>>>,
+    inner: Arc<FastDashMap<K, Arc<Mutex<SharedState<T>>>>>,
 }
 
 impl<K: Eq + Hash, T> Default for AsyncSharedMap<K, T> {
     fn default() -> Self {
         Self {
-            inner: FastDashMap::default(),
+            inner: Arc::new(FastDashMap::default()),
         }
     }
 }
@@ -70,6 +70,27 @@ impl<K: Eq + Hash + Display + Clone, T> AsyncSharedMap<K, T> {
 
     pub fn keys(&self) -> Vec<K> {
         self.inner.iter().map(|entry| entry.key().clone()).collect()
+    }
+
+    pub fn contains_key(&self, key: &K) -> bool {
+        self.inner.contains_key(key)
+    }
+
+    /// Return whether a key has an active resource or an operation currently
+    /// owns its per-key lock. An abandoned empty entry is not considered active.
+    pub fn has_resource_or_pending(&self, key: &K) -> bool {
+        loop {
+            let Some(entry) = self.inner.get(key).map(|entry| entry.clone()) else {
+                return false;
+            };
+            let Ok(state) = entry.try_lock() else {
+                return true;
+            };
+            if !self.is_current_entry(key, &entry) {
+                continue;
+            }
+            return state.resource.is_some() || state.refs > 0;
+        }
     }
 
     fn get_entry(&self, k: K) -> Arc<Mutex<SharedState<T>>> {
@@ -136,8 +157,8 @@ impl<K: Eq + Hash + Display + Clone, T> AsyncSharedMap<K, T> {
             let resource = match fut.await {
                 Ok(resource) => resource,
                 Err(e) => {
-                    drop(state);
                     self.remove_entry(&key, &entry);
+                    drop(state);
                     return Err(e);
                 }
             };
@@ -196,8 +217,8 @@ impl<K: Eq + Hash + Display + Clone, T> AsyncSharedMap<K, T> {
         let mut state = entry.lock().await;
 
         if state.refs == 0 || state.resource.is_none() {
-            drop(state);
             self.remove_entry(&key, &entry);
+            drop(state);
             return (true, Ok(()));
         }
 
@@ -211,9 +232,8 @@ impl<K: Eq + Hash + Display + Clone, T> AsyncSharedMap<K, T> {
         state.refs = 0;
 
         let res = fut.await;
-        drop(state);
-
         self.remove_entry(&key, &entry);
+        drop(state);
 
         (true, res)
     }
@@ -240,8 +260,8 @@ impl<K: Eq + Hash + Display + Clone, T> AsyncSharedMap<K, T> {
         let mut state = entry.lock().await;
 
         if state.refs == 0 || state.resource.is_none() {
-            drop(state);
             self.remove_entry(&key, &entry);
+            drop(state);
             return (true, Ok(()));
         }
 
@@ -254,8 +274,78 @@ impl<K: Eq + Hash + Display + Clone, T> AsyncSharedMap<K, T> {
         }
 
         state.resource.take();
-        drop(state);
         self.remove_entry(&key, &entry);
+        drop(state);
+
+        (true, result)
+    }
+
+    /// Release one reference after cleanup, blocking replacement creation while
+    /// a failed final resource drains in the background.
+    ///
+    /// On a successful final cleanup this behaves like `release_with_cleanup`.
+    /// On a failed final cleanup, the active resource is removed immediately,
+    /// but its per-key mutex remains locked until `drain` completes. This lets
+    /// the caller release ownership without admitting a second resource for the
+    /// same key while asynchronous teardown is still running.
+    pub async fn release_with_cleanup_and_drain<E, F, Fut, D>(
+        &self,
+        key: K,
+        cleanup: F,
+        drain: D,
+    ) -> (bool, Result<(), E>)
+    where
+        K: Send + Sync + 'static,
+        T: Send + Sync + 'static,
+        E: Error,
+        F: FnOnce(bool) -> Fut,
+        Fut: Future<Output = Result<(), E>>,
+        D: Future<Output = ()> + Send + 'static,
+    {
+        let entry = match self.inner.get(&key) {
+            Some(entry) => entry.clone(),
+            None => return (true, Ok(())),
+        };
+
+        let mut state = entry.clone().lock_owned().await;
+
+        if state.refs == 0 || state.resource.is_none() {
+            self.remove_entry(&key, &entry);
+            drop(state);
+            return (true, Ok(()));
+        }
+
+        let last = state.refs == 1;
+        let result = cleanup(last).await;
+
+        state.refs -= 1;
+        if state.refs > 0 {
+            return (false, result);
+        }
+
+        let resource = state.resource.take();
+        if result.is_ok() {
+            drop(resource);
+            self.remove_entry(&key, &entry);
+            drop(state);
+            return (true, result);
+        }
+
+        state.refs = 0;
+        let inner = self.inner.clone();
+        let entry_for_remove = entry.clone();
+        drop(tokio::spawn(async move {
+            // The drain future must not own the resource. Dropping the map's
+            // reference here lets the caller's remaining owners control when
+            // the underlying asynchronous task can actually exit.
+            drop(resource);
+            drain.await;
+            inner.remove_if(&key, |_, current| Arc::ptr_eq(current, &entry_for_remove));
+            // Remove the entry before unlocking it. A waiter that already
+            // cloned this entry will observe that it is stale and retry
+            // instead of publishing a replacement that this task removes.
+            drop(state);
+        }));
 
         (true, result)
     }
@@ -341,6 +431,7 @@ mod tests {
         assert!(release_task.await.unwrap());
         assert_eq!(*create_task.await.unwrap(), 2);
         assert_eq!(creators.load(Ordering::SeqCst), 1);
+        assert_eq!(*map.get(&1).await.unwrap(), 2);
     }
 
     #[tokio::test]
@@ -433,6 +524,7 @@ mod tests {
         started_rx.await.unwrap();
         creating.abort();
         assert!(creating.await.unwrap_err().is_cancelled());
+        assert!(!map.has_resource_or_pending(&1));
 
         let resource = timeout(
             Duration::from_secs(1),
@@ -609,6 +701,59 @@ mod tests {
         assert!(released);
         assert!(result.is_ok());
         assert!(map.get(&1).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_final_cleanup_blocks_replacement_until_drain_finishes() {
+        let map = Arc::new(AsyncSharedMap::<u64, u64>::new());
+        map.insert::<StringError>(1, Arc::new(7)).await.unwrap();
+        let (finish_drain_tx, finish_drain_rx) = oneshot::channel();
+
+        let (released, result) = map
+            .release_with_cleanup_and_drain(
+                1,
+                |last| async move {
+                    assert!(last);
+                    Err::<(), _>(StringError::from("cleanup failed"))
+                },
+                async move {
+                    let _ = finish_drain_rx.await;
+                },
+            )
+            .await;
+        assert!(released);
+        assert!(result.is_err());
+        assert!(map.contains_key(&1));
+        assert!(map.has_resource_or_pending(&1));
+
+        let creators = Arc::new(AtomicUsize::new(0));
+        let create_map = map.clone();
+        let create_count = creators.clone();
+        let mut create_task = tokio::spawn(async move {
+            create_map
+                .get_or_create(1, async {
+                    create_count.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, StringError>(Arc::new(8))
+                })
+                .await
+                .unwrap()
+        });
+
+        assert!(timeout(Duration::from_millis(50), &mut create_task)
+            .await
+            .is_err());
+        assert_eq!(creators.load(Ordering::SeqCst), 0);
+
+        finish_drain_tx.send(()).unwrap();
+        assert_eq!(
+            *timeout(Duration::from_secs(1), create_task)
+                .await
+                .unwrap()
+                .unwrap(),
+            8
+        );
+        assert_eq!(creators.load(Ordering::SeqCst), 1);
+        assert_eq!(*map.get(&1).await.unwrap(), 8);
     }
 
     #[tokio::test]

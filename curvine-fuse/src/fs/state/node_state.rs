@@ -588,15 +588,22 @@ impl NodeState {
         let close_result: FuseResult<()> = match handle.as_ref() {
             FileHandle::Backend(_) if handle.has_writer() => {
                 let cleanup_handle = handle.clone();
+                let writer_drain = handle
+                    .writer_drain()
+                    .expect("a writer-backed handle must expose its drain signal");
                 let (_, cleanup_result) = self
                     .writers
-                    .release_with_cleanup(handle.ino(), move |last| async move {
-                        if last {
-                            cleanup_handle.complete(None).await
-                        } else {
-                            cleanup_handle.flush(None).await
-                        }
-                    })
+                    .release_with_cleanup_and_drain(
+                        handle.ino(),
+                        move |last| async move {
+                            if last {
+                                cleanup_handle.complete(None).await
+                            } else {
+                                cleanup_handle.flush(None).await
+                            }
+                        },
+                        writer_drain.wait(),
+                    )
                     .await;
                 cleanup_result
             }
@@ -606,8 +613,9 @@ impl NodeState {
 
         // FUSE sends RELEASE once per open handle, and its error is not retried.
         // Remove the handle regardless of the close result so open-handle and
-        // shared-writer accounting continue to reflect kernel ownership.
-        // Retriable backend cleanup must be tracked separately (#1221).
+        // shared-writer accounting continue to reflect kernel ownership. A
+        // failed final cleanup leaves a draining writer tombstone until the
+        // writer task exits; broader bounded retry remains tracked by #1221.
         let _ = self.remove_handle(ino, fh);
 
         Ok((handle, close_result))
@@ -651,23 +659,26 @@ impl NodeState {
         // section.  While we hold dir_write, no concurrent fs_open/fs_create
         // can acquire dir_read, so no new handles can be registered — the
         // has_open_handles result is accurate.
-        let has_handles = {
+        let has_handles_or_writer = {
             let mut dir = self.dir_write();
             dir.unlink(parent, name, true)?;
-            self.has_open_handles(ino)
+            self.has_open_handles(ino) || self.writers.has_resource_or_pending(&ino)
         };
 
-        if has_handles {
-            debug!("unlink ino={}, path={}: open handles, deferring", ino, path);
+        if has_handles_or_writer {
+            debug!(
+                "unlink ino={}, path={}: open handles or draining writer, deferring",
+                ino, path
+            );
             return Ok(());
         }
 
-        // Re-check for a concurrent fs_open that may have registered a handle
-        // while we waited.  If so, defer — release() will delete via
-        // deferred_delete_ready.
-        if self.has_open_handles(ino) {
+        // Re-check for a concurrent fs_open or draining writer that may have
+        // appeared while we waited. If so, defer — release() or the background
+        // cleanup path will retain the pending-delete mark.
+        if self.has_open_handles(ino) || self.writers.has_resource_or_pending(&ino) {
             debug!(
-                "unlink ino={}, path={}: handle appeared, deferring",
+                "unlink ino={}, path={}: handle or writer appeared, deferring",
                 ino, path
             );
             return Ok(());
@@ -690,8 +701,12 @@ impl NodeState {
     }
 
     pub async fn deferred_delete_ready(&self, ino: u64) -> FuseResult<bool> {
-        // Early exit if there are open handles or no pending delete.
-        if self.has_open_handles(ino) || !self.dir_read().pending_delete(ino) {
+        // A writer entry can outlive its final kernel handle while failed
+        // cleanup drains. Do not delete the backend until that writer is gone.
+        if self.has_open_handles(ino)
+            || self.writers.has_resource_or_pending(&ino)
+            || !self.dir_read().pending_delete(ino)
+        {
             return Ok(false);
         }
 
@@ -1286,7 +1301,11 @@ mod test {
     use curvine_common::state::FileStatus;
     use orpc::common::{FastHashMap, Utils};
     use orpc::runtime::{AsyncRuntime, RpcRuntime};
+    #[cfg(target_os = "linux")]
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    #[cfg(target_os = "linux")]
+    use tokio::time::{timeout, Duration};
 
     fn file_handle(ino: u64, fh: u64) -> Arc<FileHandle> {
         Arc::new(FileHandle::new_backend(
@@ -1569,11 +1588,20 @@ mod test {
                 .await
                 .unwrap();
 
-            let (_, first_result) = state.release_handle(1, handle.fh()).await.unwrap();
+            let (released_handle, first_result) =
+                state.release_handle(1, handle.fh()).await.unwrap();
             assert!(first_result.is_err());
             assert!(state.find_handle(1, handle.fh()).is_err());
             assert!(!state.has_open_handles(1));
-            assert!(state.find_writer(1).await.is_none());
+            assert!(state.writers.has_resource_or_pending(&1));
+
+            drop(released_handle);
+            drop(handle);
+            drop(fuse_writer);
+            assert!(timeout(Duration::from_secs(5), state.find_writer(1))
+                .await
+                .unwrap()
+                .is_none());
         });
     }
 
@@ -1626,11 +1654,104 @@ mod test {
             assert!(state.has_open_handles(1));
             assert!(state.find_writer(1).await.is_some());
 
-            let (_, second_result) = state.release_handle(1, second_handle.fh()).await.unwrap();
+            let (released_handle, second_result) =
+                state.release_handle(1, second_handle.fh()).await.unwrap();
             assert!(second_result.is_err());
             assert!(state.find_handle(1, second_handle.fh()).is_err());
             assert!(!state.has_open_handles(1));
-            assert!(state.find_writer(1).await.is_none());
+            assert!(state.writers.has_resource_or_pending(&1));
+
+            drop(released_handle);
+            drop(first_handle);
+            drop(second_handle);
+            drop(fuse_writer);
+            assert!(timeout(Duration::from_secs(5), state.find_writer(1))
+                .await
+                .unwrap()
+                .is_none());
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_last_release_blocks_replacement_until_old_writer_drains() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let task_rt = rt.clone();
+
+        rt.block_on(async move {
+            crate::FuseMetrics::ensure_init().unwrap();
+            let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), task_rt.clone()).unwrap();
+            let state = Arc::new(NodeState::new(fs).unwrap());
+
+            let full_path = Path::from_str("/dev/full").unwrap();
+            let local_writer = LocalWriter::new(&full_path, 1).unwrap();
+            let status = local_writer.status().clone();
+            let fuse_writer = Arc::new(FuseWriter::new(
+                &state.conf,
+                task_rt.clone(),
+                UnifiedWriter::Local(local_writer),
+            ));
+            state
+                .writers
+                .insert::<FuseError>(1, fuse_writer.clone())
+                .await
+                .unwrap();
+            let handle = state
+                .insert_handle_with_writer(1, None, Some(fuse_writer.clone()), status)
+                .await;
+            fuse_writer
+                .write(0, Bytes::from_static(b"x"), None)
+                .await
+                .unwrap();
+
+            let (released_handle, release_result) =
+                state.release_handle(1, handle.fh()).await.unwrap();
+            assert!(release_result.is_err());
+
+            let creator_started = Arc::new(AtomicBool::new(false));
+            let replacement_state = state.clone();
+            let creator_state = state.clone();
+            let replacement_rt = task_rt.clone();
+            let replacement_started = creator_started.clone();
+            let replacement_path = full_path.clone();
+            let mut replacement_task = tokio::spawn(async move {
+                replacement_state
+                    .writers
+                    .get_or_create(1, async move {
+                        replacement_started.store(true, Ordering::SeqCst);
+                        let writer = LocalWriter::new(&replacement_path, 1).unwrap();
+                        Ok::<_, FuseError>(Arc::new(FuseWriter::new(
+                            &creator_state.conf,
+                            replacement_rt,
+                            UnifiedWriter::Local(writer),
+                        )))
+                    })
+                    .await
+            });
+
+            assert!(timeout(Duration::from_millis(50), &mut replacement_task)
+                .await
+                .is_err());
+            assert!(!creator_started.load(Ordering::SeqCst));
+
+            drop(released_handle);
+            drop(handle);
+            drop(fuse_writer);
+
+            let replacement_writer = timeout(Duration::from_secs(5), replacement_task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(creator_started.load(Ordering::SeqCst));
+
+            let (released, cleanup_result) = state
+                .writers
+                .release_with_cleanup(1, |_| async { Ok::<_, FuseError>(()) })
+                .await;
+            assert!(released);
+            cleanup_result.unwrap();
+            drop(replacement_writer);
         });
     }
 }

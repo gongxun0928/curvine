@@ -66,6 +66,12 @@ impl FileHandle {
         }
     }
 
+    pub(crate) fn writer_drain(&self) -> Option<crate::fs::fuse_writer::FuseWriterDrain> {
+        match self {
+            FileHandle::Backend(h) => h.writer.as_ref().map(|writer| writer.drain()),
+        }
+    }
+
     pub async fn read(
         &self,
         state: &NodeState,
