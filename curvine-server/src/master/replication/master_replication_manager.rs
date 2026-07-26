@@ -28,6 +28,7 @@ use orpc::message::{Builder, RequestStatus};
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::sync::FastDashMap;
 use orpc::{err_box, try_option, CommonResult};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -44,6 +45,7 @@ pub struct MasterReplicationManager {
 
     staging_queue_sender: Arc<Sender<BlockId>>,
     inflight_blocks: Arc<FastDashMap<BlockId, InflightReplicationJob>>,
+    next_job_id: Arc<AtomicU64>,
 
     worker_client_factory: Arc<ClientFactory>,
 
@@ -53,9 +55,29 @@ pub struct MasterReplicationManager {
 }
 
 struct InflightReplicationJob {
-    _block_id: BlockId,
-    permit: OwnedSemaphorePermit,
+    job_id: u64,
+    _permit: OwnedSemaphorePermit,
     target_worker: WorkerAddress,
+}
+
+fn insert_inflight_job(
+    inflight_blocks: &FastDashMap<BlockId, InflightReplicationJob>,
+    block_id: BlockId,
+    job: InflightReplicationJob,
+) -> bool {
+    let job_id = job.job_id;
+    let current = inflight_blocks.entry(block_id).or_insert(job);
+    current.job_id == job_id
+}
+
+fn remove_inflight_job(
+    inflight_blocks: &FastDashMap<BlockId, InflightReplicationJob>,
+    block_id: BlockId,
+    job_id: u64,
+) -> Option<InflightReplicationJob> {
+    inflight_blocks
+        .remove_if(&block_id, |_, job| job.job_id == job_id)
+        .map(|(_, job)| job)
 }
 
 impl MasterReplicationManager {
@@ -75,6 +97,7 @@ impl MasterReplicationManager {
             replication_semaphore: Arc::new(semaphore),
             staging_queue_sender: Arc::new(send),
             inflight_blocks: Default::default(),
+            next_job_id: Arc::new(AtomicU64::new(0)),
             worker_client_factory: Arc::new(Default::default()),
             replication_enabled: conf.master.block_replication_enabled,
             metrics: Master::get_metrics()?,
@@ -91,6 +114,7 @@ impl MasterReplicationManager {
         async_runtime.spawn(async move {
             let manager = fork;
             while let Some(block_id) = recv.recv().await {
+                manager.metrics.replication_staging_number.dec();
                 let permit = match manager.replication_semaphore.clone().acquire_owned().await {
                     Ok(permit) => permit,
                     Err(e) => {
@@ -174,37 +198,46 @@ impl MasterReplicationManager {
             .request(RequestStatus::Rpc)
             .proto_header(request)
             .build();
-        match source_worker_client.rpc(msg).await {
-            Ok(response) => {
-                let response: SubmitBlockReplicationResponse = response.parse_header()?;
-                if !response.success {
-                    return err_box!(
-                        "Errors on submit replication job to {}. err: {:?}",
-                        &source_worker_addr,
-                        response.message
-                    );
-                }
-            }
-            Err(e) => {
-                return err_box!(
-                    "Errors on sending replication job to {}, err: {:?}",
-                    &source_worker_addr,
-                    e
-                );
-            }
-        }
-
-        // step4: add into the replicating queue
-        self.inflight_blocks.insert(
+        // Register before the submit RPC. The worker acknowledges as soon as the
+        // job is queued and reports on another connection, so the report can
+        // otherwise reach the master before this await resumes.
+        let job_id = self.next_job_id.fetch_add(1, Ordering::Relaxed);
+        if !insert_inflight_job(
+            &self.inflight_blocks,
             block_id,
             InflightReplicationJob {
-                _block_id: block_id,
-                permit,
+                job_id,
+                _permit: permit,
                 target_worker: target_worker_addr,
             },
-        );
-        self.metrics.replication_staging_number.dec();
+        ) {
+            return err_box!("Block {} already has an inflight replication", block_id);
+        }
         self.metrics.replication_inflight_number.inc();
+
+        let submit_result = match source_worker_client.rpc(msg).await {
+            Ok(response) => match response.parse_header::<SubmitBlockReplicationResponse>() {
+                Ok(response) if response.success => Ok(()),
+                Ok(response) => err_box!(
+                    "Errors on submit replication job to {}. err: {:?}",
+                    &source_worker_addr,
+                    response.message
+                ),
+                Err(e) => Err(e),
+            },
+            Err(e) => err_box!(
+                "Errors on sending replication job to {}, err: {:?}",
+                &source_worker_addr,
+                e
+            ),
+        };
+
+        if let Err(e) = submit_result {
+            if remove_inflight_job(&self.inflight_blocks, block_id, job_id).is_some() {
+                self.metrics.replication_inflight_number.dec();
+            }
+            return Err(e);
+        }
 
         Ok(())
     }
@@ -248,9 +281,13 @@ impl MasterReplicationManager {
         let storage_type = req.storage_type;
         match self.inflight_blocks.remove(&block_id) {
             None => {
-                warn!("Should not happen that Block {} not found", block_id);
+                warn!(
+                    "Ignoring stale or duplicate replication result for block {}",
+                    block_id
+                );
             }
             Some(entry) => {
+                self.metrics.replication_inflight_number.dec();
                 if success {
                     info!("Successfully replicated {}", block_id);
                     let dir = self.fs.fs_dir.write();
@@ -264,10 +301,58 @@ impl MasterReplicationManager {
                     );
                     self.metrics.replication_failure_count.inc();
                 }
-                drop(entry.1.permit);
-                self.metrics.replication_inflight_number.dec();
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{insert_inflight_job, remove_inflight_job, BlockId, InflightReplicationJob};
+    use curvine_common::state::WorkerAddress;
+    use orpc::sync::FastDashMap;
+    use tokio::sync::Semaphore;
+
+    async fn job(semaphore: &std::sync::Arc<Semaphore>, job_id: u64) -> InflightReplicationJob {
+        InflightReplicationJob {
+            job_id,
+            _permit: semaphore.clone().acquire_owned().await.unwrap(),
+            target_worker: WorkerAddress::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn rollback_only_removes_its_own_inflight_generation() {
+        let semaphore = std::sync::Arc::new(Semaphore::new(2));
+        let inflight = FastDashMap::<BlockId, InflightReplicationJob>::default();
+
+        assert!(insert_inflight_job(&inflight, 7, job(&semaphore, 1).await));
+        assert!(!insert_inflight_job(&inflight, 7, job(&semaphore, 2).await));
+        assert_eq!(semaphore.available_permits(), 1);
+
+        assert!(remove_inflight_job(&inflight, 7, 2).is_none());
+        assert!(inflight.contains_key(&7));
+        assert_eq!(semaphore.available_permits(), 1);
+
+        drop(remove_inflight_job(&inflight, 7, 1));
+        assert!(!inflight.contains_key(&7));
+        assert_eq!(semaphore.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn early_report_removal_makes_submit_rollback_a_noop() {
+        let semaphore = std::sync::Arc::new(Semaphore::new(1));
+        let inflight = FastDashMap::<BlockId, InflightReplicationJob>::default();
+
+        assert!(insert_inflight_job(&inflight, 8, job(&semaphore, 1).await));
+        assert_eq!(semaphore.available_permits(), 0);
+
+        // Simulate a worker report racing ahead of the submit RPC response.
+        drop(inflight.remove(&8));
+        assert_eq!(semaphore.available_permits(), 1);
+
+        assert!(remove_inflight_job(&inflight, 8, 1).is_none());
+        assert_eq!(semaphore.available_permits(), 1);
     }
 }
