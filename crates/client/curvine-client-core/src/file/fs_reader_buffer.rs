@@ -314,10 +314,14 @@ impl FsReaderBuffer {
         // Byte-budgeted prefetch window: with large frames the message-count
         // channel capacity alone would let one lane buffer
         // read_chunk_num * target bytes. Keep the window at the historical
-        // read_chunk_size * read_chunk_num bytes.
+        // read_chunk_size * read_chunk_num bytes, and cap the coalesced frame
+        // target at half the window so the producer can fetch the next frame
+        // while the consumer still holds the current one (pipeline depth 2
+        // frames per lane; without it every frame boundary stalls the
+        // foreground reader until the next fetch completes).
         let chunk_len = chunk_size as i64;
         let window_bytes = chunk_len.saturating_mul(chunk_num as i64).max(chunk_len);
-        let seq_fetch_len = Self::SEQ_FETCH_TARGET.min(window_bytes);
+        let seq_fetch_len = Self::SEQ_FETCH_TARGET.min(window_bytes / 2).max(chunk_len);
 
         let pos = 0;
         let len = file_blocks.status.len;
