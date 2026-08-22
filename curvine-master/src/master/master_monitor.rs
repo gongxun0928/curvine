@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_raft::raft::RoleState;
+use curvine_raft::raft::{EpochCtl, RoleState};
 use curvine_runtime::sync::StateCtl;
 use num_enum::{FromPrimitive, IntoPrimitive};
 
@@ -37,14 +37,31 @@ pub enum MasterState {
 pub struct MasterMonitor {
     pub(crate) journal_ctl: StateCtl,
     pub fs_ctl: StateCtl,
+    /// Leadership epoch: advances on every raft role transition. Master
+    /// services with leader-scoped volatile state (e.g. the cache object
+    /// id segment) compare a stored epoch against this to detect
+    /// lost-and-regained leadership without observing the intermediate
+    /// states. Standalone/test masters share a private epoch counter so
+    /// the handle is always live.
+    pub(crate) journal_epoch: EpochCtl,
 }
 
 impl MasterMonitor {
     pub fn new(journal_ctl: StateCtl, fs_ctl: StateCtl) -> Self {
+        Self::with_epoch(journal_ctl, fs_ctl, EpochCtl::private())
+    }
+
+    pub fn with_epoch(journal_ctl: StateCtl, fs_ctl: StateCtl, journal_epoch: EpochCtl) -> Self {
         Self {
             journal_ctl,
             fs_ctl,
+            journal_epoch,
         }
+    }
+
+    /// Current leadership epoch (see `journal_epoch`).
+    pub fn journal_epoch(&self) -> u64 {
+        self.journal_epoch.value()
     }
 
     // Determine whether the current node is an active node.

@@ -18,6 +18,7 @@
 pub mod cache_service;
 
 pub use self::cache_service::{
-    CacheBlockLocation, CacheCommitParams, CacheGetResult, CacheService, MAX_COMMIT_BLOCKS,
+    CacheAllocateResult, CacheBlockLocation, CacheCommitParams, CacheGetResult, CacheOpStatus,
+    CacheService, CacheWorkerChooser, PolicyWorkerChooser, MAX_COMMIT_BLOCKS, MAX_KEY_BYTES,
     MAX_LOCATIONS_PER_BLOCK,
 };

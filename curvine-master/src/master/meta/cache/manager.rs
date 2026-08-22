@@ -83,14 +83,11 @@ impl CacheManager {
         self.object_ids.current()
     }
 
-    /// Leader-only issuance: consume the next object id from the volatile
-    /// allocator. Uniqueness and in-segment monotonicity are guaranteed by
-    /// the caller holding the service issue lock; the durable fence (id
-    /// must be <= the committed reserve watermark) is enforced by the
-    /// committed allocate apply.
-    pub fn next_object_id(&self) -> CommonResult<i64> {
-        self.object_ids.next()
-    }
+    // NOTE: the manager deliberately exposes NO in-segment issuance. The
+    // durable reserve watermark (applied by `apply_id_reserve`) is the
+    // only issuance-relevant state here; the leader service owns the
+    // volatile `{next, end, epoch}` segment cursor and burns its tail on
+    // leadership loss, restart, or a watermark moved by another leader.
 
     pub fn current_incarnation(&self) -> u64 {
         self.incarnations.get() as u64
@@ -390,17 +387,23 @@ impl CacheManager {
     }
 
     /// Identity-producing: per-key load allocation. Writes the `Reserved`
-    /// entry, its reverse row, and the outcome binding the object id.
+    /// entry, its reverse row, and the outcome binding the object id plus
+    /// the exact request geometry (file_len/block_size).
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_allocate<S: LocalCacheIndexStore>(
         &self,
         store: &S,
         token: OpToken,
         incarnation: u64,
         key: &str,
+        file_len: i64,
         entry: &CacheEntry,
     ) -> CommonResult<()> {
         Self::check_token(token)?;
         validate_incarnation(incarnation)?;
+        if file_len < 0 {
+            return err_box!("cache allocate file length must be >= 0: {}", file_len);
+        }
         if entry.state != CacheEntryState::Reserved {
             return err_box!(
                 "cache allocate entry must be Reserved, got {:?}",
@@ -416,6 +419,8 @@ impl CacheManager {
                 key: key.to_string(),
                 generation: entry.generation,
                 object_id: entry.object_id,
+                file_len,
+                block_size: entry.block_size,
             },
         )?;
         match gate {
@@ -545,6 +550,8 @@ impl CacheManager {
                 key: key.to_string(),
                 generation: entry.generation,
                 object_id: entry.object_id,
+                file_len,
+                block_size: entry.block_size,
             },
         )
         .map_err(cv)?;
@@ -556,11 +563,15 @@ impl CacheManager {
 
     /// Conditional CAS: `Reserved@generation` -> `Valid` with the final
     /// `(len, ufs_mtime, expire_at)`. Writing the expiry row (when
-    /// `expire_at > 0`) is part of the same atomic batch.
+    /// `expire_at > 0`) is part of the same atomic batch. `load_token`
+    /// must carry the recorded `Allocated` outcome of the load this commit
+    /// belongs to; `token` is the commit's own durable idempotency token.
     #[allow(clippy::too_many_arguments)]
     pub fn apply_commit<S: LocalCacheIndexStore>(
         &self,
         store: &S,
+        load_token: OpToken,
+        token: OpToken,
         incarnation: u64,
         key: &str,
         generation: u64,
@@ -570,6 +581,73 @@ impl CacheManager {
         expire_at: i64,
     ) -> CommonResult<()> {
         validate_incarnation(incarnation)?;
+        Self::check_token(token)?;
+
+        // Load binding first: this commit may only land on the object its
+        // allocate reserved (identity AND geometry), recorded under the
+        // load token.
+        match store.cache_get_outcome(load_token).map_err(cv)? {
+            Some(OpOutcome::Allocated {
+                incarnation: inc,
+                key: out_key,
+                generation: out_gen,
+                object_id: out_obj,
+                file_len: out_len,
+                ..
+            }) => {
+                if inc != incarnation
+                    || out_key != key
+                    || out_gen != generation
+                    || out_obj != expected_object_id
+                    || out_len != len
+                {
+                    return err_box!(
+                        "cache commit does not match its load allocation: load token {:?} recorded ({}, {})@{} object {} len {}, commit says ({}, {})@{} object {} len {}",
+                        load_token,
+                        inc,
+                        out_key,
+                        out_gen,
+                        out_obj,
+                        out_len,
+                        incarnation,
+                        key,
+                        generation,
+                        expected_object_id,
+                        len
+                    );
+                }
+            }
+            other => {
+                return err_box!(
+                    "cache commit load token {:?} has no recorded allocation: {:?}",
+                    load_token,
+                    other
+                )
+            }
+        }
+
+        // Commit-token gate: an exact recorded history wins over the entry
+        // row (whose state this commit itself may have advanced), so a
+        // lost-response retry resolves to its recorded result.
+        let gate = Self::classify_token(
+            store,
+            token,
+            &OpOutcome::Committed {
+                incarnation,
+                key: key.to_string(),
+                generation,
+                object_id: expected_object_id,
+            },
+        )?;
+        match gate {
+            // Exact recorded history: strict no-op.
+            TokenGate::AlreadyApplied => return Ok(()),
+            // Terminal, strict no-op: an expired token's parameters are
+            // NOT trusted history.
+            TokenGate::Expired => return Ok(()),
+            TokenGate::Execute => (),
+        }
+
         let cur = match store.cache_get_entry(incarnation, key).map_err(cv)? {
             Some(v) => v,
             None => return err_box!("cache commit for missing entry ({}, {})", incarnation, key),
@@ -654,6 +732,18 @@ impl CacheManager {
             })
             .map_err(cv)?;
         }
+        w.put_outcome(
+            token,
+            &OpOutcome::Committed {
+                incarnation,
+                key: key.to_string(),
+                generation,
+                object_id: cur.object_id,
+            },
+        )
+        .map_err(cv)?;
+        w.set_client_watermark(token.client_id, token.op_seq)
+            .map_err(cv)?;
         w.commit().map_err(cv)?;
         Ok(())
     }
@@ -906,7 +996,7 @@ mod tests {
             .unwrap();
 
         let alloc = reserved(1, OBJ);
-        mgr.apply_allocate(&store, token(1, 2), 1, "/a/b", &alloc)
+        mgr.apply_allocate(&store, token(1, 2), 1, "/a/b", 300, &alloc)
             .unwrap();
         assert_eq!(
             store.cache_get_entry(1, "/a/b").unwrap(),
@@ -918,17 +1008,32 @@ mod tests {
                 incarnation: 1,
                 key: "/a/b".into(),
                 generation: 1,
-                object_id: OBJ
+                object_id: OBJ,
+                file_len: 300,
+                block_size: alloc.block_size,
             })
         );
 
         // Idempotent allocate replay.
-        mgr.apply_allocate(&store, token(1, 2), 1, "/a/b", &alloc)
+        mgr.apply_allocate(&store, token(1, 2), 1, "/a/b", 300, &alloc)
             .unwrap();
 
         // Commit: Reserved@1 -> Valid with len/ufs_mtime; TTL row appears.
-        mgr.apply_commit(&store, 1, "/a/b", 1, OBJ, 300, 12345, 5000)
-            .unwrap();
+        // The load token binds the allocation; the commit carries its own
+        // distinct op token.
+        mgr.apply_commit(
+            &store,
+            token(1, 2),
+            token(1, 3),
+            1,
+            "/a/b",
+            1,
+            OBJ,
+            300,
+            12345,
+            5000,
+        )
+        .unwrap();
         let committed = store.cache_get_entry(1, "/a/b").unwrap().unwrap();
         assert_eq!(committed.state, CacheEntryState::Valid);
         assert_eq!(
@@ -940,12 +1045,54 @@ mod tests {
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].key, "/a/b");
 
-        // Commit replay is idempotent (exact match).
-        mgr.apply_commit(&store, 1, "/a/b", 1, OBJ, 300, 12345, 5000)
-            .unwrap();
-        // A different commit at the same generation is a divergence.
+        // Commit replay is idempotent: the recorded Committed outcome for
+        // the commit token wins over the (advanced) entry row.
+        mgr.apply_commit(
+            &store,
+            token(1, 2),
+            token(1, 3),
+            1,
+            "/a/b",
+            1,
+            OBJ,
+            300,
+            12345,
+            5000,
+        )
+        .unwrap();
+        // A commit replay whose payload diverges from the recorded load
+        // geometry (len 999 != allocated 300) is rejected by the load
+        // binding, before any outcome gate.
         assert!(mgr
-            .apply_commit(&store, 1, "/a/b", 1, OBJ, 999, 12345, 5000)
+            .apply_commit(
+                &store,
+                token(1, 2),
+                token(1, 3),
+                1,
+                "/a/b",
+                1,
+                OBJ,
+                999,
+                12345,
+                5000
+            )
+            .is_err());
+        assert_eq!(store.cache_get_entry(1, "/a/b").unwrap().unwrap().len, 300);
+        // A DIFFERENT commit token at the consumed generation with a
+        // different payload is a divergence.
+        assert!(mgr
+            .apply_commit(
+                &store,
+                token(1, 2),
+                token(7, 1),
+                1,
+                "/a/b",
+                1,
+                OBJ,
+                999,
+                12345,
+                5000
+            )
             .is_err());
 
         // Remove: Valid@1 -> Tombstoned@2, expiry and reverse rows dropped.
@@ -956,9 +1103,21 @@ mod tests {
         assert!(store.cache_scan_expiry(100000, 10).unwrap().is_empty());
         assert!(store.cache_get_object(OBJ).unwrap().is_none());
 
-        // Late commit against the superseded generation: terminal no-op.
-        mgr.apply_commit(&store, 1, "/a/b", 1, OBJ, 300, 12345, 5000)
-            .unwrap();
+        // Late commit against the superseded generation: terminal no-op
+        // (fresh commit token, so the entry-row supersede path is exercised).
+        mgr.apply_commit(
+            &store,
+            token(1, 2),
+            token(7, 2),
+            1,
+            "/a/b",
+            1,
+            OBJ,
+            300,
+            12345,
+            5000,
+        )
+        .unwrap();
         assert_eq!(
             store.cache_get_entry(1, "/a/b").unwrap().unwrap().state,
             CacheEntryState::Tombstoned
@@ -970,7 +1129,7 @@ mod tests {
 
         // A later allocate for the same key advances the generation.
         let alloc3 = reserved(3, OBJ + 1);
-        mgr.apply_allocate(&store, token(1, 3), 1, "/a/b", &alloc3)
+        mgr.apply_allocate(&store, token(1, 4), 1, "/a/b", 300, &alloc3)
             .unwrap();
         assert_eq!(
             store
@@ -993,10 +1152,21 @@ mod tests {
         mgr.apply_incarnation_allocate(&store, token(2, 1), 5, 1)
             .unwrap();
         let alloc = reserved(1, OBJ);
-        mgr.apply_allocate(&store, token(1, 2), 1, "/k", &alloc)
+        mgr.apply_allocate(&store, token(1, 2), 1, "/k", 100, &alloc)
             .unwrap();
-        mgr.apply_commit(&store, 1, "/k", 1, OBJ, 100, 777, 0)
-            .unwrap();
+        mgr.apply_commit(
+            &store,
+            token(1, 2),
+            token(1, 3),
+            1,
+            "/k",
+            1,
+            OBJ,
+            100,
+            777,
+            0,
+        )
+        .unwrap();
 
         let replay = CacheManager::new();
         replay.restore_watermarks(&store).unwrap();
@@ -1007,24 +1177,46 @@ mod tests {
             .apply_incarnation_allocate(&store, token(2, 1), 5, 1)
             .unwrap();
         replay
-            .apply_allocate(&store, token(1, 2), 1, "/k", &alloc)
+            .apply_allocate(&store, token(1, 2), 1, "/k", 100, &alloc)
             .unwrap();
         replay
-            .apply_commit(&store, 1, "/k", 1, OBJ, 100, 777, 0)
+            .apply_commit(
+                &store,
+                token(1, 2),
+                token(1, 3),
+                1,
+                "/k",
+                1,
+                OBJ,
+                100,
+                777,
+                0,
+            )
             .unwrap();
         assert_eq!(replay.current_object_id(), OBJ + 9);
         assert_eq!(replay.current_incarnation(), 1);
 
-        // Commit without a prior entry fails loudly.
+        // Commit without a recorded load allocation fails loudly.
         assert!(replay
-            .apply_commit(&store, 1, "/missing", 1, OBJ, 1, 1, 0)
+            .apply_commit(
+                &store,
+                token(3, 9),
+                token(3, 10),
+                1,
+                "/missing",
+                1,
+                OBJ,
+                1,
+                1,
+                0
+            )
             .is_err());
         // Allocate with a non-Reserved state fails loudly.
         let mut bad = reserved(9, OBJ + 5);
         bad.state = CacheEntryState::Valid;
         bad.ufs_mtime = 5;
         assert!(replay
-            .apply_allocate(&store, token(9, 9), 1, "/bad", &bad)
+            .apply_allocate(&store, token(9, 9), 1, "/bad", 1, &bad)
             .is_err());
     }
 
@@ -1067,14 +1259,14 @@ mod tests {
         // a direct outcome delete, the same thing eviction does): the
         // identity is unrecoverable and must not be re-created.
         let alloc = reserved(1, OBJ);
-        mgr.apply_allocate(&store, token(2, 1), 1, "/k", &alloc)
+        mgr.apply_allocate(&store, token(2, 1), 1, "/k", 100, &alloc)
             .unwrap();
 
         // Allocate divergence on the same token is loud (outcome present,
         // different parameters).
         let alloc_diff = reserved(1, OBJ + 1);
         assert!(mgr
-            .apply_allocate(&store, token(2, 1), 1, "/k", &alloc_diff)
+            .apply_allocate(&store, token(2, 1), 1, "/k", 100, &alloc_diff)
             .is_err());
 
         let mut w = store.cache_write();
@@ -1082,7 +1274,7 @@ mod tests {
         w.commit().unwrap();
         // Client 2 watermark is 1, so the same token is now Expired, not
         // AlreadyApplied: terminal no-op, entry row untouched.
-        mgr.apply_allocate(&store, token(2, 1), 1, "/k", &alloc)
+        mgr.apply_allocate(&store, token(2, 1), 1, "/k", 100, &alloc)
             .unwrap();
         assert_eq!(
             store.cache_get_entry(1, "/k").unwrap(),
@@ -1151,16 +1343,16 @@ mod tests {
 
         // --- allocate: only None -> Reserved@1 or Tombstoned@g -> g+1.
         let alloc = reserved(1, OBJ);
-        mgr.apply_allocate(&store, token(9, 1), 1, "/k", &alloc)
+        mgr.apply_allocate(&store, token(9, 1), 1, "/k", 100, &alloc)
             .unwrap();
         // Identical parameters under a different token over a live
         // Reserved row -> alias error, entry untouched, no outcome.
         assert!(mgr
-            .apply_allocate(&store, token(9, 2), 1, "/k", &alloc)
+            .apply_allocate(&store, token(9, 2), 1, "/k", 100, &alloc)
             .is_err());
         let alloc2 = reserved(2, OBJ + 1);
         assert!(mgr
-            .apply_allocate(&store, token(9, 3), 1, "/k", &alloc2)
+            .apply_allocate(&store, token(9, 3), 1, "/k", 100, &alloc2)
             .is_err());
         assert!(store.cache_get_outcome(token(9, 2)).unwrap().is_none());
         assert!(store.cache_get_outcome(token(9, 3)).unwrap().is_none());
@@ -1175,14 +1367,14 @@ mod tests {
         // belongs to another identity -> error, no outcome.
         let alloc_alias = reserved(1, OBJ);
         assert!(mgr
-            .apply_allocate(&store, token(10, 1), 1, "/other", &alloc_alias)
+            .apply_allocate(&store, token(10, 1), 1, "/other", 100, &alloc_alias)
             .is_err());
         assert!(store.cache_get_outcome(token(10, 1)).unwrap().is_none());
         assert!(store.cache_get_entry(1, "/other").unwrap().is_none());
         // Unreserved id ahead of the durable HW (OBJ+9) -> error.
         let alloc_unreserved = reserved(1, OBJ + 500);
         assert!(mgr
-            .apply_allocate(&store, token(10, 2), 1, "/other", &alloc_unreserved)
+            .apply_allocate(&store, token(10, 2), 1, "/other", 100, &alloc_unreserved)
             .is_err());
         assert!(store.cache_get_outcome(token(10, 2)).unwrap().is_none());
         assert!(store.cache_get_entry(1, "/other").unwrap().is_none());
@@ -1192,7 +1384,7 @@ mod tests {
         mgr.apply_remove(&store, 1, "/k", 1, 2, OBJ).unwrap();
         let alloc_reuse = reserved(3, OBJ);
         assert!(mgr
-            .apply_allocate(&store, token(10, 3), 1, "/k", &alloc_reuse)
+            .apply_allocate(&store, token(10, 3), 1, "/k", 100, &alloc_reuse)
             .is_err());
         assert!(store.cache_get_outcome(token(10, 3)).unwrap().is_none());
         // /k stays at the tombstone; a monotonic re-open still works.
@@ -1201,7 +1393,7 @@ mod tests {
             CacheEntryState::Tombstoned
         );
         let alloc_reopen = reserved(3, OBJ + 1);
-        mgr.apply_allocate(&store, token(10, 4), 1, "/k", &alloc_reopen)
+        mgr.apply_allocate(&store, token(10, 4), 1, "/k", 100, &alloc_reopen)
             .unwrap();
         assert_eq!(store.cache_get_entry(1, "/k").unwrap(), Some(alloc_reopen));
     }
@@ -1251,11 +1443,11 @@ mod tests {
         // inside the reserved segment), then a late op claiming the top of
         // the object domain.
         let alloc = reserved(1, OBJ + 50);
-        mgr.apply_allocate(&store, token(3, 1), 1, "/k", &alloc)
+        mgr.apply_allocate(&store, token(3, 1), 1, "/k", 100, &alloc)
             .unwrap();
         let alloc_huge = reserved(1, BlockIdCodec::CACHE_OBJECT_MAX - 1);
         assert!(mgr
-            .apply_allocate(&store, token(3, 1), 1, "/other", &alloc_huge)
+            .apply_allocate(&store, token(3, 1), 1, "/other", 100, &alloc_huge)
             .is_err());
         // Client 3 watermark is 1, so a fresh lower op_seq is Expired only
         // after the outcome is gone; with the outcome present it is a
@@ -1263,7 +1455,7 @@ mod tests {
         mgr.apply_id_reserve(&store, token(4, 5), OBJ + 100, OBJ + 110)
             .unwrap();
         let volatile_before = mgr.current_object_id();
-        mgr.apply_allocate(&store, token(4, 1), 1, "/late", &alloc_huge)
+        mgr.apply_allocate(&store, token(4, 1), 1, "/late", 100, &alloc_huge)
             .unwrap();
         assert!(
             store.cache_get_entry(1, "/late").unwrap().is_none(),
@@ -1303,7 +1495,7 @@ mod tests {
 
         let alloc = reserved(u64::MAX, OBJ + 1);
         assert!(mgr
-            .apply_allocate(&store, token(1, 1), 1, "/k", &alloc)
+            .apply_allocate(&store, token(1, 1), 1, "/k", 100, &alloc)
             .is_err());
         // The rejected allocate wrote nothing.
         assert_eq!(
@@ -1328,40 +1520,86 @@ mod tests {
             .unwrap();
 
         let alloc = reserved(1, OBJ);
-        mgr.apply_allocate(&store, token(1, 1), 1, "/k", &alloc)
+        mgr.apply_allocate(&store, token(1, 1), 1, "/k", 100, &alloc)
             .unwrap();
 
-        // Commit may never skip generations: Reserved@1 + commit@2 errors.
+        // Commit may never skip generations: Reserved@1 + commit@2 errors
+        // (the load binding records generation 1, so the skip is rejected).
         assert!(mgr
-            .apply_commit(&store, 1, "/k", 2, OBJ, 100, 777, 0)
+            .apply_commit(
+                &store,
+                token(1, 1),
+                token(1, 2),
+                1,
+                "/k",
+                2,
+                OBJ,
+                100,
+                777,
+                0
+            )
             .is_err());
 
         // Exact Reserved@g -> Valid works, and exact replay is idempotent.
-        mgr.apply_commit(&store, 1, "/k", 1, OBJ, 100, 777, 0)
-            .unwrap();
-        mgr.apply_commit(&store, 1, "/k", 1, OBJ, 100, 777, 0)
-            .unwrap();
+        mgr.apply_commit(
+            &store,
+            token(1, 1),
+            token(1, 2),
+            1,
+            "/k",
+            1,
+            OBJ,
+            100,
+            777,
+            0,
+        )
+        .unwrap();
+        mgr.apply_commit(
+            &store,
+            token(1, 1),
+            token(1, 2),
+            1,
+            "/k",
+            1,
+            OBJ,
+            100,
+            777,
+            0,
+        )
+        .unwrap();
 
-        // A different payload at the committed generation is a divergence.
+        // A different payload at the committed generation (fresh commit
+        // token) diverges from the recorded load geometry.
         assert!(mgr
-            .apply_commit(&store, 1, "/k", 1, OBJ, 200, 777, 0)
+            .apply_commit(
+                &store,
+                token(1, 1),
+                token(8, 1),
+                1,
+                "/k",
+                1,
+                OBJ,
+                200,
+                777,
+                0
+            )
             .is_err());
 
         // Allocate may not overwrite a Valid/Reserved row at a later
         // generation: only Tombstoned@g -> Reserved@g+1 re-opens the key.
         let alloc2 = reserved(2, OBJ + 1);
         assert!(mgr
-            .apply_allocate(&store, token(1, 2), 1, "/k", &alloc2)
+            .apply_allocate(&store, token(1, 2), 1, "/k", 100, &alloc2)
             .is_err());
         // Cross-generation jumps are forbidden even from a tombstone.
         mgr.apply_remove(&store, 1, "/k", 1, 2, OBJ).unwrap();
         let alloc4 = reserved(4, OBJ + 2);
         assert!(mgr
-            .apply_allocate(&store, token(1, 3), 1, "/k", &alloc4)
+            .apply_allocate(&store, token(1, 3), 1, "/k", 100, &alloc4)
             .is_err());
         // Adjacent tombstone re-open is the only legal re-allocation.
         let alloc3 = reserved(3, OBJ + 1);
-        mgr.apply_allocate(&store, token(1, 3), 1, "/k", &alloc3)
+        mgr.apply_allocate(&store, token(1, 3), 1, "/k", 100, &alloc3)
             .unwrap();
         assert_eq!(
             store.cache_get_entry(1, "/k").unwrap().unwrap().generation,
@@ -1371,7 +1609,7 @@ mod tests {
         // A first allocation for a fresh key must start at generation 1.
         let alloc9 = reserved(9, OBJ + 5);
         assert!(mgr
-            .apply_allocate(&store, token(1, 4), 1, "/fresh", &alloc9)
+            .apply_allocate(&store, token(1, 4), 1, "/fresh", 100, &alloc9)
             .is_err());
     }
 
@@ -1456,13 +1694,24 @@ mod tests {
             mgr.apply_incarnation_allocate(&store, token(2, 1), 5, 1)
                 .unwrap();
             let alloc = reserved(1, OBJ);
-            mgr.apply_allocate(&store, token(1, 2), 1, "/a", &alloc)
+            mgr.apply_allocate(&store, token(1, 2), 1, "/a", 300, &alloc)
                 .unwrap();
             let alloc_b = reserved(1, OBJ + 1);
-            mgr.apply_allocate(&store, token(1, 3), 1, "/b", &alloc_b)
+            mgr.apply_allocate(&store, token(1, 3), 1, "/b", 100, &alloc_b)
                 .unwrap();
-            mgr.apply_commit(&store, 1, "/a", 1, OBJ, 300, 111, 9000)
-                .unwrap();
+            mgr.apply_commit(
+                &store,
+                token(1, 2),
+                token(1, 4),
+                1,
+                "/a",
+                1,
+                OBJ,
+                300,
+                111,
+                9000,
+            )
+            .unwrap();
             mgr.apply_remove(&store, 1, "/b", 1, 2, OBJ + 1).unwrap();
         };
 

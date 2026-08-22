@@ -849,8 +849,8 @@ impl MasterHandler {
             block_len: block.block_len,
             workers: block
                 .workers
-                .into_iter()
-                .map(ProtoUtils::block_location_to_pb)
+                .iter()
+                .map(ProtoUtils::worker_address_to_pb)
                 .collect(),
         }
     }
@@ -863,9 +863,25 @@ impl MasterHandler {
             block_len: block.block_len,
             workers: block
                 .workers
-                .into_iter()
-                .map(ProtoUtils::block_location_from_pb)
+                .iter()
+                .map(ProtoUtils::worker_address_from_pb)
                 .collect(),
+        }
+    }
+
+    /// Map a cache op terminal status to its wire enum, plus the current
+    /// generation to report when the command was superseded.
+    fn cache_op_status_to_pb(
+        status: crate::master::cache::CacheOpStatus,
+    ) -> (CacheOpStatusProto, Option<u64>) {
+        match status {
+            crate::master::cache::CacheOpStatus::Applied => (CacheOpStatusProto::Applied, None),
+            crate::master::cache::CacheOpStatus::AlreadyApplied => {
+                (CacheOpStatusProto::AlreadyApplied, None)
+            }
+            crate::master::cache::CacheOpStatus::Superseded { current, .. } => {
+                (CacheOpStatusProto::Superseded, Some(current))
+            }
         }
     }
 
@@ -873,16 +889,20 @@ impl MasterHandler {
         let request: CacheGetRequest = ctx.parse_header()?;
         ctx.set_audit(Some(request.key.to_string()), None);
 
-        let result = self
-            .fs
-            .cache_service
-            .get(request.incarnation, &request.key)?;
+        let result = self.fs.cache_service.get(
+            request.incarnation,
+            &request.key,
+            request.need_locations.unwrap_or(true),
+        )?;
         let mut rep = CacheGetResponse::default();
         if let Some(hit) = result {
             rep.hit = Some(true);
             rep.object_id = Some(hit.object_id);
             rep.file_len = Some(hit.len);
             rep.block_size = Some(hit.block_size);
+            rep.generation = Some(hit.generation);
+            rep.ufs_mtime = Some(hit.ufs_mtime);
+            rep.expire_at = Some(hit.expire_at);
             rep.blocks = hit
                 .blocks
                 .into_iter()
@@ -896,19 +916,31 @@ impl MasterHandler {
         let request: CacheAllocateRequest = ctx.parse_header()?;
         ctx.set_audit(Some(request.key.to_string()), None);
 
+        if request.ttl_ms.unwrap_or(0) != 0 {
+            return err_box!(
+                "cache allocate ttl is not supported until mount-policy TTL lands: ttl_ms must be 0"
+            );
+        }
         let token = crate::master::meta::cache::OpToken {
             client_id: request.token.client_id,
             op_seq: request.token.op_seq,
         };
-        let (object_id, generation) = self.fs.cache_service.allocate(
+        let result = self.fs.cache_service.allocate(
             token,
+            ctx.msg.req_id(),
             request.incarnation,
             &request.key,
+            request.file_len,
             request.block_size,
         )?;
         ctx.response(CacheAllocateResponse {
-            object_id,
-            generation,
+            object_id: result.object_id,
+            generation: result.generation,
+            blocks: result
+                .blocks
+                .into_iter()
+                .map(Self::cache_block_location_to_pb)
+                .collect(),
         })
     }
 
@@ -921,9 +953,21 @@ impl MasterHandler {
             .into_iter()
             .map(Self::cache_block_location_from_pb)
             .collect();
-        self.fs
+        let token = crate::master::meta::cache::OpToken {
+            client_id: request.token.client_id,
+            op_seq: request.token.op_seq,
+        };
+        let load_token = crate::master::meta::cache::OpToken {
+            client_id: request.load_token.client_id,
+            op_seq: request.load_token.op_seq,
+        };
+        let status = self
+            .fs
             .cache_service
             .commit(crate::master::cache::CacheCommitParams {
+                token,
+                load_token,
+                rpc_id: ctx.msg.req_id(),
                 incarnation: request.incarnation,
                 key: &request.key,
                 generation: request.generation,
@@ -933,33 +977,47 @@ impl MasterHandler {
                 ttl_ms: request.ttl_ms.unwrap_or(0),
                 blocks,
             })?;
-        ctx.response(CacheCommitResponse::default())
+        let (status, current_generation) = Self::cache_op_status_to_pb(status);
+        ctx.response(CacheCommitResponse {
+            status: Some(status.into()),
+            current_generation,
+        })
     }
 
     fn cache_invalidate(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let request: CacheInvalidateRequest = ctx.parse_header()?;
         ctx.set_audit(Some(request.key.to_string()), None);
 
-        self.fs.cache_service.invalidate(
+        let status = self.fs.cache_service.invalidate(
+            ctx.msg.req_id(),
             request.incarnation,
             &request.key,
             request.expected_generation,
             request.expected_object_id,
         )?;
-        ctx.response(CacheInvalidateResponse::default())
+        let (status, current_generation) = Self::cache_op_status_to_pb(status);
+        ctx.response(CacheInvalidateResponse {
+            status: Some(status.into()),
+            current_generation,
+        })
     }
 
     fn cache_remove(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let request: CacheRemoveRequest = ctx.parse_header()?;
         ctx.set_audit(Some(request.key.to_string()), None);
 
-        self.fs.cache_service.invalidate(
+        let status = self.fs.cache_service.invalidate(
+            ctx.msg.req_id(),
             request.incarnation,
             &request.key,
             request.expected_generation,
             request.expected_object_id,
         )?;
-        ctx.response(CacheRemoveResponse::default())
+        let (status, current_generation) = Self::cache_op_status_to_pb(status);
+        ctx.response(CacheRemoveResponse {
+            status: Some(status.into()),
+            current_generation,
+        })
     }
 
     fn get_mount_table(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {

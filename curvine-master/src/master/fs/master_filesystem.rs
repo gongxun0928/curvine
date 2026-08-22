@@ -160,18 +160,45 @@ impl MasterFilesystem {
         Ok(())
     }
 
+    /// Production cache placement chooser: the cluster worker policy at
+    /// the server-configured cache replication factor. The factor must be
+    /// a valid replication inside the master's min/max bounds — a
+    /// misconfigured cluster fails closed at construction instead of
+    /// planning under-replicated or over-cap placements.
+    fn cache_chooser(
+        conf: &ClusterConf,
+        workers: &SyncWorkerManager,
+    ) -> FsResult<Arc<crate::master::cache::PolicyWorkerChooser>> {
+        let raw = conf.client.replicas;
+        let replicas = match u16::try_from(raw) {
+            Ok(r) if r >= conf.master.min_replication && r <= conf.master.max_replication => r,
+            _ => {
+                return err_ext!(FsError::invalid_argument(format!(
+                    "cache placement replicas {} is outside the master replication bounds [{}, {}]",
+                    raw, conf.master.min_replication, conf.master.max_replication
+                )))
+            }
+        };
+        Ok(Arc::new(crate::master::cache::PolicyWorkerChooser::new(
+            workers.clone(),
+            replicas,
+        )))
+    }
+
     pub fn new(
         conf: &ClusterConf,
         fs_dir: SyncFsDir,
         worker_manager: SyncWorkerManager,
         master_monitor: MasterMonitor,
-    ) -> Self {
+    ) -> FsResult<Self> {
         let journal_writer = fs_dir.read().journal_writer.clone();
-        Self {
+        let chooser = Self::cache_chooser(conf, &worker_manager)?;
+        Ok(Self {
             cache_service: Arc::new(crate::master::cache::CacheService::new(
                 fs_dir.clone(),
                 journal_writer,
                 master_monitor.clone(),
+                chooser,
             )),
             fs_dir,
             worker_manager,
@@ -184,20 +211,23 @@ impl MasterFilesystem {
                 FULL_BLOCK_RECONCILE_THREADS,
                 FULL_BLOCK_RECONCILE_QUEUE_SIZE,
             )),
-        }
+        })
     }
 
-    pub fn with_js(conf: &ClusterConf, js: &JournalSystem) -> Self {
+    pub fn with_js(conf: &ClusterConf, js: &JournalSystem) -> FsResult<Self> {
         let fs_dir = js.fs().fs_dir.clone();
         let journal_writer = fs_dir.read().journal_writer.clone();
-        Self {
+        let worker_manager = js.worker_manager();
+        let chooser = Self::cache_chooser(conf, &worker_manager)?;
+        Ok(Self {
             cache_service: Arc::new(crate::master::cache::CacheService::new(
                 fs_dir.clone(),
                 journal_writer,
                 js.master_monitor(),
+                chooser,
             )),
             fs_dir,
-            worker_manager: js.worker_manager(),
+            worker_manager,
             master_monitor: js.master_monitor(),
             conf: Arc::new(conf.master.clone()),
             full_block_reports: Default::default(),
@@ -207,7 +237,7 @@ impl MasterFilesystem {
                 FULL_BLOCK_RECONCILE_THREADS,
                 FULL_BLOCK_RECONCILE_QUEUE_SIZE,
             )),
-        }
+        })
     }
 
     pub fn check_parent(path: &InodePath) -> FsResult<()> {

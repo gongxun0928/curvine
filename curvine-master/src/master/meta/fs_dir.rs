@@ -990,12 +990,18 @@ impl FsDir {
                 self.cache
                     .apply_incarnation_revoke(store, e.mount_id, e.incarnation)
             }
-            JournalEntry::CacheAllocate(e) => {
-                self.cache
-                    .apply_allocate(store, e.token, e.incarnation, &e.key, &e.entry)
-            }
+            JournalEntry::CacheAllocate(e) => self.cache.apply_allocate(
+                store,
+                e.token,
+                e.incarnation,
+                &e.key,
+                e.file_len,
+                &e.entry,
+            ),
             JournalEntry::CacheCommit(e) => self.cache.apply_commit(
                 store,
+                e.load_token,
+                e.token,
                 e.incarnation,
                 &e.key,
                 e.generation,

@@ -126,16 +126,32 @@ pub struct OpToken {
     pub op_seq: u64,
 }
 
-/// Persisted outcomes for identity-producing operations only. Conditional
-/// key mutations never persist outcomes; they are derived from entry state.
+/// Persisted outcomes for identity-producing and load-commit operations.
+/// Purely conditional mutations (remove/invalidate) never persist
+/// outcomes; they are derived from entry state via their CAS fences.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OpOutcome {
     /// Global cache-object-id segment reservation `[start, end)`.
     Reserved { start: i64, end: i64 },
     /// Mount incarnation allocation.
     IncarnationAllocated { incarnation: u64 },
-    /// Per-key load allocation: the object id identity must be recoverable.
+    /// Per-key load allocation: the object id identity must be recoverable,
+    /// and the exact request geometry is recorded so a retry (including a
+    /// re-plan after a master restart lost the volatile plan) can verify
+    /// the recorded parameters before regenerating a plan.
     Allocated {
+        incarnation: u64,
+        key: String,
+        generation: u64,
+        object_id: i64,
+        /// Target length as allocated (0 is legal: an empty object).
+        file_len: i64,
+        block_size: i64,
+    },
+    /// Per-key load commit (`Reserved@g -> Valid`): lets a lost-response
+    /// commit retry resolve to its recorded result instead of re-judging
+    /// the already-advanced entry row.
+    Committed {
         incarnation: u64,
         key: String,
         generation: u64,

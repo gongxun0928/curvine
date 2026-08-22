@@ -1111,7 +1111,8 @@ mod tests {
             fs_dir.clone(),
             SyncWorkerManager::new(WorkerManager::new(conf).unwrap()),
             master_monitor,
-        );
+        )
+        .unwrap();
         let mount_manager = Arc::new(MountManager::new(fs.clone()));
         let job_manager = Arc::new(JobManager::from_cluster_conf(
             fs,
@@ -1129,6 +1130,14 @@ mod tests {
         JournalEntry::CacheCommit(CacheCommitEntry {
             op_id: 1,
             rpc_id: 0,
+            token: crate::master::meta::cache::entry::OpToken {
+                client_id: 9,
+                op_seq: 2,
+            },
+            load_token: crate::master::meta::cache::entry::OpToken {
+                client_id: 9,
+                op_seq: 1,
+            },
             incarnation: 1,
             key: "/missing".into(),
             generation: 1,
@@ -1516,7 +1525,11 @@ mod tests {
         let rt = conf.journal.create_runtime();
         let log_store = RocksLogStorage::from_conf(&conf.journal, true);
         let role_monitor = RoleMonitor::new();
-        let master_monitor = MasterMonitor::new(role_monitor.read_ctl(), StateCtl::new(0));
+        let master_monitor = MasterMonitor::with_epoch(
+            role_monitor.read_ctl(),
+            StateCtl::new(0),
+            role_monitor.epoch_ctl(),
+        );
 
         // Production writer: testing=false keeps the RaftClient and the
         // real sync-propose barrier; the loader's apply worker runs.
@@ -1535,7 +1548,8 @@ mod tests {
             fs_dir.clone(),
             SyncWorkerManager::new(WorkerManager::new(&conf).unwrap()),
             master_monitor,
-        );
+        )
+        .unwrap();
         let mount_manager = Arc::new(MountManager::new(fs.clone()));
         let job_manager = Arc::new(JobManager::from_cluster_conf(
             fs,

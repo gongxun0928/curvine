@@ -21,20 +21,30 @@
 //! service then re-reads the committed state (token outcome / entry row)
 //! to resolve the RPC — never the pre-propose in-memory view.
 //!
-//! The object-id issuer is leader-only: ids come from the volatile
-//! `CacheObjectId` allocator, are consumed strictly inside the durably
-//! reserved segment, and clients can never supply their own object id
-//! (the wire has no such field). After a leader crash the allocator
-//! restarts at the durable reserve watermark — the unconsumed tail of the
-//! old segment is permanently burned and the next reserve starts after
-//! the watermark.
+//! The object-id issuer is leader-only and owns a volatile segment cursor
+//! `{next, end, epoch}`: ids are consumed strictly inside the durably
+//! reserved segment, one at a time, and the whole tail is burned when the
+//! segment is exhausted, when the durable reserve watermark moves past it
+//! (another leader reserved onward), or when the leadership epoch changed
+//! (lost-and-regained leadership, even invisibly between two RPCs). The
+//! wire has no object id field, so clients can never supply their own.
+//!
+//! Allocate plans the whole placement master-side (bounded worker sets
+//! per derived block) and returns it with the identity; the plan is also
+//! kept in a volatile table keyed by the load token. Commit reports the
+//! locations that actually succeeded and validates them against that plan
+//! (planned workers only, deduplicated, one entry per block); without the
+//! plan (master restart) the commit fails closed as a retryable miss — a
+//! retry may never silently swap placements.
 //!
 //! Block locations are volatile master state (contract: a full block
-//! report may restore lost locations but must never resurrect a
-//! `Valid` CacheIndex row). They are not journaled: `CacheGet` treats
-//! any missing block location as a whole-object miss so the caller
-//! falls back to the UFS.
+//! report may restore lost locations but must never resurrect a `Valid`
+//! CacheIndex row). They are not journaled: `CacheGet` treats any missing
+//! block location as a whole-object miss so the caller falls back to the
+//! UFS.
 
+use crate::master::fs::policy::ChooseContext;
+use crate::master::fs::WorkerManager;
 use crate::master::journal::{
     CacheAllocateEntry, CacheCommitEntry, CacheIdReserveEntry, CacheRemoveEntry, JournalEntry,
     JournalWriter,
@@ -45,10 +55,10 @@ use crate::master::meta::cache::LocalCacheIndexStore;
 use crate::master::meta::{BlockIdCodec, CacheBlockLayout};
 use crate::master::{MasterMonitor, SyncFsDir};
 use curvine_core_error::{err_box, err_msg, CommonError, CommonResult};
-use curvine_model::BlockLocation;
+use curvine_model::WorkerAddress;
 use curvine_runtime::common::LocalTime;
+use curvine_runtime::sync::ArcRwLock;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Object ids per durable reserve segment. Reserves are rare (one per
@@ -56,7 +66,7 @@ use std::sync::{Arc, Mutex};
 /// client stay trivially small.
 const CACHE_RESERVE_SEGMENT: i64 = 4096;
 
-/// Hard cap on block location entries accepted by one commit. Bounded so
+/// Hard cap on block location entries per commit / placement. Bounded so
 /// a malformed commit can never make the master build an unbounded
 /// response or volatile table (contract: bounded ops).
 pub const MAX_COMMIT_BLOCKS: usize = 1 << 16;
@@ -64,17 +74,35 @@ pub const MAX_COMMIT_BLOCKS: usize = 1 << 16;
 /// Hard cap on replica locations per block.
 pub const MAX_LOCATIONS_PER_BLOCK: usize = 16;
 
+/// Hard cap on the UTF-8 size of a cache key across all cache RPCs.
+pub const MAX_KEY_BYTES: usize = 4096;
+
 /// The internal client identity used for segment reserves. It is disjoint
 /// from any RPC client id space in use (client ids are random u64s; the
 /// watermark of this client only advances via reserves, which lazily
 /// evicts older reserve outcome rows once window eviction lands in 4c).
+/// RPC clients may not present this id.
 const CACHE_ISSUER_CLIENT_ID: u64 = 0;
 
-#[derive(Debug, Clone)]
+/// Terminal status of a conditional cache mutation (contract §3 rev2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheOpStatus {
+    /// This command's expected generation matched and it applied now.
+    Applied,
+    /// The committed state already reflects this command (replay/retry).
+    AlreadyApplied,
+    /// A later generation advanced; the command (and its load) is dead.
+    /// Carries the fence the caller expected and the generation the
+    /// committed row has advanced to, so the caller can terminate the old
+    /// load and diagnostics can show the fence gap.
+    Superseded { expected: u64, current: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct CacheBlockLocation {
     pub block_id: i64,
     pub block_len: i64,
-    pub workers: Vec<BlockLocation>,
+    pub workers: Vec<WorkerAddress>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,14 +110,32 @@ pub struct CacheGetResult {
     pub object_id: i64,
     pub len: i64,
     pub block_size: i64,
+    pub generation: u64,
+    pub ufs_mtime: i64,
+    pub expire_at: i64,
     pub blocks: Vec<CacheBlockLocation>,
 }
 
-/// Volatile per-object block locations, keyed by object id, one ordered
-/// worker set per 1-based block sequence.
+#[derive(Debug, Clone)]
+pub struct CacheAllocateResult {
+    pub object_id: i64,
+    pub generation: u64,
+    /// Master-planned placement: one entry per derived block (empty for a
+    /// zero-length object). On an exact retry whose volatile plan was lost
+    /// to a master restart, a fresh plan is regenerated for the SAME
+    /// identity — a second identity is never minted.
+    pub blocks: Vec<CacheBlockLocation>,
+}
+
 /// Arguments of one commit RPC (keeps the service signature clippy-sized).
 #[derive(Debug, Clone)]
 pub struct CacheCommitParams<'a> {
+    /// Durable idempotency token of THIS commit operation.
+    pub token: OpToken,
+    /// The load identity token from CacheAllocate; binds the commit to
+    /// its recorded Allocated outcome and volatile plan.
+    pub load_token: OpToken,
+    pub rpc_id: i64,
     pub incarnation: u64,
     pub key: &'a str,
     pub generation: u64,
@@ -100,22 +146,103 @@ pub struct CacheCommitParams<'a> {
     pub blocks: Vec<CacheBlockLocation>,
 }
 
+/// Worker selection for cache placements: one bounded worker set per
+/// block. The production implementation goes through the real worker
+/// policy (availability/capacity aware); tests install a fixed chooser.
+/// `replica_policy` is the minimum successful locations every planned
+/// block must carry (and every commit must confirm).
+pub trait CacheWorkerChooser: Send + Sync {
+    fn choose_block(&self, block_size: i64) -> CommonResult<Vec<WorkerAddress>>;
+    fn replica_policy(&self) -> usize;
+}
+
+/// Production chooser: the cluster worker policy behind the master's
+/// worker manager, at the server-configured cache replication factor
+/// (`ClusterConf.client.replicas`, validated against the master's
+/// min/max replication at construction). A policy that cannot satisfy
+/// the configured replica count (too few live/capable workers) fails
+/// the placement instead of planning under-replicated blocks.
+pub struct PolicyWorkerChooser {
+    workers: ArcRwLock<WorkerManager>,
+    replicas: u16,
+}
+
+impl PolicyWorkerChooser {
+    pub fn new(workers: ArcRwLock<WorkerManager>, replicas: u16) -> Self {
+        Self { workers, replicas }
+    }
+}
+
+impl CacheWorkerChooser for PolicyWorkerChooser {
+    fn choose_block(&self, block_size: i64) -> CommonResult<Vec<WorkerAddress>> {
+        let wm = self.workers.read();
+        let chosen = wm.choose_worker(ChooseContext::with_num(
+            self.replicas,
+            block_size,
+            Vec::new(),
+        ))?;
+        drop(wm);
+        if (chosen.len() as u16) < self.replicas {
+            return err_box!(
+                "cache placement could only choose {} of {} required replicas",
+                chosen.len(),
+                self.replicas
+            );
+        }
+        Ok(chosen)
+    }
+
+    fn replica_policy(&self) -> usize {
+        self.replicas as usize
+    }
+}
+
 #[derive(Default)]
 struct ObjectLocations {
-    blocks: HashMap<i64, Vec<BlockLocation>>,
+    blocks: HashMap<i64, Vec<WorkerAddress>>,
+}
+
+/// Volatile leader-scoped segment cursor for the object id issuer.
+#[derive(Debug, Clone, Copy)]
+struct Segment {
+    /// Next unconsumed id (issue `next`, then `next += 1`).
+    next: i64,
+    /// Exclusive segment end; `durable_hw == end - 1` while this segment
+    /// is the latest reserve.
+    end: i64,
+    /// Leadership epoch observed when the segment was reserved. Any
+    /// difference from the current epoch means leadership was lost (and
+    /// possibly regained) since: burn the tail.
+    epoch: u64,
+}
+
+/// Volatile master-planned placement of one load, keyed by its allocate
+/// (load) token. Lost on restart — a commit without its plan fails closed
+/// unless the exact allocate is replayed to re-generate one.
+#[derive(Debug, Clone)]
+struct LoadPlan {
+    object_id: i64,
+    generation: u64,
+    file_len: i64,
+    block_size: i64,
+    /// Minimum successful locations per block (the chooser's replica
+    /// policy at planning time): commit evidence must reach it.
+    replicas: usize,
+    blocks: Vec<CacheBlockLocation>,
 }
 
 pub struct CacheService {
     fs_dir: SyncFsDir,
     journal_writer: Arc<JournalWriter>,
     monitor: MasterMonitor,
+    chooser: Arc<dyn CacheWorkerChooser>,
     /// Serializes the reserve+issue critical section so concurrent
     /// allocates consume strictly monotonic, unique ids.
     issue_lock: Mutex<()>,
-    /// Monotonic op_seq source for issuer reserve tokens. Seeded from the
-    /// wall clock so restarts do not collide (a repeated token with
-    /// different segment params would be treated as divergence).
-    issuer_seq: AtomicU64,
+    /// Leader-scoped segment cursor (see `Segment`). None = burned.
+    segment: Mutex<Option<Segment>>,
+    /// Volatile load plans by allocate token.
+    plans: Mutex<HashMap<OpToken, LoadPlan>>,
     locations: Mutex<HashMap<i64, ObjectLocations>>,
 }
 
@@ -124,21 +251,31 @@ impl CacheService {
         fs_dir: SyncFsDir,
         journal_writer: Arc<JournalWriter>,
         monitor: MasterMonitor,
+        chooser: Arc<dyn CacheWorkerChooser>,
     ) -> Self {
         Self {
             fs_dir,
             journal_writer,
             monitor,
+            chooser,
             issue_lock: Mutex::new(()),
-            issuer_seq: AtomicU64::new(LocalTime::mills()),
+            segment: Mutex::new(None),
+            plans: Mutex::new(HashMap::new()),
             locations: Mutex::new(HashMap::new()),
         }
     }
 
     /// Whole-object lookup. `hit` requires a `Valid`, unexpired entry AND
-    /// a complete volatile location set for the derived block layout —
-    /// anything missing is a miss (caller falls back to the UFS).
-    pub fn get(&self, incarnation: u64, key: &str) -> CommonResult<Option<CacheGetResult>> {
+    /// (when `need_locations`) a complete volatile location set for the
+    /// derived block layout — anything missing is a miss (caller falls
+    /// back to the UFS).
+    pub fn get(
+        &self,
+        incarnation: u64,
+        key: &str,
+        need_locations: bool,
+    ) -> CommonResult<Option<CacheGetResult>> {
+        validate_key(key)?;
         let store = self.fs_dir.read();
         let rocks = store.get_rocks_store();
         let entry = rocks.cache_get_entry(incarnation, key).map_err(fs_err)?;
@@ -154,59 +291,179 @@ impl CacheService {
         }
 
         let layout = CacheBlockLayout::derive(entry.object_id, entry.len, entry.block_size)?;
-        let locations = self.locations.lock().unwrap();
-        let Some(object_locations) = locations.get(&entry.object_id) else {
-            return Ok(None);
-        };
-        if object_locations.blocks.len() != layout.block_count as usize {
-            return Ok(None);
-        }
-
-        let mut blocks = Vec::with_capacity(layout.block_count as usize);
-        for index in 1..=layout.block_count {
-            let Some(workers) = object_locations.blocks.get(&index) else {
+        let mut blocks = Vec::new();
+        if need_locations {
+            let locations = self.locations.lock().unwrap();
+            let Some(object_locations) = locations.get(&entry.object_id) else {
                 return Ok(None);
             };
-            if workers.is_empty() {
+            if object_locations.blocks.len() != layout.block_count as usize {
                 return Ok(None);
             }
-            blocks.push(CacheBlockLocation {
-                block_id: layout.block_id(index)?,
-                block_len: if index == layout.block_count {
-                    layout.last_len
-                } else {
-                    layout.block_size
-                },
-                workers: workers.clone(),
-            });
+            for index in 1..=layout.block_count {
+                let Some(workers) = object_locations.blocks.get(&index) else {
+                    return Ok(None);
+                };
+                if workers.is_empty() {
+                    return Ok(None);
+                }
+                blocks.push(CacheBlockLocation {
+                    block_id: layout.block_id(index)?,
+                    block_len: if index == layout.block_count {
+                        layout.last_len
+                    } else {
+                        layout.block_size
+                    },
+                    workers: workers.clone(),
+                });
+            }
         }
         Ok(Some(CacheGetResult {
             object_id: entry.object_id,
             len: entry.len,
             block_size: entry.block_size,
+            generation: entry.generation,
+            ufs_mtime: entry.ufs_mtime,
+            expire_at: entry.expire_at,
             blocks,
         }))
     }
 
-    /// Allocate a fresh cache object for `key` and hand back the
-    /// leader-issued `(object_id, generation)`. The client cannot
-    /// influence the object id; generation is the next absolute
-    /// transition of the entry row (None -> 1, Tombstoned@g -> g+1).
+    /// Allocate a fresh cache object for `key`: leader-issued identity
+    /// `(object_id, generation)` plus the master-planned whole-object
+    /// placement. The client cannot influence the object id; generation
+    /// is the next absolute transition of the entry row (None -> 1,
+    /// Tombstoned@g -> g+1). `file_len == 0` is a legal empty object
+    /// (empty placement, empty commit evidence).
     pub fn allocate(
         &self,
         token: OpToken,
+        rpc_id: i64,
         incarnation: u64,
         key: &str,
+        file_len: i64,
         block_size: i64,
-    ) -> CommonResult<(i64, u64)> {
-        self.require_leader()?;
+    ) -> CommonResult<CacheAllocateResult> {
+        self.require_leader_or_burn()?;
+        validate_key(key)?;
+        validate_client_token(token)?;
+        if file_len < 0 {
+            return err_box!("cache allocate file length must be >= 0: {}", file_len);
+        }
         if block_size <= 0 {
             return err_box!("cache allocate block size must be positive: {}", block_size);
+        }
+        // Bounded layout, checked before any identity is issued (a
+        // layout the wire cannot carry must never burn an object id).
+        let block_count = if file_len == 0 {
+            0
+        } else {
+            (file_len - 1) / block_size + 1
+        };
+        if block_count as usize > MAX_COMMIT_BLOCKS {
+            return err_box!(
+                "cache allocate derived block count {} exceeds cap {} (len {}, block size {})",
+                block_count,
+                MAX_COMMIT_BLOCKS,
+                file_len,
+                block_size
+            );
         }
 
         // Serialize issuance: reserve + consume must be one critical
         // section for uniqueness and in-segment monotonicity.
         let _guard = self.issue_lock.lock().unwrap();
+
+        // Idempotent retry, resolved from committed state only: the token
+        // outcome comes before ANY entry-state check or issuance, so a
+        // retry after a lost response returns the committed identity even
+        // though the first execution (or a later commit) moved the entry
+        // row to Reserved/Valid. The retry must replay the EXACT recorded
+        // geometry; if the volatile plan was lost to a master restart a
+        // fresh plan is generated for the SAME identity (a second identity
+        // is never minted, and the placement is never silently swapped
+        // behind a commit: commit still validates against the live plan).
+        {
+            let store = self.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            match rocks.cache_get_outcome(token).map_err(fs_err)? {
+                Some(OpOutcome::Allocated {
+                    incarnation: out_inc,
+                    key: out_key,
+                    generation,
+                    object_id,
+                    file_len: out_len,
+                    block_size: out_bs,
+                }) => {
+                    if out_inc != incarnation
+                        || out_key != key
+                        || out_len != file_len
+                        || out_bs != block_size
+                    {
+                        return err_box!(
+                            "cache allocate token {:?} replayed with different parameters ({}, {}, len {}, bs {}): committed ({}, {})@{} object {} len {} bs {}",
+                            token,
+                            incarnation,
+                            key,
+                            file_len,
+                            block_size,
+                            out_inc,
+                            out_key,
+                            generation,
+                            object_id,
+                            out_len,
+                            out_bs
+                        );
+                    }
+                    // Scoped lock: the guard must be released before the
+                    // replan arm, which takes the plans lock again (the
+                    // match-scrutinee temporary would otherwise live across
+                    // the whole match and self-deadlock).
+                    let prior = {
+                        let plans = self.plans.lock().unwrap();
+                        plans.get(&token).map(|plan| plan.blocks.clone())
+                    };
+                    let blocks = match prior {
+                        Some(blocks) => blocks,
+                        None => {
+                            // Plan lost (master restart): regenerate a
+                            // fresh volatile plan for the same identity.
+                            let layout = CacheBlockLayout::derive(object_id, file_len, block_size)?;
+                            self.replan(token, generation, layout)?
+                        }
+                    };
+                    return Ok(CacheAllocateResult {
+                        object_id,
+                        generation,
+                        blocks,
+                    });
+                }
+                Some(other) => {
+                    return err_box!(
+                        "cache allocate token {:?} has a non-allocate committed outcome: {:?}",
+                        token,
+                        other
+                    )
+                }
+                None => {
+                    // Below the client watermark with no outcome: the
+                    // outcome window has moved past this token — its
+                    // identity (if any ever existed) cannot be recovered.
+                    let watermark = rocks
+                        .cache_client_watermark(token.client_id)
+                        .map_err(fs_err)?;
+                    if let Some(hw) = watermark {
+                        if token.op_seq <= hw {
+                            return err_box!(
+                                "cache allocate token {:?} is expired (client watermark {}): terminal, re-issue with a fresh token",
+                                token,
+                                hw
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         // Fast-fail entry-state check and generation selection. The
         // committed apply re-checks the absolute transition, so a racing
@@ -233,50 +490,42 @@ impl CacheService {
             }
         };
 
-        // Ensure the volatile allocator still has durable capacity: ids
-        // may only be consumed inside a committed reserve segment. Guards
-        // are dropped around the propose (the apply worker takes its own
-        // fs_dir lock; holding a read guard across the barrier would
-        // deadlock the FSM).
-        loop {
-            let durable_hw = {
-                let store = self.fs_dir.read();
-                store
-                    .get_rocks_store()
-                    .cache_get_state(state_tags::CACHE_OBJECT_ID)
-                    .map_err(fs_err)?
-                    .unwrap_or(BlockIdCodec::CACHE_OBJECT_MIN - 1)
-            };
-            if self.current_volatile_object_id() < durable_hw {
-                break;
-            }
-            // Reserve the next contiguous segment [HW+1, HW+1+SEG).
-            let start = durable_hw
-                .checked_add(1)
-                .ok_or_else(|| cm_err("cache object id segment space exhausted"))?;
-            let end = start
-                .checked_add(CACHE_RESERVE_SEGMENT)
-                .filter(|end| *end <= BlockIdCodec::CACHE_OBJECT_MAX + 1)
-                .ok_or_else(|| cm_err("cache object id segment space exhausted"))?;
-            let reserve_token = self.next_issuer_token();
-            let entry = JournalEntry::CacheIdReserve(CacheIdReserveEntry {
-                op_id: 0,
-                rpc_id: 0,
-                token: reserve_token,
-                start,
-                end,
+        // Plan the placement before any id is issued: a failed worker
+        // selection (no workers / below replica policy) must not burn an
+        // object id.
+        let layout_worker_sets = self.plan_worker_sets(block_count as usize, block_size)?;
+        let replicas = self.chooser.replica_policy();
+
+        // Ensure the volatile segment cursor is valid (burning stale
+        // segments first) and consume one id (under the epoch it was
+        // consumed in).
+        let (issued, issued_epoch) = self.ensure_segment_and_issue(rpc_id)?;
+
+        let layout = CacheBlockLayout::derive(issued, file_len, block_size)?;
+        let mut planned_blocks = Vec::with_capacity(block_count as usize);
+        for (index, workers) in layout_worker_sets.into_iter().enumerate() {
+            planned_blocks.push(CacheBlockLocation {
+                block_id: layout.block_id((index + 1) as i64)?,
+                block_len: if (index + 1) as i64 == layout.block_count {
+                    layout.last_len
+                } else {
+                    layout.block_size
+                },
+                workers,
             });
-            // The propose barrier returns only after the FSM applied the
-            // reserve, so after it the durable HW covers [start, end).
-            self.journal_writer
-                .sync_propose_cache(entry)
-                .map_err(fs_err)?;
         }
 
-        let issued = {
-            let store = self.fs_dir.read();
-            store.cache.next_object_id()?
-        };
+        // Leadership may have changed (even invisibly) between the issue
+        // and this propose: the entry must be proposed by the same leader
+        // epoch that consumed the id, so re-verify and burn on mismatch.
+        if !self.monitor.is_active() || self.monitor.journal_epoch() != issued_epoch {
+            *self.segment.lock().unwrap() = None;
+            return err_box!(
+                "cache allocate lost leadership after issuance (epoch {} -> {}): retry with the same token",
+                issued_epoch,
+                self.monitor.journal_epoch()
+            );
+        }
 
         let entry = CacheEntry {
             generation,
@@ -287,45 +536,115 @@ impl CacheService {
             block_size,
             expire_at: 0,
         };
+        let op_id = self.fs_dir.read().next_op_id();
         let journal_entry = JournalEntry::CacheAllocate(CacheAllocateEntry {
-            op_id: 0,
-            rpc_id: 0,
+            op_id,
+            rpc_id,
             token,
             incarnation,
             key: key.to_string(),
+            file_len,
             entry,
         });
         self.journal_writer
             .sync_propose_cache(journal_entry)
             .map_err(fs_err)?;
 
-        // Resolve the RPC from committed state only: the token must
-        // resolve to exactly this allocate outcome.
-        let store = self.fs_dir.read();
-        let rocks = store.get_rocks_store();
-        match rocks.cache_get_outcome(token).map_err(fs_err)? {
+        // Resolve the RPC from committed state only: the answer is the
+        // committed outcome itself, never the locally issued id — if the
+        // FSM recorded a different identity (an already-applied earlier
+        // execution of this token), that committed answer wins and the
+        // burned local id is never handed to the client.
+        let outcome = {
+            let store = self.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            rocks.cache_get_outcome(token).map_err(fs_err)?
+        };
+        match outcome {
             Some(OpOutcome::Allocated {
+                incarnation: out_inc,
+                key: out_key,
                 object_id,
                 generation: out_generation,
                 ..
-            }) if object_id == issued && out_generation == generation => {
-                Ok((object_id, out_generation))
+            }) if out_inc == incarnation && out_key == key && out_generation == generation => {
+                self.plans.lock().unwrap().insert(
+                    token,
+                    LoadPlan {
+                        object_id,
+                        generation: out_generation,
+                        file_len,
+                        block_size,
+                        replicas,
+                        blocks: planned_blocks.clone(),
+                    },
+                );
+                Ok(CacheAllocateResult {
+                    object_id,
+                    generation: out_generation,
+                    blocks: planned_blocks,
+                })
             }
             other => err_box!(
-                "cache allocate barrier readback failed for token {:?}: {:?}",
+                "cache allocate barrier readback failed for token {:?} ({}, {}): {:?}",
                 token,
+                incarnation,
+                key,
                 other
             ),
         }
     }
 
+    /// Regenerate a volatile plan for an already-committed (durable)
+    /// allocation: same object identity and geometry, fresh worker sets.
+    /// Used by an exact allocate retry whose plan was lost to a master
+    /// restart — a second identity is never minted, and any in-flight
+    /// commit from the previous incarnation of this master fails closed
+    /// against the plan table either way.
+    fn replan(
+        &self,
+        token: OpToken,
+        generation: u64,
+        layout: CacheBlockLayout,
+    ) -> CommonResult<Vec<CacheBlockLocation>> {
+        let sets = self.plan_worker_sets(layout.block_count as usize, layout.block_size)?;
+        let replicas = self.chooser.replica_policy();
+        let mut blocks = Vec::with_capacity(layout.block_count as usize);
+        for (index, workers) in sets.into_iter().enumerate() {
+            blocks.push(CacheBlockLocation {
+                block_id: layout.block_id((index + 1) as i64)?,
+                block_len: if (index + 1) as i64 == layout.block_count {
+                    layout.last_len
+                } else {
+                    layout.block_size
+                },
+                workers,
+            });
+        }
+        self.plans.lock().unwrap().insert(
+            token,
+            LoadPlan {
+                object_id: layout.object_id,
+                generation,
+                file_len: layout.len,
+                block_size: layout.block_size,
+                replicas,
+                blocks: blocks.clone(),
+            },
+        );
+        Ok(blocks)
+    }
+
     /// Commit the loaded object: `Reserved@g` -> `Valid` with the final
-    /// `(len, ufs_mtime, expire_at)` and the volatile block locations.
-    /// The location set must cover the derived block layout exactly —
-    /// one entry per block, sequence-ordered, no gaps, duplicates, or
-    /// extra blocks — and is only recorded after the barrier ACK.
-    pub fn commit(&self, params: CacheCommitParams<'_>) -> CommonResult<()> {
+    /// `(len, ufs_mtime)` and the locations that actually succeeded. The
+    /// reported locations must match the allocate plan bound to the load
+    /// token (same blocks, planned workers only, deduplicated) and are
+    /// published only after the barrier readback confirms `Valid`.
+    pub fn commit(&self, params: CacheCommitParams<'_>) -> CommonResult<CacheOpStatus> {
         let CacheCommitParams {
+            token,
+            load_token,
+            rpc_id,
             incarnation,
             key,
             generation,
@@ -336,69 +655,226 @@ impl CacheService {
             blocks,
         } = params;
         self.require_leader()?;
+        validate_key(key)?;
+        validate_client_token(token)?;
+        validate_client_token(load_token)?;
+        if ttl_ms != 0 {
+            return err_box!(
+                "cache commit ttl is not supported until mount-policy TTL lands (4b): ttl_ms must be 0, got {}",
+                ttl_ms
+            );
+        }
 
-        // Validation happens against the committed entry row (block_size
-        // is immutable entry metadata), then the guard is dropped for the
-        // propose. The committed apply re-checks identity via CAS.
-        let (_block_size, layout) = {
+        // Commit-token durable idempotency first: a retry after a lost
+        // response resolves to its recorded Committed outcome regardless
+        // of how far the entry row has advanced since.
+        {
             let store = self.fs_dir.read();
             let rocks = store.get_rocks_store();
-            let cur = rocks
-                .cache_get_entry(incarnation, key)
-                .map_err(fs_err)?
+            match rocks.cache_get_outcome(token).map_err(fs_err)? {
+                Some(OpOutcome::Committed {
+                    incarnation: out_inc,
+                    key: out_key,
+                    generation: out_generation,
+                    object_id: out_object,
+                }) => {
+                    if out_inc == incarnation
+                        && out_key == key
+                        && out_generation == generation
+                        && out_object == object_id
+                    {
+                        return Ok(CacheOpStatus::AlreadyApplied);
+                    }
+                    return err_box!(
+                        "cache commit token {:?} replayed with different parameters: committed ({}, {})@{} object {}",
+                        token,
+                        out_inc,
+                        out_key,
+                        out_generation,
+                        out_object
+                    );
+                }
+                Some(other) => {
+                    return err_box!(
+                        "cache commit token {:?} has a non-commit committed outcome: {:?}",
+                        token,
+                        other
+                    )
+                }
+                None => {
+                    let watermark = rocks
+                        .cache_client_watermark(token.client_id)
+                        .map_err(fs_err)?;
+                    if let Some(hw) = watermark {
+                        if token.op_seq <= hw {
+                            return err_box!(
+                                "cache commit token {:?} is expired (client watermark {}): terminal, the load must be restarted with a fresh token",
+                                token,
+                                hw
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Load binding: the durable Allocated outcome must record exactly
+        // this load (identity AND geometry). The manager re-verifies this
+        // atomically at apply; checking here keeps divergence off the wire.
+        {
+            let store = self.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            match rocks.cache_get_outcome(load_token).map_err(fs_err)? {
+                Some(OpOutcome::Allocated {
+                    incarnation: out_inc,
+                    key: out_key,
+                    generation: out_generation,
+                    object_id: out_object,
+                    file_len: out_len,
+                    ..
+                }) => {
+                    if out_inc != incarnation
+                        || out_key != key
+                        || out_generation != generation
+                        || out_object != object_id
+                        || out_len != len
+                    {
+                        return err_box!(
+                            "cache commit does not match its recorded load allocation for load token {:?}: ({}, {})@{} object {} len {}",
+                            load_token,
+                            incarnation,
+                            key,
+                            generation,
+                            object_id,
+                            len
+                        );
+                    }
+                }
+                other => {
+                    return err_box!(
+                        "cache commit load token {:?} has no recorded allocation: {:?}",
+                        load_token,
+                        other
+                    )
+                }
+            }
+        }
+
+        // The volatile plan is mandatory: without it the reported
+        // locations cannot be validated against what the master planned
+        // (master restart), and a silent re-plan would misattribute old
+        // writes. Fail closed as a retryable miss — the caller retries the
+        // exact allocate (which re-plans the same identity) and re-commits.
+        let plan = {
+            let plans = self.plans.lock().unwrap();
+            plans
+                .get(&load_token)
+                .cloned()
                 .ok_or_else(|| {
                     cm_err(format!(
-                        "cache commit for missing entry ({}, {})",
-                        incarnation, key
+                        "cache commit for load token {:?} has no live plan (master restart or unknown token): retryable miss, replay the exact allocate to re-plan, then re-commit",
+                        load_token
                     ))
-                })?;
-            if cur.state != CacheEntryState::Reserved {
-                return err_box!(
-                    "cache commit for non-reserved entry ({}, {})@{} state {:?}",
-                    incarnation,
-                    key,
-                    cur.generation,
-                    cur.state
-                );
-            }
-            if cur.generation != generation || cur.object_id != object_id {
-                return err_box!(
-                    "cache commit identity mismatch for ({}, {}): entry ({}, {}) vs request ({}, {})",
-                    incarnation,
-                    key,
-                    cur.generation,
-                    cur.object_id,
-                    generation,
-                    object_id
-                );
-            }
-            (
-                cur.block_size,
-                CacheBlockLayout::derive(object_id, len, cur.block_size)?,
-            )
+                })?
         };
+        if plan.object_id != object_id || plan.generation != generation {
+            return err_box!(
+                "cache commit identity does not match the load plan: request ({}, {}) vs plan ({}, {})",
+                generation,
+                object_id,
+                plan.generation,
+                plan.object_id
+            );
+        }
+        if plan.file_len != len {
+            return err_box!(
+                "cache commit file length {} differs from the allocated plan {}",
+                len,
+                plan.file_len
+            );
+        }
 
-        validate_commit_locations(&layout, &blocks)?;
+        // Committed row classification. The plan is volatile, so the
+        // committed row remains the authority for identity.
+        {
+            let store = self.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            match rocks.cache_get_entry(incarnation, key).map_err(fs_err)? {
+                None => {
+                    return Ok(CacheOpStatus::Superseded {
+                        expected: generation,
+                        current: 0,
+                    })
+                }
+                Some(cur) if cur.generation > generation => {
+                    return Ok(CacheOpStatus::Superseded {
+                        expected: generation,
+                        current: cur.generation,
+                    });
+                }
+                Some(cur) if cur.generation < generation => {
+                    return err_box!(
+                        "cache commit generation {} is beyond the committed row generation {} for ({}, {})",
+                        generation,
+                        cur.generation,
+                        incarnation,
+                        key
+                    );
+                }
+                Some(cur) if cur.object_id != object_id => {
+                    return err_box!(
+                        "cache commit identity mismatch for ({}, {})@{}: committed object {} vs expected {}",
+                        incarnation,
+                        key,
+                        generation,
+                        cur.object_id,
+                        object_id
+                    );
+                }
+                Some(cur) if cur.state == CacheEntryState::Tombstoned => {
+                    return Ok(CacheOpStatus::Superseded {
+                        expected: generation,
+                        current: cur.generation,
+                    });
+                }
+                Some(cur) if cur.state == CacheEntryState::Valid => {
+                    // Same generation and object: only this load's commit
+                    // could have written it.
+                    if cur.len == len && cur.ufs_mtime == ufs_mtime {
+                        return Ok(CacheOpStatus::AlreadyApplied);
+                    }
+                    return err_box!(
+                        "cache commit parameter divergence for ({}, {})@{}: committed len {} mtime {} vs request len {} mtime {}",
+                        incarnation,
+                        key,
+                        generation,
+                        cur.len,
+                        cur.ufs_mtime,
+                        len,
+                        ufs_mtime
+                    );
+                }
+                Some(_) => (), // Reserved at the right identity: apply.
+            }
+        }
 
-        let expire_at = if ttl_ms > 0 {
-            let now = LocalTime::mills() as i64;
-            now.checked_add(ttl_ms)
-                .filter(|v| *v > 0)
-                .ok_or_else(|| cm_err("cache commit ttl overflow"))?
-        } else {
-            0
-        };
+        // Evidence validation against the plan happens before the
+        // barrier: every rejected set below never touches the journal.
+        validate_commit_against_plan(&plan, &blocks)?;
 
+        let op_id = self.fs_dir.read().next_op_id();
         let entry = JournalEntry::CacheCommit(CacheCommitEntry {
-            op_id: 0,
-            rpc_id: 0,
+            op_id,
+            rpc_id,
+            token,
+            load_token,
             incarnation,
             key: key.to_string(),
             generation,
             expected_object_id: object_id,
             len,
             ufs_mtime,
-            expire_at,
+            expire_at: 0,
         });
         self.journal_writer
             .sync_propose_cache(entry)
@@ -406,7 +882,7 @@ impl CacheService {
 
         // Readback from committed state: the row must now be Valid at the
         // committed generation with the committed object identity. Only
-        // then are the volatile locations recorded.
+        // then are the volatile locations published.
         {
             let store = self.fs_dir.read();
             let rocks = store.get_rocks_store();
@@ -435,29 +911,99 @@ impl CacheService {
                 .blocks
                 .insert((index + 1) as i64, block.workers);
         }
-        Ok(())
+        drop(locations);
+        // Terminal state reached: the plan is spent.
+        self.plans.lock().unwrap().remove(&load_token);
+        Ok(CacheOpStatus::Applied)
     }
 
     /// Invalidate / remove one cache object: a generation fence to
     /// `Tombstoned@expected_generation + 1` that must target the object
     /// the caller observed (`expected_object_id` CAS). Volatile locations
-    /// are dropped only after the barrier readback confirms the fence.
-    /// (Bulk prefix/mount removal and physical vacuum land in 4c.)
+    /// and any plan for the object are dropped only after the fence is
+    /// confirmed. (Bulk prefix/mount removal and physical vacuum land in
+    /// 4c.)
     pub fn invalidate(
         &self,
+        rpc_id: i64,
         incarnation: u64,
         key: &str,
         expected_generation: u64,
         expected_object_id: i64,
-    ) -> CommonResult<()> {
+    ) -> CommonResult<CacheOpStatus> {
         self.require_leader()?;
-
+        validate_key(key)?;
         let new_generation = expected_generation
             .checked_add(1)
             .ok_or_else(|| cm_err("cache invalidate generation overflow: entry is terminal"))?;
+
+        // Classify against the committed row first: terminal states
+        // resolve without a propose.
+        {
+            let store = self.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            match rocks.cache_get_entry(incarnation, key).map_err(fs_err)? {
+                None => {
+                    return Ok(CacheOpStatus::Superseded {
+                        expected: new_generation,
+                        current: 0,
+                    })
+                }
+                Some(cur) if cur.generation > new_generation => {
+                    return Ok(CacheOpStatus::Superseded {
+                        expected: new_generation,
+                        current: cur.generation,
+                    })
+                }
+                Some(cur) if cur.generation == new_generation => {
+                    if cur.state == CacheEntryState::Tombstoned {
+                        drop(store);
+                        self.drop_object_state(&expected_object_id);
+                        return Ok(CacheOpStatus::AlreadyApplied);
+                    }
+                    // Some other mutation wrote the fenced generation:
+                    // divergence, not silent classification.
+                    return err_box!(
+                        "cache invalidate replay divergence for ({}, {})@{}: state {:?}",
+                        incarnation,
+                        key,
+                        cur.generation,
+                        cur.state
+                    );
+                }
+                Some(cur) if cur.generation > expected_generation => {
+                    return Ok(CacheOpStatus::Superseded {
+                        expected: new_generation,
+                        current: cur.generation,
+                    })
+                }
+                Some(cur) if cur.generation < expected_generation => {
+                    return err_box!(
+                        "cache invalidate expected generation {} is beyond the committed row generation {} for ({}, {})",
+                        expected_generation,
+                        cur.generation,
+                        incarnation,
+                        key
+                    );
+                }
+                Some(cur) if cur.object_id != expected_object_id => {
+                    return err_box!(
+                        "cache invalidate identity mismatch for ({}, {})@{}: committed object {} vs expected {}",
+                        incarnation,
+                        key,
+                        cur.generation,
+                        cur.object_id,
+                        expected_object_id
+                    );
+                }
+                Some(_) => (), // Reserved/Valid at the expected fence: apply.
+            }
+        }
+
+        let op_id = self.fs_dir.read().next_op_id();
         let entry = JournalEntry::CacheRemove(CacheRemoveEntry {
-            op_id: 0,
-            rpc_id: 0,
+            op_id,
+            rpc_id,
             incarnation,
             key: key.to_string(),
             expected_generation,
@@ -476,8 +1022,8 @@ impl CacheService {
                 if cur.state == CacheEntryState::Tombstoned && cur.generation >= new_generation =>
             {
                 drop(store);
-                self.locations.lock().unwrap().remove(&expected_object_id);
-                Ok(())
+                self.drop_object_state(&expected_object_id);
+                Ok(CacheOpStatus::Applied)
             }
             other => err_box!(
                 "cache invalidate barrier readback failed for ({}, {}): {:?}",
@@ -488,6 +1034,16 @@ impl CacheService {
         }
     }
 
+    /// Drop the volatile state (locations + every plan) of one object:
+    /// called when the object's row reaches a terminal state.
+    fn drop_object_state(&self, object_id: &i64) {
+        self.locations.lock().unwrap().remove(object_id);
+        self.plans
+            .lock()
+            .unwrap()
+            .retain(|_, plan| &plan.object_id != object_id);
+    }
+
     fn require_leader(&self) -> CommonResult<()> {
         if !self.monitor.is_active() {
             return err_box!("cache metadata mutations are leader-only");
@@ -495,22 +1051,158 @@ impl CacheService {
         Ok(())
     }
 
-    fn current_volatile_object_id(&self) -> i64 {
-        self.fs_dir.read().cache.current_object_id()
+    /// Leader gate for issuance paths: a failed gate also burns the
+    /// segment (leadership was lost, even if only observed now).
+    fn require_leader_or_burn(&self) -> CommonResult<()> {
+        if !self.monitor.is_active() {
+            *self.segment.lock().unwrap() = None;
+            return err_box!("cache metadata mutations are leader-only");
+        }
+        Ok(())
     }
 
-    fn next_issuer_token(&self) -> OpToken {
-        let op_seq = self.issuer_seq.fetch_add(1, Ordering::SeqCst) + 1;
-        OpToken {
+    /// Plan the per-block worker sets for a whole object. Chooses before
+    /// any identity is issued so worker-selection failures never burn an
+    /// object id. Each set is bounded by the chooser's replica policy
+    /// (production: `ClusterConf.client.replicas` under the worker
+    /// policy's availability/capacity rules).
+    fn plan_worker_sets(
+        &self,
+        block_count: usize,
+        block_size: i64,
+    ) -> CommonResult<Vec<Vec<WorkerAddress>>> {
+        let mut sets = Vec::with_capacity(block_count);
+        for _ in 0..block_count {
+            let mut workers = self.chooser.choose_block(block_size)?;
+            workers.truncate(MAX_LOCATIONS_PER_BLOCK);
+            if workers.is_empty() {
+                return err_box!("cache placement chooser returned no workers");
+            }
+            sets.push(workers);
+        }
+        Ok(sets)
+    }
+
+    /// Ensure the leader-scoped segment cursor is usable and consume one
+    /// id (returning the id together with the leadership epoch it was
+    /// consumed in). Caller holds the issue lock. Burn rules:
+    /// - the leadership epoch changed since the segment was reserved
+    ///   (lost-and-regained leadership, even invisibly between RPCs);
+    /// - the durable reserve watermark moved past the segment end
+    ///   (another leader reserved onward);
+    /// - the segment is exhausted (next == end);
+    /// - leadership was lost across the reserve barrier (the just
+    ///   reserved segment is dropped and the loop reserves again under
+    ///   the new epoch).
+    ///
+    /// A burned/exhausted segment triggers a fresh durable reserve
+    /// `[HW+1, HW+1+SEG)` through the sync barrier; the old tail is
+    /// permanently lost to this leader.
+    fn ensure_segment_and_issue(&self, rpc_id: i64) -> CommonResult<(i64, u64)> {
+        let epoch = self.monitor.journal_epoch();
+        let mut seg = self.segment.lock().unwrap();
+        loop {
+            let durable_hw = {
+                let store = self.fs_dir.read();
+                store
+                    .get_rocks_store()
+                    .cache_get_state(state_tags::CACHE_OBJECT_ID)
+                    .map_err(fs_err)?
+                    .unwrap_or(BlockIdCodec::CACHE_OBJECT_MIN - 1)
+            };
+            if let Some(s) = *seg {
+                if s.epoch != epoch || durable_hw > s.end - 1 {
+                    *seg = None;
+                }
+            }
+            if let Some(s) = seg.as_mut() {
+                if s.next < s.end {
+                    let id = s.next;
+                    s.next += 1;
+                    return Ok((id, s.epoch));
+                }
+                *seg = None; // exhausted
+            }
+
+            // Reserve the next contiguous segment [HW+1, HW+1+SEG).
+            // Guards are dropped around the propose (the apply worker
+            // takes its own fs_dir lock; holding a read guard across the
+            // barrier would deadlock the FSM).
+            let start = durable_hw
+                .checked_add(1)
+                .ok_or_else(|| cm_err("cache object id segment space exhausted"))?;
+            let end = start
+                .checked_add(CACHE_RESERVE_SEGMENT)
+                .filter(|end| *end <= BlockIdCodec::CACHE_OBJECT_MAX + 1)
+                .ok_or_else(|| cm_err("cache object id segment space exhausted"))?;
+            let reserve_token = self.next_issuer_token()?;
+            let op_id = self.fs_dir.read().next_op_id();
+            let entry = JournalEntry::CacheIdReserve(CacheIdReserveEntry {
+                op_id,
+                rpc_id,
+                token: reserve_token,
+                start,
+                end,
+            });
+            // The propose barrier returns only after the FSM applied the
+            // reserve, so after it the durable HW covers [start, end).
+            self.journal_writer
+                .sync_propose_cache(entry)
+                .map_err(fs_err)?;
+            let now_hw = {
+                let store = self.fs_dir.read();
+                store
+                    .get_rocks_store()
+                    .cache_get_state(state_tags::CACHE_OBJECT_ID)
+                    .map_err(fs_err)?
+                    .unwrap_or(BlockIdCodec::CACHE_OBJECT_MIN - 1)
+            };
+            if now_hw != end - 1 {
+                return err_box!(
+                    "cache id reserve barrier verification failed: durable watermark {} != {}",
+                    now_hw,
+                    end - 1
+                );
+            }
+            // Leadership may have transitioned while the barrier ran:
+            // never install a segment reserved by a previous epoch —
+            // burn it (and the tail) and reserve again under this one.
+            if !self.monitor.is_active() || self.monitor.journal_epoch() != epoch {
+                *seg = None;
+                continue;
+            }
+            *seg = Some(Segment {
+                next: start,
+                end,
+                epoch,
+            });
+        }
+    }
+
+    /// Next issuer reserve token. The op sequence is durable: read from
+    /// the issuer client's committed watermark (+1, overflow-checked), so
+    /// restarts and clock skew can never collide or regress tokens.
+    /// Caller holds the issue lock.
+    fn next_issuer_token(&self) -> CommonResult<OpToken> {
+        let store = self.fs_dir.read();
+        let rocks = store.get_rocks_store();
+        let hw = rocks
+            .cache_client_watermark(CACHE_ISSUER_CLIENT_ID)
+            .map_err(fs_err)?
+            .unwrap_or(0);
+        let op_seq = hw.checked_add(1).ok_or_else(|| {
+            cm_err("cache issuer op sequence exhausted at u64::MAX: id space is terminal")
+        })?;
+        Ok(OpToken {
             client_id: CACHE_ISSUER_CLIENT_ID,
             op_seq,
-        }
+        })
     }
 
     /// Test/restore seam for volatile locations (a full block report will
     /// use the same table in 4d). Accepts only complete, validated sets.
     #[cfg(test)]
-    pub(crate) fn install_locations(
+    fn install_locations(
         &self,
         object_id: i64,
         blocks: Vec<CacheBlockLocation>,
@@ -525,13 +1217,41 @@ impl CacheService {
         }
         Ok(())
     }
+
+    /// Test seam for volatile load plans (stand-in for a completed
+    /// allocate whose raft barrier is unavailable in unit tests).
+    #[cfg(test)]
+    fn install_plan(&self, token: OpToken, plan: LoadPlan) {
+        self.plans.lock().unwrap().insert(token, plan);
+    }
 }
 
-/// Exact-layout validation: the commit's block list must equal the
-/// derived `1..=n` sequence — right count, right ids, right lengths,
-/// non-empty bounded worker sets.
-fn validate_commit_locations(
-    layout: &CacheBlockLayout,
+fn validate_key(key: &str) -> CommonResult<()> {
+    if key.len() > MAX_KEY_BYTES {
+        return err_box!("cache key is {} bytes, cap {}", key.len(), MAX_KEY_BYTES);
+    }
+    Ok(())
+}
+
+/// RPC clients may not present the internal issuer client id: a forged
+/// issuer token could otherwise alias/deny the reserve token space.
+fn validate_client_token(token: OpToken) -> CommonResult<()> {
+    if token.client_id == CACHE_ISSUER_CLIENT_ID {
+        return err_box!(
+            "cache rpc token may not use the internal issuer client id {}",
+            CACHE_ISSUER_CLIENT_ID
+        );
+    }
+    Ok(())
+}
+
+/// Evidence validation: the commit's reported locations must match the
+/// allocate plan bound to the load token — same blocks in sequence order,
+/// and per block only planned workers, deduplicated, at least the replica
+/// policy's location count. This is what stops a client from publishing
+/// un-planned replicas (or faking replica counts by repeating a worker).
+fn validate_commit_against_plan(
+    plan: &LoadPlan,
     blocks: &[CacheBlockLocation],
 ) -> CommonResult<()> {
     if blocks.len() > MAX_COMMIT_BLOCKS {
@@ -541,42 +1261,58 @@ fn validate_commit_locations(
             MAX_COMMIT_BLOCKS
         );
     }
-    if blocks.len() != layout.block_count as usize {
+    // The plan itself must be internally consistent: its block list is the
+    // layout derived from (file_len, block_size).
+    let derived_count = if plan.file_len == 0 {
+        0
+    } else {
+        ((plan.file_len - 1) / plan.block_size + 1) as usize
+    };
+    if plan.blocks.len() != derived_count {
         return err_box!(
-            "cache commit location count {} does not match derived block count {} (len {}, block size {})",
-            blocks.len(),
-            layout.block_count,
-            layout.len,
-            layout.block_size
+            "cache load plan block count {} does not match the derived layout {} (len {}, block size {})",
+            plan.blocks.len(),
+            derived_count,
+            plan.file_len,
+            plan.block_size
         );
     }
-    for (index, block) in blocks.iter().enumerate() {
-        let expected_id = layout.block_id((index + 1) as i64)?;
-        if block.block_id != expected_id {
+    if blocks.len() != plan.blocks.len() {
+        return err_box!(
+            "cache commit location count {} does not match the planned block count {}",
+            blocks.len(),
+            plan.blocks.len()
+        );
+    }
+    for (index, (block, planned)) in blocks.iter().zip(plan.blocks.iter()).enumerate() {
+        if block.block_id != planned.block_id {
             return err_box!(
-                "cache commit block id {} at position {} is not the derived id {}",
+                "cache commit block id {} at position {} is not the planned id {}",
                 block.block_id,
                 index + 1,
-                expected_id
+                planned.block_id
             );
         }
-        let expected_len = if (index + 1) as i64 == layout.block_count {
-            layout.last_len
-        } else {
-            layout.block_size
-        };
-        if block.block_len != expected_len {
+        if block.block_len != planned.block_len {
             return err_box!(
-                "cache commit block {} length {} != expected {}",
+                "cache commit block {} length {} != planned {}",
                 block.block_id,
                 block.block_len,
-                expected_len
+                planned.block_len
             );
         }
         if block.workers.is_empty() {
             return err_box!(
-                "cache commit block {} has no replica locations",
+                "cache commit block {} has no successful replica locations",
                 block.block_id
+            );
+        }
+        if block.workers.len() < plan.replicas {
+            return err_box!(
+                "cache commit block {} reports {} locations, below the replica policy {}",
+                block.block_id,
+                block.workers.len(),
+                plan.replicas
             );
         }
         if block.workers.len() > MAX_LOCATIONS_PER_BLOCK {
@@ -586,6 +1322,28 @@ fn validate_commit_locations(
                 block.workers.len(),
                 MAX_LOCATIONS_PER_BLOCK
             );
+        }
+        let mut seen = Vec::with_capacity(block.workers.len());
+        for worker in &block.workers {
+            if !planned
+                .workers
+                .iter()
+                .any(|p| p.worker_id == worker.worker_id)
+            {
+                return err_box!(
+                    "cache commit block {} reports worker {} which is not in the allocate plan",
+                    block.block_id,
+                    worker.worker_id
+                );
+            }
+            if seen.contains(&worker.worker_id) {
+                return err_box!(
+                    "cache commit block {} reports worker {} more than once",
+                    block.block_id,
+                    worker.worker_id
+                );
+            }
+            seen.push(worker.worker_id);
         }
     }
     Ok(())
@@ -607,14 +1365,77 @@ mod tests {
     use crate::master::quota::eviction::EvictionConf;
     use crate::master::Master;
     use curvine_config::{ClusterConf, JournalConf, MasterConf};
-    use curvine_model::StorageType;
     use curvine_raft::raft::{RaftClient, RoleState};
     use curvine_runtime::sync::StateCtl;
-    use std::sync::Arc;
 
     const OBJ: i64 = BlockIdCodec::CACHE_OBJECT_MIN;
 
-    fn service_conf(name: &str) -> ClusterConf {
+    fn token(client: u64, seq: u64) -> OpToken {
+        OpToken {
+            client_id: client,
+            op_seq: seq,
+        }
+    }
+
+    fn worker(id: u32) -> WorkerAddress {
+        WorkerAddress {
+            worker_id: id,
+            hostname: format!("worker-{}", id),
+            ip_addr: "10.0.0.1".into(),
+            rpc_port: 8200,
+            web_port: 8300,
+        }
+    }
+
+    /// Deterministic chooser: returns the fixed set, or fails like a real
+    /// worker policy with no available workers.
+    struct FixedChooser {
+        workers: Vec<WorkerAddress>,
+        fail: bool,
+        replicas: usize,
+    }
+
+    impl CacheWorkerChooser for FixedChooser {
+        fn choose_block(&self, _block_size: i64) -> CommonResult<Vec<WorkerAddress>> {
+            if self.fail {
+                return err_box!("fixed chooser: no available workers");
+            }
+            Ok(self.workers.clone())
+        }
+
+        fn replica_policy(&self) -> usize {
+            self.replicas
+        }
+    }
+
+    fn chooser(workers: Vec<WorkerAddress>) -> Arc<dyn CacheWorkerChooser> {
+        Arc::new(FixedChooser {
+            workers,
+            fail: false,
+            replicas: 1,
+        })
+    }
+
+    fn chooser_with_policy(
+        workers: Vec<WorkerAddress>,
+        replicas: usize,
+    ) -> Arc<dyn CacheWorkerChooser> {
+        Arc::new(FixedChooser {
+            workers,
+            fail: false,
+            replicas,
+        })
+    }
+
+    fn failing_chooser() -> Arc<dyn CacheWorkerChooser> {
+        Arc::new(FixedChooser {
+            workers: vec![worker(1)],
+            fail: true,
+            replicas: 1,
+        })
+    }
+
+    fn build_service(name: &str, chooser: Arc<dyn CacheWorkerChooser>) -> CacheService {
         let mut journal = JournalConf::with_test();
         journal.enable = true;
         let mut conf = ClusterConf {
@@ -625,11 +1446,6 @@ mod tests {
             ..Default::default()
         };
         conf.change_test_meta_dir(name);
-        conf
-    }
-
-    fn build_service(name: &str) -> CacheService {
-        let conf = service_conf(name);
         Master::init_test_metrics();
         let rt = conf.journal.create_runtime();
         let client = RaftClient::from_conf(rt, &conf.journal);
@@ -645,43 +1461,11 @@ mod tests {
         let fs_dir =
             SyncFsDir::new(FsDir::new(&conf, writer.clone(), ttl_bucket_list, evictor).unwrap());
         let monitor = MasterMonitor::new(StateCtl::new(0), StateCtl::new(0));
-        // Unit tests exercise the leader-side validation and readback
-        // logic; the barrier itself needs a real raft cluster (covered by
-        // the journal fault tests and the 4e matrix) and fails closed in
-        // testing mode.
+        // Unit tests exercise the leader-side validation, token, plan, and
+        // burn logic; the raft barrier itself fails closed in testing mode
+        // (no cluster) and is covered by the journal fault tests / 4e.
         monitor.journal_ctl.set_state(RoleState::Leader);
-        CacheService::new(fs_dir, writer, monitor)
-    }
-
-    fn worker(id: u32) -> BlockLocation {
-        BlockLocation {
-            worker_id: id,
-            storage_type: StorageType::Mem,
-        }
-    }
-
-    fn full_locations(layout: &CacheBlockLayout) -> Vec<CacheBlockLocation> {
-        (1..=layout.block_count)
-            .map(|index| {
-                let block_len = if index == layout.block_count {
-                    layout.last_len
-                } else {
-                    layout.block_size
-                };
-                CacheBlockLocation {
-                    block_id: layout.block_id(index).unwrap(),
-                    block_len,
-                    workers: vec![worker(1), worker(2)],
-                }
-            })
-            .collect()
-    }
-
-    fn token(client: u64, seq: u64) -> OpToken {
-        OpToken {
-            client_id: client,
-            op_seq: seq,
-        }
+        CacheService::new(fs_dir, writer, monitor, chooser)
     }
 
     /// Writes a committed entry straight through the manager apply path
@@ -689,6 +1473,8 @@ mod tests {
     /// which needs a real raft barrier).
     fn committed_entry(
         service: &CacheService,
+        alloc_token: OpToken,
+        commit_token: OpToken,
         key: &str,
         object_id: i64,
         len: i64,
@@ -708,84 +1494,227 @@ mod tests {
             block_size: 64,
             expire_at: 0,
         };
-        mgr.apply_allocate(rocks, token(2, 1), 1, key, &alloc)
+        mgr.apply_allocate(rocks, alloc_token, 1, key, len, &alloc)
             .unwrap();
-        mgr.apply_commit(rocks, 1, key, 1, object_id, len, 777, expire_at)
-            .unwrap();
+        mgr.apply_commit(
+            rocks,
+            alloc_token,
+            commit_token,
+            1,
+            key,
+            1,
+            object_id,
+            len,
+            777,
+            expire_at,
+        )
+        .unwrap();
     }
 
     fn layout(object_id: i64, len: i64) -> CacheBlockLayout {
         CacheBlockLayout::derive(object_id, len, 64).unwrap()
     }
 
+    /// Planned/reported location set for a whole layout, two workers.
+    fn full_locations(lay: &CacheBlockLayout) -> Vec<CacheBlockLocation> {
+        (1..=lay.block_count)
+            .map(|index| {
+                let block_len = if index == lay.block_count {
+                    lay.last_len
+                } else {
+                    lay.block_size
+                };
+                CacheBlockLocation {
+                    block_id: lay.block_id(index).unwrap(),
+                    block_len,
+                    workers: vec![worker(1), worker(2)],
+                }
+            })
+            .collect()
+    }
+
+    fn plan_for(lay: &CacheBlockLayout) -> LoadPlan {
+        LoadPlan {
+            object_id: lay.object_id,
+            generation: 1,
+            file_len: lay.len,
+            block_size: lay.block_size,
+            replicas: 1,
+            blocks: full_locations(lay),
+        }
+    }
+
+    fn commit_params<'a>(
+        load_token: OpToken,
+        token: OpToken,
+        blocks: Vec<CacheBlockLocation>,
+    ) -> CacheCommitParams<'a> {
+        CacheCommitParams {
+            token,
+            load_token,
+            rpc_id: 7,
+            incarnation: 1,
+            key: "/k",
+            generation: 1,
+            object_id: OBJ,
+            len: 130,
+            ufs_mtime: 777,
+            ttl_ms: 0,
+            blocks,
+        }
+    }
+
+    #[test]
+    fn test_validate_key_and_client_token() {
+        assert!(validate_key("/a/b").is_ok());
+        assert!(validate_key(&"x".repeat(MAX_KEY_BYTES)).is_ok());
+        assert!(validate_key(&"x".repeat(MAX_KEY_BYTES + 1)).is_err());
+
+        assert!(validate_client_token(token(1, 1)).is_ok());
+        // The internal issuer id is disjoint from the RPC client space.
+        assert!(validate_client_token(token(CACHE_ISSUER_CLIENT_ID, 1)).is_err());
+    }
+
     /// Whole-object semantics: a Valid entry without volatile locations
-    /// is a miss; a complete location set is a hit; any missing block is
-    /// a miss again.
+    /// is a miss when locations are needed, but a metadata-only hit when
+    /// they are not; a complete location set is a hit; any missing block
+    /// is a miss again.
     #[test]
     fn test_get_is_whole_object() {
-        let service = build_service("get-whole-object");
-        let object_id = OBJ;
+        let service = build_service("get-whole-object", chooser(vec![worker(1), worker(2)]));
         let len = 150; // 3 blocks of 64: 64, 64, 22
-        committed_entry(&service, "/k", object_id, len, 0);
-        let lay = layout(object_id, len);
+        committed_entry(&service, token(2, 1), token(2, 2), "/k", OBJ, len, 0);
+        let lay = layout(OBJ, len);
         assert_eq!(lay.block_count, 3);
         assert_eq!(lay.last_len, 22);
 
-        // No locations -> miss.
-        assert!(service.get(1, "/k").unwrap().is_none());
+        // No locations -> miss when needed.
+        assert!(service.get(1, "/k", true).unwrap().is_none());
+        // Metadata-only lookup hits without any volatile location set.
+        let meta = service.get(1, "/k", false).unwrap().expect("meta hit");
+        assert!(meta.blocks.is_empty());
+        assert_eq!(meta.object_id, OBJ);
+        assert_eq!(meta.len, len);
+        assert_eq!(meta.generation, 1);
+        assert_eq!(meta.ufs_mtime, 777);
+        assert_eq!(meta.expire_at, 0);
 
         // Complete -> hit with exact derived ids/lengths.
         service
-            .install_locations(object_id, full_locations(&lay))
+            .install_locations(OBJ, full_locations(&lay))
             .unwrap();
-        let hit = service
-            .get(1, "/k")
-            .unwrap()
-            .expect("complete set must hit");
-        assert_eq!(hit.object_id, object_id);
-        assert_eq!(hit.len, len);
-        assert_eq!(hit.block_size, 64);
+        let hit = service.get(1, "/k", true).unwrap().expect("hit");
         assert_eq!(hit.blocks.len(), 3);
-        assert_eq!(
-            hit.blocks[0].block_id,
-            BlockIdCodec::encode_block_id(object_id, 1).unwrap()
-        );
         assert_eq!(hit.blocks[0].block_len, 64);
         assert_eq!(hit.blocks[2].block_len, 22);
-        assert_eq!(hit.blocks[2].workers.len(), 2);
+        assert_eq!(
+            hit.blocks[0].block_id,
+            BlockIdCodec::encode_block_id(OBJ, 1).unwrap()
+        );
 
         // Drop the last block -> whole-object miss.
         let mut partial = full_locations(&lay);
         partial.pop();
-        service.install_locations(object_id, partial).unwrap();
+        service.install_locations(OBJ, partial).unwrap();
         assert!(
-            service.get(1, "/k").unwrap().is_none(),
+            service.get(1, "/k", true).unwrap().is_none(),
             "missing block location must be a whole-object miss"
         );
 
-        // Other incarnation / key -> miss.
-        assert!(service.get(2, "/k").unwrap().is_none());
-        assert!(service.get(1, "/other").unwrap().is_none());
+        // Other incarnation / key -> miss; oversized key -> error.
+        assert!(service.get(2, "/k", true).unwrap().is_none());
+        assert!(service.get(1, "/other", true).unwrap().is_none());
+        assert!(service
+            .get(1, &"x".repeat(MAX_KEY_BYTES + 1), true)
+            .is_err());
     }
 
     #[test]
     fn test_get_miss_on_expired_entry() {
-        let service = build_service("get-expired");
+        let service = build_service("get-expired", chooser(vec![worker(1)]));
         // Expire in the past (passive expiry; active scan lands in 4c).
-        committed_entry(&service, "/k", OBJ, 64, 1);
+        committed_entry(&service, token(2, 1), token(2, 2), "/k", OBJ, 64, 1);
         service
             .install_locations(OBJ, full_locations(&layout(OBJ, 64)))
             .unwrap();
-        assert!(service.get(1, "/k").unwrap().is_none());
+        assert!(service.get(1, "/k", true).unwrap().is_none());
+        assert!(service.get(1, "/k", false).unwrap().is_none());
     }
 
-    /// Commit validation happens BEFORE the barrier: every malformed
-    /// location set errors without touching the journal, and only a
-    /// perfect set reaches the (testing-mode fail-closed) barrier.
+    /// Pre-barrier allocate validation: nothing malformed may reach the
+    /// barrier, worker-selection failures never reach it either, and a
+    /// fully valid allocate lands on the (fail-closed in testing mode)
+    /// reserve barrier.
     #[test]
-    fn test_commit_rejects_malformed_location_sets() {
-        let service = build_service("commit-malformed");
-        let len = 130; // 3 blocks: 64, 64, 2
+    fn test_allocate_pre_barrier_validation() {
+        let service = build_service("allocate-validation", chooser(vec![worker(1), worker(2)]));
+        committed_entry(&service, token(2, 1), token(2, 2), "/k", OBJ, 64, 0);
+
+        // Forged issuer identity.
+        let err = service
+            .allocate(token(CACHE_ISSUER_CLIENT_ID, 1), 7, 1, "/new", 128, 64)
+            .unwrap_err();
+        assert!(format!("{}", err).contains("issuer"), "{}", err);
+
+        // Geometry: len 0 is a LEGAL empty object (it still reaches the
+        // barrier); negative length and non-positive block size are not.
+        let err = service
+            .allocate(token(3, 1), 7, 1, "/empty", 0, 64)
+            .unwrap_err();
+        assert!(format!("{}", err).contains("raft"), "{}", err);
+        assert!(service.allocate(token(3, 2), 7, 1, "/new", -1, 64).is_err());
+        assert!(service.allocate(token(3, 3), 7, 1, "/new", 128, 0).is_err());
+
+        // Derived block count over the wire cap.
+        let block_size: i64 = 64;
+        let file_len = (MAX_COMMIT_BLOCKS as i64) * block_size + 1;
+        let err = service
+            .allocate(token(3, 4), 7, 1, "/new", file_len, block_size)
+            .unwrap_err();
+        assert!(format!("{}", err).contains("cap"), "{}", err);
+
+        // Key cap.
+        assert!(service
+            .allocate(token(3, 5), 7, 1, &"x".repeat(MAX_KEY_BYTES + 1), 128, 64)
+            .is_err());
+
+        // Live entry (Reserved/Valid) may not re-allocate.
+        let err = service
+            .allocate(token(3, 6), 7, 1, "/k", 128, 64)
+            .unwrap_err();
+        assert!(format!("{}", err).contains("live entry"), "{}", err);
+
+        // A chooser with no workers fails before the barrier.
+        let service = build_service("allocate-no-workers", failing_chooser());
+        let err = service
+            .allocate(token(3, 7), 7, 1, "/new", 128, 64)
+            .unwrap_err();
+        assert!(!format!("{}", err).contains("raft"), "{}", err);
+
+        // A fully valid allocate reaches the sync-propose barrier, which
+        // fails closed in testing mode: the reserve is never skipped.
+        let service = build_service("allocate-barrier", chooser(vec![worker(1), worker(2)]));
+        let err = service
+            .allocate(token(3, 8), 7, 1, "/new", 128, 64)
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("raft"),
+            "allocate must go through the fail-closed sync barrier: {}",
+            err
+        );
+    }
+
+    /// Token-first idempotency: a retried allocate resolves from the
+    /// committed Allocated outcome — the exact recorded geometry returns
+    /// the committed identity (regenerating a volatile plan for the SAME
+    /// identity when it was lost to a master restart, never a second
+    /// identity), a different geometry or key is divergence, and an
+    /// evicted token is terminal.
+    #[test]
+    fn test_allocate_token_retry_and_expired() {
+        let service = build_service("allocate-retry", chooser(vec![worker(1)]));
+        // A committed allocate outcome written by a previous leader
+        // (file_len 128 = 2 blocks of 64).
         {
             let store = service.fs_dir.read();
             let rocks = store.get_rocks_store();
@@ -801,10 +1730,323 @@ mod tests {
                 block_size: 64,
                 expire_at: 0,
             };
-            mgr.apply_allocate(rocks, token(2, 1), 1, "/k", &alloc)
+            mgr.apply_allocate(rocks, token(2, 1), 1, "/k", 128, &alloc)
+                .unwrap();
+            // Client 3's outcome window moved to 7 (another op completed);
+            // its reserve must stay contiguous with the durable watermark.
+            mgr.apply_id_reserve(rocks, token(3, 7), OBJ + 100, OBJ + 110)
                 .unwrap();
         }
-        let lay = layout(OBJ, len);
+
+        // Retry of the recorded allocation: committed identity, and the
+        // lost volatile plan is regenerated for the SAME identity (same
+        // object id/generation, non-empty blocks for a non-empty object).
+        let result = service.allocate(token(2, 1), 7, 1, "/k", 128, 64).unwrap();
+        assert_eq!(result.object_id, OBJ);
+        assert_eq!(result.generation, 1);
+        assert_eq!(result.blocks.len(), 2, "re-plan must rebuild the placement");
+        assert_eq!(result.blocks[0].workers, vec![worker(1)]);
+        // The regenerated plan is now live: a further retry replays it
+        // verbatim (no identity, no placement swap).
+        let again = service.allocate(token(2, 1), 7, 1, "/k", 128, 64).unwrap();
+        assert_eq!(again.blocks, result.blocks);
+        assert!(service.plans.lock().unwrap().contains_key(&token(2, 1)));
+
+        // Same token aimed at a different key or geometry: divergence.
+        assert!(service
+            .allocate(token(2, 1), 7, 1, "/other", 128, 64)
+            .is_err());
+        assert!(service.allocate(token(2, 1), 7, 1, "/k", 129, 64).is_err());
+        assert!(service.allocate(token(2, 1), 7, 1, "/k", 128, 32).is_err());
+
+        // Token below the client watermark with no outcome: terminal.
+        let err = service
+            .allocate(token(3, 7), 7, 1, "/x", 128, 64)
+            .unwrap_err();
+        assert!(format!("{}", err).contains("expired"), "{}", err);
+        let err = service
+            .allocate(token(3, 1), 7, 1, "/x", 128, 64)
+            .unwrap_err();
+        assert!(format!("{}", err).contains("expired"), "{}", err);
+        // Above the watermark: proceeds to the fail-closed barrier.
+        let err = service
+            .allocate(token(3, 8), 7, 1, "/x", 128, 64)
+            .unwrap_err();
+        assert!(format!("{}", err).contains("raft"), "{}", err);
+    }
+
+    /// len=0 is a legal empty object end to end at the retry path: the
+    /// regenerated plan (and thus the future commit evidence) is empty.
+    #[test]
+    fn test_allocate_len0_replan_is_empty() {
+        let service = build_service("allocate-len0", chooser(vec![worker(1)]));
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let mgr = &store.cache;
+            mgr.apply_id_reserve(rocks, token(1, 1), OBJ, OBJ + 100)
+                .unwrap();
+            let alloc = CacheEntry {
+                generation: 1,
+                state: CacheEntryState::Reserved,
+                object_id: OBJ,
+                len: 0,
+                ufs_mtime: 0,
+                block_size: 64,
+                expire_at: 0,
+            };
+            mgr.apply_allocate(rocks, token(2, 1), 1, "/empty", 0, &alloc)
+                .unwrap();
+        }
+        let result = service
+            .allocate(token(2, 1), 7, 1, "/empty", 0, 64)
+            .unwrap();
+        assert_eq!(result.object_id, OBJ);
+        assert_eq!(result.generation, 1);
+        assert!(
+            result.blocks.is_empty(),
+            "an empty object plans (and commits) zero blocks"
+        );
+    }
+
+    /// Segment burn rules: consume in order inside the epoch; burn on
+    /// epoch change, on the durable watermark passing the segment, and on
+    /// exhaustion — each burn forces a fresh durable reserve through the
+    /// (testing-mode fail-closed) barrier.
+    #[test]
+    fn test_segment_burn_rules() {
+        let service = build_service("segment-burn", chooser(vec![worker(1)]));
+        let epoch = service.monitor.journal_epoch();
+
+        // Install a fresh segment: ids are consumed in order.
+        *service.segment.lock().unwrap() = Some(Segment {
+            next: OBJ + 5,
+            end: OBJ + 10,
+            epoch,
+        });
+        assert_eq!(
+            service.ensure_segment_and_issue(7).unwrap(),
+            (OBJ + 5, epoch)
+        );
+        assert_eq!(
+            service.ensure_segment_and_issue(7).unwrap(),
+            (OBJ + 6, epoch)
+        );
+
+        // Invisible leadership loss (epoch bumped, role unchanged): the
+        // tail burns and the next issue needs a fresh reserve.
+        service.monitor.journal_epoch.advance();
+        let err = service.ensure_segment_and_issue(7).unwrap_err();
+        assert!(format!("{}", err).contains("raft"), "{}", err);
+        assert!(service.segment.lock().unwrap().is_none());
+
+        // Durable watermark passing the segment end burns it too.
+        *service.segment.lock().unwrap() = Some(Segment {
+            next: OBJ,
+            end: OBJ + 10,
+            epoch: service.monitor.journal_epoch(),
+        });
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            store
+                .cache
+                .apply_id_reserve(rocks, token(1, 1), OBJ, OBJ + 110)
+                .unwrap();
+        }
+        let err = service.ensure_segment_and_issue(7).unwrap_err();
+        assert!(format!("{}", err).contains("raft"), "{}", err);
+        assert!(service.segment.lock().unwrap().is_none());
+
+        // An exhausted segment likewise forces a reserve.
+        *service.segment.lock().unwrap() = Some(Segment {
+            next: OBJ + 5,
+            end: OBJ + 5,
+            epoch: service.monitor.journal_epoch(),
+        });
+        let err = service.ensure_segment_and_issue(7).unwrap_err();
+        assert!(format!("{}", err).contains("raft"), "{}", err);
+    }
+
+    /// The issuer's own op sequence is durable: always watermark+1, never
+    /// a wall clock, so restarts cannot collide or regress tokens.
+    #[test]
+    fn test_issuer_seq_is_durable_watermark() {
+        let service = build_service("issuer-seq", chooser(vec![worker(1)]));
+        assert_eq!(service.next_issuer_token().unwrap(), token(0, 1));
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            store
+                .cache
+                .apply_id_reserve(rocks, token(0, 1), OBJ, OBJ + 10)
+                .unwrap();
+        }
+        assert_eq!(service.next_issuer_token().unwrap(), token(0, 2));
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            store
+                .cache
+                .apply_id_reserve(rocks, token(0, 5), OBJ + 10, OBJ + 20)
+                .unwrap();
+        }
+        assert_eq!(service.next_issuer_token().unwrap(), token(0, 6));
+    }
+
+    /// A leader gate failure on an issuance path burns the segment.
+    #[test]
+    fn test_leader_gate_burns_segment() {
+        let service = build_service("leader-burn", chooser(vec![worker(1)]));
+        let epoch = service.monitor.journal_epoch();
+        *service.segment.lock().unwrap() = Some(Segment {
+            next: OBJ,
+            end: OBJ + 10,
+            epoch,
+        });
+        service.monitor.journal_ctl.set_state(RoleState::Follower);
+        assert!(service.allocate(token(3, 1), 7, 1, "/k", 128, 64).is_err());
+        assert!(service.segment.lock().unwrap().is_none());
+    }
+
+    /// The volatile plan is mandatory: a commit without it fails closed
+    /// as a retryable miss (master restart) — before any other judgment
+    /// about the entry row.
+    #[test]
+    fn test_commit_requires_plan() {
+        let service = build_service("commit-plan-mandatory", chooser(vec![worker(1)]));
+        // Reserved row + recorded load outcome exist, but no volatile plan
+        // for the load token.
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let mgr = &store.cache;
+            mgr.apply_id_reserve(rocks, token(1, 1), OBJ, OBJ + 100)
+                .unwrap();
+            let alloc = CacheEntry {
+                generation: 1,
+                state: CacheEntryState::Reserved,
+                object_id: OBJ,
+                len: 0,
+                ufs_mtime: 0,
+                block_size: 64,
+                expire_at: 0,
+            };
+            mgr.apply_allocate(rocks, token(9, 1), 1, "/k", 130, &alloc)
+                .unwrap();
+        }
+        let lay = layout(OBJ, 130);
+        let err = service
+            .commit(commit_params(
+                token(9, 1),
+                token(9, 2),
+                full_locations(&lay),
+            ))
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("live plan"),
+            "commit without a plan must fail closed: {}",
+            err
+        );
+        assert!(!format!("{}", err).contains("raft"), "{}", err);
+    }
+
+    /// A lost-response commit retry resolves to its recorded Committed
+    /// outcome as AlreadyApplied, regardless of the entry row. A commit
+    /// that does not match its recorded load allocation is rejected before
+    /// any plan lookup.
+    #[test]
+    fn test_commit_outcome_retry_already_applied() {
+        let service = build_service("commit-retry", chooser(vec![worker(1)]));
+        committed_entry(&service, token(2, 1), token(2, 2), "/k", OBJ, 130, 0);
+        // Later mutations (removal) advanced the row far past the commit;
+        // the commit-token outcome must still win.
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            store.cache.apply_remove(rocks, 1, "/k", 1, 2, OBJ).unwrap();
+        }
+        let status = service
+            .commit(commit_params(token(2, 1), token(2, 2), vec![]))
+            .unwrap();
+        assert_eq!(status, CacheOpStatus::AlreadyApplied);
+        // Same commit token with different parameters: resolved by the
+        // recorded outcome.
+        let mut p = commit_params(token(2, 1), token(2, 2), vec![]);
+        p.len = 999;
+        assert_eq!(service.commit(p).unwrap(), CacheOpStatus::AlreadyApplied);
+
+        // An unknown load token has no recorded allocation: fail closed
+        // before the plan lookup.
+        let err = service
+            .commit(commit_params(token(4, 9), token(4, 1), vec![]))
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("no recorded allocation"),
+            "{}",
+            err
+        );
+
+        // A different commit token for the same load: the plan is missing
+        // (restart), so replay the exact allocate to re-plan — then the row
+        // check runs and the Tombstoned@2 row supersedes generation 1.
+        let err = service
+            .commit(commit_params(token(2, 1), token(4, 1), vec![]))
+            .unwrap_err();
+        assert!(format!("{}", err).contains("live plan"), "{}", err);
+        let lay = layout(OBJ, 130);
+        service.install_plan(token(2, 1), plan_for(&lay));
+        assert_eq!(
+            service
+                .commit(commit_params(
+                    token(2, 1),
+                    token(4, 1),
+                    full_locations(&lay)
+                ))
+                .unwrap(),
+            CacheOpStatus::Superseded {
+                expected: 1,
+                current: 2
+            }
+        );
+    }
+
+    /// TTL stays fail-closed until mount-policy TTL lands (4b).
+    #[test]
+    fn test_commit_ttl_fail_closed() {
+        let service = build_service("commit-ttl", chooser(vec![worker(1)]));
+        let mut p = commit_params(token(2, 1), token(2, 2), vec![]);
+        p.ttl_ms = 1;
+        let err = service.commit(p).unwrap_err();
+        assert!(format!("{}", err).contains("ttl"), "{}", err);
+    }
+
+    /// Commit evidence is validated against the plan BEFORE the barrier:
+    /// same blocks in order, planned workers only, deduplicated, at least
+    /// the replica policy's count, capped.
+    #[test]
+    fn test_commit_rejects_malformed_evidence() {
+        let service = build_service("commit-evidence", chooser(vec![worker(1), worker(2)]));
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let mgr = &store.cache;
+            mgr.apply_id_reserve(rocks, token(1, 1), OBJ, OBJ + 100)
+                .unwrap();
+            let alloc = CacheEntry {
+                generation: 1,
+                state: CacheEntryState::Reserved,
+                object_id: OBJ,
+                len: 0,
+                ufs_mtime: 0,
+                block_size: 64,
+                expire_at: 0,
+            };
+            mgr.apply_allocate(rocks, token(9, 1), 1, "/k", 130, &alloc)
+                .unwrap();
+        }
+        let lay = layout(OBJ, 130); // 3 blocks: 64, 64, 2
+        service.install_plan(token(9, 1), plan_for(&lay));
 
         let cases: Vec<(&str, Vec<CacheBlockLocation>)> = vec![
             ("wrong count (too few)", full_locations(&lay)[..2].to_vec()),
@@ -828,24 +2070,32 @@ mod tests {
                 v[0].workers.clear();
                 v
             }),
-            ("worker cap exceeded", {
+            ("unplanned worker", {
                 let mut v = full_locations(&lay);
-                v[0].workers = (0..=MAX_LOCATIONS_PER_BLOCK as u32).map(worker).collect();
+                v[0].workers = vec![worker(1), worker(99)];
+                v
+            }),
+            ("duplicate worker", {
+                let mut v = full_locations(&lay);
+                v[0].workers = vec![worker(1), worker(1)];
+                v
+            }),
+            ("location cap exceeded", {
+                let mut plan = plan_for(&lay);
+                plan.blocks[0].workers = (1..=(MAX_LOCATIONS_PER_BLOCK as u32 + 1))
+                    .map(worker)
+                    .collect();
+                service.install_plan(token(9, 1), plan);
+                let mut v = full_locations(&lay);
+                v[0].workers = (1..=(MAX_LOCATIONS_PER_BLOCK as u32 + 1))
+                    .map(worker)
+                    .collect();
                 v
             }),
         ];
         for (name, blocks) in cases {
             let err = service
-                .commit(CacheCommitParams {
-                    incarnation: 1,
-                    key: "/k",
-                    generation: 1,
-                    object_id: OBJ,
-                    len,
-                    ufs_mtime: 777,
-                    ttl_ms: 0,
-                    blocks,
-                })
+                .commit(commit_params(token(9, 1), token(9, 2), blocks))
                 .unwrap_err();
             assert!(
                 !format!("{}", err).contains("raft"),
@@ -855,31 +2105,30 @@ mod tests {
             );
         }
 
-        // A perfect set reaches the barrier, which fails closed in
-        // testing mode (no raft cluster) — proving no path bypasses the
-        // sync propose.
+        // A perfect evidence set reaches the fail-closed barrier: the
+        // journal write is never skipped.
         let err = service
-            .commit(CacheCommitParams {
-                incarnation: 1,
-                key: "/k",
-                generation: 1,
-                object_id: OBJ,
-                len,
-                ufs_mtime: 777,
-                ttl_ms: 0,
-                blocks: full_locations(&lay),
-            })
+            .commit(commit_params(
+                token(9, 1),
+                token(9, 2),
+                full_locations(&lay),
+            ))
             .unwrap_err();
         assert!(
             format!("{}", err).contains("raft"),
-            "well-formed commit must reach the (fail-closed) barrier: {}",
+            "well-formed commit must reach the fail-closed barrier: {}",
             err
         );
     }
 
+    /// The commit evidence must reach the replica policy: a plan with
+    /// replicas=2 rejects single-location blocks before the barrier.
     #[test]
-    fn test_commit_rejects_identity_mismatch() {
-        let service = build_service("commit-identity");
+    fn test_commit_replica_policy_enforced() {
+        let service = build_service(
+            "commit-replica-policy",
+            chooser_with_policy(vec![worker(1), worker(2)], 2),
+        );
         {
             let store = service.fs_dir.read();
             let rocks = store.get_rocks_store();
@@ -895,61 +2144,102 @@ mod tests {
                 block_size: 64,
                 expire_at: 0,
             };
-            mgr.apply_allocate(rocks, token(2, 1), 1, "/k", &alloc)
+            mgr.apply_allocate(rocks, token(9, 1), 1, "/k", 130, &alloc)
                 .unwrap();
         }
-        let lay = layout(OBJ, 64);
-        let blocks = full_locations(&lay);
-        fn params<'a>(
-            generation: u64,
-            object_id: i64,
-            key: &'a str,
-            blocks: Vec<CacheBlockLocation>,
-        ) -> CacheCommitParams<'a> {
-            CacheCommitParams {
-                incarnation: 1,
-                key,
-                generation,
-                object_id,
-                len: 64,
-                ufs_mtime: 777,
-                ttl_ms: 0,
-                blocks,
-            }
-        }
-        // Wrong generation.
-        assert!(service
-            .commit(params(2, OBJ, "/k", blocks.clone()))
-            .is_err());
-        // Wrong object id.
-        assert!(service
-            .commit(params(1, OBJ + 5, "/k", blocks.clone()))
-            .is_err());
-        // Missing entry.
-        assert!(service.commit(params(1, OBJ, "/missing", blocks)).is_err());
+        let lay = layout(OBJ, 130);
+        let mut plan = plan_for(&lay);
+        plan.replicas = 2;
+        service.install_plan(token(9, 1), plan);
+
+        // Planned workers, deduplicated, but only one location per block:
+        // below the replica policy.
+        let starved: Vec<CacheBlockLocation> = full_locations(&lay)
+            .into_iter()
+            .map(|mut b| {
+                b.workers = vec![worker(1)];
+                b
+            })
+            .collect();
+        let err = service
+            .commit(commit_params(token(9, 1), token(9, 2), starved))
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("replica policy"),
+            "evidence below the replica policy must be rejected: {}",
+            err
+        );
+        assert!(!format!("{}", err).contains("raft"), "{}", err);
+
+        // Full evidence reaches the fail-closed barrier.
+        let err = service
+            .commit(commit_params(
+                token(9, 1),
+                token(9, 2),
+                full_locations(&lay),
+            ))
+            .unwrap_err();
+        assert!(format!("{}", err).contains("raft"), "{}", err);
     }
 
-    /// Allocate fails closed end to end in testing mode (the reserve
-    // propose needs a real raft cluster), and pre-barrier entry-state
-    /// checks reject live rows before any issuance.
+    /// Invalidate classification: terminal rows resolve without a
+    /// propose; everything else reaches the fail-closed barrier.
     #[test]
-    fn test_allocate_fails_closed_and_rejects_live_entry() {
-        let service = build_service("allocate-fail-closed");
+    fn test_invalidate_classification() {
+        let service = build_service("invalidate-classify", chooser(vec![worker(1)]));
+        // Missing entry.
+        assert_eq!(
+            service.invalidate(7, 1, "/missing", 1, OBJ).unwrap(),
+            CacheOpStatus::Superseded {
+                expected: 2,
+                current: 0
+            }
+        );
 
-        // Live entry -> rejected before the barrier.
-        committed_entry(&service, "/k", OBJ, 64, 0);
-        let err = service.allocate(token(3, 1), 1, "/k", 64).unwrap_err();
-        assert!(format!("{}", err).contains("live entry"), "{}", err);
+        // Committed + removed: Tombstoned@2 is an AlreadyApplied fence
+        // for expected_generation 1, and volatile locations are dropped.
+        committed_entry(&service, token(2, 1), token(2, 2), "/k", OBJ, 64, 0);
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            store.cache.apply_remove(rocks, 1, "/k", 1, 2, OBJ).unwrap();
+        }
+        service
+            .install_locations(OBJ, full_locations(&layout(OBJ, 64)))
+            .unwrap();
+        assert_eq!(
+            service.invalidate(7, 1, "/k", 1, OBJ).unwrap(),
+            CacheOpStatus::AlreadyApplied
+        );
+        assert!(!service.locations.lock().unwrap().contains_key(&OBJ));
 
-        // Invalid block size -> rejected immediately.
-        assert!(service.allocate(token(3, 2), 1, "/new", 0).is_err());
+        // Expected generation beyond the row: divergence error.
+        assert!(service.invalidate(7, 1, "/k", 9, OBJ).is_err());
 
-        // Fresh key: the issuer needs a reserve first and the barrier
-        // fails closed without a raft cluster.
-        let err = service.allocate(token(3, 3), 1, "/new", 64).unwrap_err();
+        // Expected object mismatch: divergence error.
+        assert!(service.invalidate(7, 1, "/k", 2, OBJ + 7).is_err());
+
+        // A live Reserved row at the right fence reaches the barrier.
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let mgr = &store.cache;
+            let alloc = CacheEntry {
+                generation: 1,
+                state: CacheEntryState::Reserved,
+                object_id: OBJ + 3,
+                len: 0,
+                ufs_mtime: 0,
+                block_size: 64,
+                expire_at: 0,
+            };
+            mgr.apply_allocate(rocks, token(5, 1), 1, "/live", 128, &alloc)
+                .unwrap();
+        }
+        let err = service.invalidate(7, 1, "/live", 1, OBJ + 3).unwrap_err();
         assert!(
             format!("{}", err).contains("raft"),
-            "allocate must go through the fail-closed sync barrier: {}",
+            "live fence must reach the fail-closed barrier: {}",
             err
         );
     }

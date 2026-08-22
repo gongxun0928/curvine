@@ -1,10 +1,19 @@
 // Cache-mode metadata RPC surface (dual-mode metadata split, Phase 2).
 //
-// Wire contract highlights (task #4 milestone 4a):
+// Wire contract highlights (task #4 milestone 4a, rev after dual review):
 // - The client never supplies an object id; CacheAllocate hands out ids
-//   minted by the leader-only segment issuer.
-// - CacheCommit locations must cover the derived block layout exactly:
-//   one location entry per block, sequence-ordered, no gaps/duplicates.
+//   minted by the leader-only segment issuer, together with the master-
+//   planned block placement for the whole object.
+// - CacheCommit carries the allocate's load token (identity/plan binding,
+//   never re-used as an op token) plus an independent commit op token for
+//   durable idempotency, and the locations that actually succeeded; the
+//   master accepts only workers from the plan (deduplicated, per block,
+//   at least the configured replica count) and publishes them only after
+//   the raft barrier. Without the plan (master restart) the commit fails
+//   closed as a retryable miss — a retry may never silently swap
+//   placements.
+// - ttl_ms is reserved but MUST be 0 until mount-policy TTL lands (4b);
+//   a nonzero value is rejected fail-closed.
 // - CacheGet is whole-object: any missing block location is a miss and
 //   the caller falls back to the UFS.
 
@@ -25,12 +34,22 @@ message CacheOpTokenProto {
 message CacheBlockLocationProto {
     required int64 block_id = 1;
     required int64 block_len = 2;
-    repeated BlockLocationProto workers = 3;
+    repeated WorkerAddressProto workers = 3;
+}
+
+enum CacheOpStatusProto {
+    APPLIED = 1;
+    ALREADY_APPLIED = 2;
+    SUPERSEDED = 3;
 }
 
 message CacheGetRequest {
     required uint64 incarnation = 1;
     required string key = 2;
+    // When false the response carries metadata only (identity +
+    // generation + expiry) without the location set; a client that will
+    // not read the data does not need to drag the whole placement.
+    optional bool need_locations = 3 [default = true];
 }
 
 message CacheGetResponse {
@@ -39,6 +58,11 @@ message CacheGetResponse {
     optional int64 file_len = 3;
     optional int64 block_size = 4;
     repeated CacheBlockLocationProto blocks = 5;
+    // Entry metadata the caller needs for later Invalidate/Remove fences
+    // and expiry decisions (present only on hit).
+    optional uint64 generation = 6;
+    optional int64 ufs_mtime = 7;
+    optional int64 expire_at = 8;
 }
 
 message CacheAllocateRequest {
@@ -46,12 +70,21 @@ message CacheAllocateRequest {
     required uint64 incarnation = 2;
     required string key = 3;
     required int64 block_size = 4;
+    // Reserved for mount-policy TTL (4b); must be 0 in 4a.
     optional int64 ttl_ms = 5 [default = 0];
+    required int64 file_len = 6;
 }
 
 message CacheAllocateResponse {
     required int64 object_id = 1;
     required uint64 generation = 2;
+    // Master-planned placement: exactly one entry per derived block,
+    // sequence-ordered, bounded by the commit caps; empty only for a
+    // zero-length object. An allocate retry with the exact recorded
+    // parameters re-generates a fresh volatile plan for the SAME
+    // object id/generation when the old one was lost to a master
+    // restart — a second identity is never minted.
+    repeated CacheBlockLocationProto blocks = 3;
 }
 
 message CacheCommitRequest {
@@ -61,11 +94,25 @@ message CacheCommitRequest {
     required int64 object_id = 4;
     required int64 file_len = 5;
     required int64 ufs_mtime = 6;
+    // Reserved for mount-policy TTL (4b); must be 0 in 4a.
     optional int64 ttl_ms = 7 [default = 0];
+    // The locations that actually succeeded, validated against the
+    // allocate plan (load token, block_id): planned workers only.
     repeated CacheBlockLocationProto blocks = 8;
+    // Durable idempotency token of THIS commit operation (independent of
+    // the load token: one load may retry its commit with a fresh op
+    // token only before the first one is recorded).
+    required CacheOpTokenProto token = 9;
+    // The load identity token from CacheAllocate; binds this commit to
+    // its allocate outcome and volatile plan.
+    required CacheOpTokenProto load_token = 10;
 }
 
 message CacheCommitResponse {
+    optional CacheOpStatusProto status = 1 [default = APPLIED];
+    // Present when status = SUPERSEDED: the generation the committed row
+    // has advanced to (the caller's expected generation is what it sent).
+    optional uint64 current_generation = 2;
 }
 
 message CacheInvalidateRequest {
@@ -76,6 +123,9 @@ message CacheInvalidateRequest {
 }
 
 message CacheInvalidateResponse {
+    optional CacheOpStatusProto status = 1 [default = APPLIED];
+    // Present when status = SUPERSEDED: the committed row generation.
+    optional uint64 current_generation = 2;
 }
 
 message CacheRemoveRequest {
@@ -86,4 +136,7 @@ message CacheRemoveRequest {
 }
 
 message CacheRemoveResponse {
+    optional CacheOpStatusProto status = 1 [default = APPLIED];
+    // Present when status = SUPERSEDED: the committed row generation.
+    optional uint64 current_generation = 2;
 }

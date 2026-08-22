@@ -243,17 +243,32 @@ pub struct CacheAllocateEntry {
     pub(crate) token: OpToken,
     pub(crate) incarnation: u64,
     pub(crate) key: String,
+    /// Target object length as allocated (the Reserved row itself stays
+    /// len=0 until commit): bound into the persisted Allocated outcome so
+    /// an exact allocate retry (including a re-plan after master restart)
+    /// can verify the recorded parameters.
+    pub(crate) file_len: i64,
     pub(crate) entry: CacheEntry,
 }
 
 /// Conditional CAS: `Reserved@generation` -> `Valid` with the final
 /// `(len, ufs_mtime, expire_at)`. The committed apply rejects the commit
 /// when the recorded generation has advanced (Superseded is terminal: the
-/// old load is dead and its object reclaimable).
+/// old load is dead and its object reclaimable). The load token binds the
+/// commit to its allocate for durable idempotency: a retried commit with
+/// the same token resolves to its recorded outcome instead of re-judging
+/// the (already advanced) entry row.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct CacheCommitEntry {
     pub(crate) op_id: u64,
     pub(crate) rpc_id: i64,
+    /// Durable idempotency token of this commit operation (never the load
+    /// token: Allocate and Commit record different outcomes and must not
+    /// alias one token to both).
+    pub(crate) token: OpToken,
+    /// The load identity token from the allocate; binds the commit to its
+    /// recorded Allocated outcome and (volatile) placement plan.
+    pub(crate) load_token: OpToken,
     pub(crate) incarnation: u64,
     pub(crate) key: String,
     pub(crate) generation: u64,
@@ -863,6 +878,7 @@ mod tests {
                     token: token(),
                     incarnation: 1,
                     key: "/k".into(),
+                    file_len: 1,
                     entry: CacheEntry {
                         generation: 1,
                         state: crate::master::meta::cache::CacheEntryState::Reserved,
@@ -879,6 +895,8 @@ mod tests {
                 JournalEntry::CacheCommit(CacheCommitEntry {
                     op_id: 1,
                     rpc_id: 0,
+                    token: token(),
+                    load_token: token(),
                     incarnation: 1,
                     key: "/k".into(),
                     generation: 1,

@@ -38,6 +38,11 @@ pub const EMPTY_REQ_ID: i64 = -1;
 
 pub const MAX_DATE_SIZE: i32 = 16 * 1024 * 1024;
 
+/// Hard cap on the header section (the serialized protobuf
+/// request/response). Without this bound a client-controlled header_size
+/// would drive the frame reader's up-front buffer allocation.
+pub const MAX_HEADER_SIZE: i32 = 16 * 1024 * 1024;
+
 #[repr(i8)]
 #[derive(Debug, Copy, Clone, PartialEq, IntoPrimitive, FromPrimitive)]
 pub enum RequestStatus {
@@ -324,6 +329,34 @@ impl RpcMessage {
     pub fn decode_protocol(buf: &mut BytesMut) -> IOResult<(Protocol, i32, i32)> {
         let total_size = buf.get_i32();
         let header_size = buf.get_i32();
+        // Pre-decode validation of ALL client-controlled length fields.
+        // The header section carries the serialized protobuf request (the
+        // data section is the streaming payload), so an unbounded
+        // header_size would let a peer force the reader to reserve up to
+        // ~2 GiB before any handler-level cap can run. Both frame paths
+        // (rpc_frame / read_frame) parse their head through this method,
+        // so the bounds hold for every connection.
+        if total_size < HEAD_SIZE {
+            return err_box!(
+                "total length {} is smaller than the protocol head",
+                total_size
+            );
+        } else if total_size > MAX_HEADER_SIZE + MAX_DATE_SIZE + HEAD_SIZE {
+            return err_box!(
+                "total length {} exceeds maximum size {}",
+                total_size,
+                MAX_HEADER_SIZE + MAX_DATE_SIZE + HEAD_SIZE
+            );
+        }
+        if header_size < 0 {
+            return err_box!("header length is negative: {}", header_size);
+        } else if header_size > MAX_HEADER_SIZE {
+            return err_box!(
+                "header length {} exceeds maximum size {}",
+                header_size,
+                MAX_HEADER_SIZE
+            );
+        }
         let data_size = total_size - header_size - HEAD_SIZE;
         if data_size < 0 {
             return err_box!("data length is negative");
@@ -391,5 +424,73 @@ impl RefMessage for RpcMessage {
 
     fn into_box(self) -> BoxMessage {
         BoxMessage::Msg(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::Message;
+    use bytes::{BufMut, BytesMut};
+
+    /// Build a 22-byte protocol head with the given length fields followed
+    /// by whatever fixed head bytes `decode_protocol` still consumes.
+    fn head_buf(total_size: i32, header_size: i32) -> BytesMut {
+        let mut buf = BytesMut::with_capacity(PROTOCOL_SIZE as usize);
+        buf.put_i32(total_size);
+        buf.put_i32(header_size);
+        // code + status + req_id + seq_id (the remaining fixed head).
+        buf.put_i8(0);
+        buf.put_i8(0);
+        buf.put_i64(0);
+        buf.put_i32(0);
+        buf
+    }
+
+    #[test]
+    fn decode_rejects_negative_header_size() {
+        let mut buf = head_buf(100, -1);
+        assert!(Message::decode_protocol(&mut buf).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_oversize_header() {
+        let oversize = MAX_HEADER_SIZE + 1;
+        let mut buf = head_buf(oversize + HEAD_SIZE, oversize);
+        assert!(Message::decode_protocol(&mut buf).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_oversize_total() {
+        let oversize = MAX_HEADER_SIZE + MAX_DATE_SIZE + HEAD_SIZE + 1;
+        let mut buf = head_buf(oversize, 0);
+        assert!(Message::decode_protocol(&mut buf).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_total_below_head() {
+        let mut buf = head_buf(HEAD_SIZE - 1, 0);
+        assert!(Message::decode_protocol(&mut buf).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_inconsistent_lengths() {
+        // header_size larger than the total frame can hold.
+        let mut buf = head_buf(HEAD_SIZE + 10, 100);
+        assert!(Message::decode_protocol(&mut buf).is_err());
+    }
+
+    #[test]
+    fn decode_accepts_bounded_lengths() {
+        // Consistent, in-cap lengths must still parse.
+        let header = 128;
+        let data = 256;
+        let total = header + data + HEAD_SIZE;
+        let mut buf = head_buf(total, header);
+        let res = Message::decode_protocol(&mut buf);
+        assert!(res.is_ok(), "bounded head must decode: {:?}", res.err());
+        let (_, out_header, out_data) = res.unwrap();
+        assert_eq!(out_header, header);
+        assert_eq!(out_data, data);
     }
 }

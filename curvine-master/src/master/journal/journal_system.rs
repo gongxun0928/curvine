@@ -123,7 +123,7 @@ impl JournalSystem {
             fs_dir.clone(),
             worker_manager.clone(),
             master_monitor.clone(),
-        );
+        )?;
         let mount_manager = Arc::new(MountManager::new(fs.clone()));
         let quota_manager = QuotaManager::new(
             eviction_conf,
@@ -270,7 +270,11 @@ impl JournalSystem {
         }
 
         let role_monitor = RoleMonitor::new();
-        let master_monitor = MasterMonitor::new(role_monitor.read_ctl(), StateCtl::new(0));
+        let master_monitor = MasterMonitor::with_epoch(
+            role_monitor.read_ctl(),
+            StateCtl::new(0),
+            role_monitor.epoch_ctl(),
+        );
         let parts = Self::build_fs_parts(conf, rt.clone(), master_monitor.clone())?;
 
         let raft_journal = MetaRaftJournal::new(
