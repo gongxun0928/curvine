@@ -44,8 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let conf = ClusterConf::from(conf_path.as_str()).map_err(|e| e.to_string())?;
     let rpc_rt = std::sync::Arc::new(conf.client_rpc_conf().create_runtime());
-    let fs = CurvineFileSystem::with_rt(conf, rpc_rt.clone())
-        .map_err(|e| e.to_string())?;
+    let fs = CurvineFileSystem::with_rt(conf, rpc_rt.clone()).map_err(|e| e.to_string())?;
 
     // Drive the async workload on a local tokio runtime, then drop the fs and
     // the RPC runtime in sync context (they must not be dropped inside async).
@@ -109,7 +108,7 @@ async fn run(
             // A unit index is drawn, then scaled: identical op sequence across
             // sides for the same seed, and no reads straddle 4KiB boundaries.
             "uniform" => {
-                let units = ((len - BS) / BS) as u64;
+                let units = ((len - BS) / BS + 1) as u64;
                 (next() % units) as i64 * BS
             }
             // Unaligned variant (byte-granularity offset) kept as a separate
@@ -124,8 +123,7 @@ async fn run(
                 ops_in_chunk -= 1;
                 // In-chunk offset also 4KiB-aligned (32 possible unit offsets
                 // within a 128KiB chunk).
-                cur_chunk * CHUNK
-                    + (next() % (((CHUNK - BS) / BS + 1) as u64)) as i64 * BS
+                cur_chunk * CHUNK + (next() % (((CHUNK - BS) / BS + 1) as u64)) as i64 * BS
             }
             // Sequential 4KiB reads within one chunk: the regime where the
             // 128KiB frame should clearly win (1 fetch + local hits vs 1
