@@ -49,6 +49,8 @@ use std::ffi::OsStr;
 use std::sync::Arc;
 
 const FUSE_TIME_GRANULARITY_NS: u32 = 1_000_000;
+/// Fragment size used by FUSE statfs block counters.
+const STATFS_FRAGMENT_SIZE: u32 = 4 * ByteUnit::KB as u32;
 
 pub struct CurvineFileSystem {
     fs: UnifiedFileSystem,
@@ -91,6 +93,15 @@ impl CurvineFileSystem {
     fn is_ofd_lock_pid(pid: u32) -> bool {
         // FUSE kernels have used both 0 and -1 for the pid of an OFD lock.
         pid == 0 || pid == u32::MAX
+    }
+
+    fn statfs_block_counts(capacity: i64, available: i64) -> (u64, u64) {
+        let capacity = u64::try_from(capacity).unwrap_or(0);
+        let available = u64::try_from(available).unwrap_or(0).min(capacity);
+        let fragment_size = u64::from(STATFS_FRAGMENT_SIZE);
+
+        // Report only complete fragments, preserving the existing rounding behavior.
+        (capacity / fragment_size, available / fragment_size)
     }
 
     pub fn new(conf: ClusterConf, rt: Arc<Runtime>) -> FuseResult<Self> {
@@ -1395,7 +1406,7 @@ impl fs::FileSystem for CurvineFileSystem {
         self.check_traverse_permissions(op.header.nodeid, op.header)
             .await?;
 
-        let status = self.state.fs_stat(op.header.nodeid, None).await?;
+        let status = self.state.fs_stat_guarded(op.header.nodeid).await?;
 
         let mut fuse_attr = FuseUtils::status_to_attr(&self.conf, &status)?;
         fuse_attr.ino = op.header.nodeid;
@@ -1573,9 +1584,21 @@ impl fs::FileSystem for CurvineFileSystem {
     async fn stat_fs(&self, _: StatFs<'_>) -> FuseResult<fuse_kstatfs> {
         let info = self.fs.get_filesystem_info().await?;
 
-        let block_size = 4 * ByteUnit::KB as u32;
-        let total_blocks = (info.capacity / block_size as i64) as u64;
-        let free_blocks = (info.available / block_size as i64) as u64;
+        // Use the allocatable view (Live workers only) so df matches what new
+        // writes can actually use; capacity/available would also count
+        // Blacklist/Decommission workers and over-report free space.
+        if info.allocatable_capacity < 0
+            || info.allocatable_available < 0
+            || info.allocatable_available > info.allocatable_capacity
+        {
+            debug!(
+                "Normalizing invalid filesystem info for statfs: allocatable_capacity={}, allocatable_available={}",
+                info.allocatable_capacity, info.allocatable_available
+            );
+        }
+
+        let (total_blocks, free_blocks) =
+            Self::statfs_block_counts(info.allocatable_capacity, info.allocatable_available);
 
         let res = fuse_kstatfs {
             blocks: total_blocks,
@@ -1583,9 +1606,9 @@ impl fs::FileSystem for CurvineFileSystem {
             bavail: free_blocks,
             files: FUSE_UNKNOWN_INODES,
             ffree: FUSE_UNKNOWN_INODES,
-            bsize: block_size,
+            bsize: STATFS_FRAGMENT_SIZE,
             namelen: FUSE_MAX_NAME_LENGTH as u32,
-            frsize: block_size,
+            frsize: STATFS_FRAGMENT_SIZE,
             padding: 0,
             spare: [0; 6],
         };
@@ -1975,6 +1998,7 @@ impl fs::FileSystem for CurvineFileSystem {
         let path = self.state.get_path_common(op.header.nodeid, Some(name))?;
         self.ensure_writable_path(&path, RpcCode::Delete).await?;
 
+        let _guard = self.state.lock_path(&path).await;
         self.fs.delete(&path, false).await?;
         self.state.unlink(op.header.nodeid, name, false)?;
         self.state
@@ -2424,6 +2448,60 @@ mod tests {
             pid,
             padding: 0,
         }
+    }
+
+    #[test]
+    fn statfs_block_counts_normalize_invalid_values() {
+        use super::CurvineFileSystem;
+
+        let cases = [
+            (-4096, 0, (0, 0)),
+            (8192, -4096, (2, 0)),
+            (-4096, 8192, (0, 0)),
+            (4096, 8192, (1, 1)),
+        ];
+
+        for (capacity, available, expected) in cases {
+            let actual = CurvineFileSystem::statfs_block_counts(capacity, available);
+            assert_eq!(
+                actual, expected,
+                "capacity={capacity}, available={available}"
+            );
+            assert!(actual.1 <= actual.0);
+        }
+    }
+
+    #[test]
+    fn statfs_block_counts_round_down_to_complete_fragments() {
+        use super::CurvineFileSystem;
+
+        let cases = [
+            (0, 0, (0, 0)),
+            (1, 1, (0, 0)),
+            (4095, 4095, (0, 0)),
+            (4096, 4096, (1, 1)),
+            (4097, 4097, (1, 1)),
+            (16384, 8192, (4, 2)),
+        ];
+
+        for (capacity, available, expected) in cases {
+            assert_eq!(
+                CurvineFileSystem::statfs_block_counts(capacity, available),
+                expected,
+                "capacity={capacity}, available={available}"
+            );
+        }
+    }
+
+    #[test]
+    fn statfs_block_counts_handle_i64_max_without_overflow() {
+        use super::{CurvineFileSystem, STATFS_FRAGMENT_SIZE};
+
+        let expected = u64::try_from(i64::MAX).unwrap() / u64::from(STATFS_FRAGMENT_SIZE);
+        let actual = CurvineFileSystem::statfs_block_counts(i64::MAX, i64::MAX);
+
+        assert_eq!(actual, (expected, expected));
+        assert!(actual.1 <= actual.0);
     }
 
     #[test]
@@ -3092,10 +3170,10 @@ mod tests {
     use super::CurvineFileSystem;
     use crate::{
         fuse_init_flag_names, FUSE_ATOMIC_O_TRUNC, FUSE_BIG_WRITES, FUSE_DO_READDIRPLUS,
-        FUSE_EXPORT_SUPPORT, FUSE_FLOCK_LOCKS, FUSE_HAS_IOCTL_DIR, FUSE_KERNEL_MINOR_VERSION,
-        FUSE_KERNEL_VERSION, FUSE_MAX_PAGES, FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_SETXATTR_EXT,
-        FUSE_SPLICE_MOVE, FUSE_SPLICE_READ, FUSE_SPLICE_WRITE, FUSE_WRITEBACK_CACHE,
-        SUPPORTED_INIT_FLAGS,
+        FUSE_EXPLICIT_INVAL_DATA, FUSE_EXPORT_SUPPORT, FUSE_FLOCK_LOCKS, FUSE_HAS_IOCTL_DIR,
+        FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION, FUSE_MAX_PAGES, FUSE_POSIX_ACL,
+        FUSE_POSIX_LOCKS, FUSE_SETXATTR_EXT, FUSE_SPLICE_MOVE, FUSE_SPLICE_READ, FUSE_SPLICE_WRITE,
+        FUSE_WRITEBACK_CACHE, SUPPORTED_INIT_FLAGS,
     };
 
     #[test]
@@ -3174,6 +3252,18 @@ mod tests {
             out & FUSE_SETXATTR_EXT,
             0,
             "the decoder only supports the 8-byte SETXATTR compatibility layout"
+        );
+    }
+
+    #[test]
+    fn explicit_data_invalidation_is_not_advertised() {
+        let conf = init_conf(false, false);
+        let out = CurvineFileSystem::negotiate_out_flags(FUSE_EXPLICIT_INVAL_DATA, &conf);
+
+        assert_eq!(
+            out & FUSE_EXPLICIT_INVAL_DATA,
+            0,
+            "page-cache invalidation is currently delegated to the kernel"
         );
     }
 

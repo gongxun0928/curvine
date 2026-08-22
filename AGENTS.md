@@ -56,7 +56,7 @@ Usage notes:
 
 <skill>
 <name>cv-submit-pr-review</name>
-<description>Perform a direct code review of a Curvine PR by reading the diff and changed files, analyzing correctness, safety, design, and performance impact on critical paths (data read/write, RPC message communication, metadata operations), and producing structured findings. Use when user asks to review a PR's code, do a code review, or check a PR before merge.</description>
+<description>Perform a direct code review of a Curvine PR against live base/head by mapping dirty crates, reading surrounding code, and checking correctness, safety, lifecycle, interface contracts, test strength, and performance on data I/O, RPC, and metadata paths. Use when user asks to review a PR's code, do a code review, or check a PR before merge.</description>
 <location>project</location>
 </skill>
 
@@ -75,6 +75,12 @@ Usage notes:
 <skill>
 <name>cv-tasks-breakdown</name>
 <description>Break a design or implementation plan into small, dependency-ordered tasks with test coverage per task, commit-sized deliverables, and sub-issue tracking. Use when user asks to decompose a plan, split a large feature, create a task breakdown, or prepare incremental commits for a complex change.</description>
+<location>project</location>
+</skill>
+
+<skill>
+<name>cv-test-report</name>
+<description>Publish Curvine full-chain daily test reports to the Hextra Hugo site at CurvineIO/test-reports, using a standard Markdown template with no environment or secret leakage. Use when the user asks to publish a test report, convert harness output to Markdown, or update CurvineIO/test-reports.</description>
 <location>project</location>
 </skill>
 

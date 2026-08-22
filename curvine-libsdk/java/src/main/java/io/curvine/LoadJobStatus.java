@@ -24,6 +24,7 @@ import io.curvine.proto.JobTaskStateProto;
 public final class LoadJobStatus {
     private final String jobId;
     private final JobTaskStateProto state;
+    private final int stateValue;
     private final String sourcePath;
     private final String targetPath;
     private final JobTaskProgressProto progress;
@@ -34,17 +35,36 @@ public final class LoadJobStatus {
             String sourcePath,
             String targetPath,
             JobTaskProgressProto progress) {
+        this(
+                jobId,
+                state,
+                state == null ? 0 : state.getNumber(),
+                sourcePath,
+                targetPath,
+                progress);
+    }
+
+    private LoadJobStatus(
+            String jobId,
+            JobTaskStateProto state,
+            int stateValue,
+            String sourcePath,
+            String targetPath,
+            JobTaskProgressProto progress) {
         this.jobId = jobId;
         this.state = state;
+        this.stateValue = stateValue;
         this.sourcePath = sourcePath;
         this.targetPath = targetPath;
         this.progress = progress;
     }
 
     public static LoadJobStatus fromProto(GetJobStatusResponse response) {
+        JobTaskStateProto state = response.getState();
         return new LoadJobStatus(
                 response.getJobId(),
-                response.getState(),
+                state,
+                state.getNumber(),
                 response.getSourcePath(),
                 response.getTargetPath(),
                 response.getProgress());
@@ -70,14 +90,34 @@ public final class LoadJobStatus {
         return progress;
     }
 
+    /**
+     * True when the job is no longer running (completed, failed, canceled, or partial success).
+     * Under proto2, unknown wire enum values decode to {@code UNKNOWN} and are treated as
+     * non-terminal; full forward-compat for future terminal states requires a preserved raw
+     * state field on the wire (for example {@code state_value} in {@code job.proto}).
+     */
     public boolean isFinished() {
-        return state == JobTaskStateProto.COMPLETED
-                || state == JobTaskStateProto.FAILED
-                || state == JobTaskStateProto.CANCELED;
+        switch (state) {
+            case PENDING:
+            case LOADING:
+            case UNKNOWN:
+                return false;
+            default:
+                return true;
+        }
     }
 
     public boolean isSuccessful() {
         return state == JobTaskStateProto.COMPLETED;
+    }
+
+    /**
+     * True when some files/tasks succeeded and others failed.
+     * Callers should inspect progress message / retry failed items as needed.
+     */
+    public boolean isPartialSuccess() {
+        return state == JobTaskStateProto.PARTIAL_SUCCESS
+                || stateValue == JobTaskStateProto.PARTIAL_SUCCESS.getNumber();
     }
 
     @Override
