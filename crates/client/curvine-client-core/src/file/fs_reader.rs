@@ -28,6 +28,9 @@ pub struct FsReader {
     inner: Inner,
     chunk: DataSlice,
     chunk_size: usize,
+    /// Random exact-demand policy: when the read pattern is judged Random,
+    /// forward small caller demands as-is instead of the chunk_size frame.
+    random_exact_demand: bool,
     pos: i64,
     len: i64,
     file_blocks: FileBlocks,
@@ -41,6 +44,7 @@ impl FsReader {
         let conf = &fs_context.conf.client;
 
         let read_detector = ReadDetector::with_conf(conf, len);
+        let random_exact_demand = conf.read_random_exact_demand;
 
         debug!(
             "Create reader, path={}, len={}, blocks={}, chunk_size={}, chunk_number={}, read_parallel={}, slice_size={}, read_ahead={}-{}",
@@ -61,6 +65,7 @@ impl FsReader {
             inner,
             chunk: DataSlice::Empty,
             chunk_size,
+            random_exact_demand,
             pos: 0,
             len,
             file_blocks,
@@ -109,9 +114,14 @@ impl Reader for FsReader {
 
     async fn read_chunk0_demand(&mut self, demand: Option<usize>) -> FsResult<DataSlice> {
         // Only lift the frame size for demands larger than the default chunk;
-        // at or below it, small-IO behavior must stay exactly as before.
+        // at or below it, small-IO behavior must stay exactly as before —
+        // except under the opt-in random exact-demand policy: on streams the
+        // detector already judges Random, a small demand is forwarded as-is
+        // so the worker returns exactly what the caller asked for.
+        let exact_random = self.random_exact_demand && self.inner.is_random();
         let demand = match demand {
             Some(v) if v > self.chunk_size => v as i64,
+            Some(v) if exact_random && v > 0 => v as i64,
             _ => 0,
         };
         self.metrics

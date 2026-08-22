@@ -261,6 +261,13 @@ pub struct ClientConf {
     // Sequential read check threshold
     #[client_cli]
     pub sequential_read_threshold: u64,
+
+    // Random exact-demand reads: when enabled and the read pattern is judged
+    // Random, a small caller demand (e.g. 4KiB) is sent as-is via read_len
+    // instead of the default chunk_size frame. Default false keeps the
+    // historical chunk-granularity fetch behavior.
+    #[client_cli]
+    pub read_random_exact_demand: bool,
 }
 
 impl ClientConf {
@@ -455,6 +462,7 @@ impl Default for ClientConf {
             large_file_size_str: "10GB".to_string(),
             max_read_parallel: Self::DEFAULT_MAX_READ_PARALLEL,
             sequential_read_threshold: 7,
+            read_random_exact_demand: false,
         };
 
         conf.init().unwrap();

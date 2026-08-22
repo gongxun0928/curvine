@@ -470,6 +470,13 @@ impl FsReaderBuffer {
         &self.path
     }
 
+    /// Current read-pattern judgment (see `ReadDetector`). Used by the
+    /// random exact-demand policy to scope smaller-than-chunk frames to
+    /// Random streams only.
+    pub fn is_random(&self) -> bool {
+        self.read_detector.is_random()
+    }
+
     fn select_reader_index(
         is_random: bool,
         pos: i64,
