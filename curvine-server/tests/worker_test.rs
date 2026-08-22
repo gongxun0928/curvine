@@ -117,6 +117,101 @@ fn test_worker_block_write_and_read_with_checksum_validation() -> CommonResult<(
 }
 
 #[test]
+// New-client wire shape: every Running read carries an explicit
+// DataHeaderProto (offset + read_len). Covers sequential small frames
+// (offset advances by the previous frame's returned length) and a seek
+// followed by random small frames; the worker must serve each frame from
+// the requested offset, bounded by read_len, byte-identical to the legacy
+// headerless transfer.
+fn test_worker_read_running_header_every_frame() -> CommonResult<()> {
+    let conf = start_worker();
+
+    let block_id = Utils::req_id().abs();
+    block_write(block_id, &conf)?;
+
+    let len = (CHUNK_SIZE * LOOP_NUM) as i64;
+    let chunk = CHUNK_SIZE as i64;
+    let truth = block_read_all_bytes(block_id, len, &conf)?;
+
+    let client = conf.worker_sync_client()?;
+    let req_id = Utils::req_id();
+    let open = Builder::new()
+        .code(RpcCode::ReadBlock)
+        .req_id(req_id)
+        .seq_id(0)
+        .request(RequestStatus::Open)
+        .proto_header(BlockReadRequest {
+            id: block_id,
+            off: 0,
+            len,
+            chunk_size: CHUNK_SIZE,
+            short_circuit: false,
+            ..Default::default()
+        })
+        .build();
+    let _: BlockReadResponse = client.rpc_check(open)?.parse_header()?;
+
+    let running = |seq_id: i32, offset: i64, read_len: i64| {
+        Builder::new()
+            .code(RpcCode::ReadBlock)
+            .req_id(req_id)
+            .seq_id(seq_id)
+            .request(RequestStatus::Running)
+            .proto_header(DataHeaderProto {
+                offset,
+                flush: false,
+                is_last: false,
+                read_len: Some(read_len),
+            })
+            .build()
+    };
+
+    // Sequential small frames: every Running carries offset + read_len.
+    let mut seq_id = 1;
+    let mut pos = 0i64;
+    let mut served = Vec::new();
+    while pos < len {
+        let rep = client.rpc_check(running(seq_id, pos, chunk))?;
+        seq_id += 1;
+        let data = rep.data.as_slice().to_vec();
+        assert!(data.len() as i64 <= chunk, "frame exceeded read_len");
+        assert_eq!(
+            &data[..],
+            &truth[pos as usize..(pos + data.len() as i64) as usize],
+            "sequential frame content mismatch at {}",
+            pos
+        );
+        pos += data.len() as i64;
+        served.extend_from_slice(&data);
+    }
+    assert_eq!(served, truth, "sequential transfer must be byte-identical");
+
+    // Random small frames after seeks: offsets jump, including backward.
+    for &off in &[0, len - 3 * chunk, 17 * chunk, len - chunk] {
+        let rep = client.rpc_check(running(seq_id, off, chunk))?;
+        seq_id += 1;
+        let data = rep.data.as_slice().to_vec();
+        assert_eq!(data.len() as i64, chunk, "interior offset fully served");
+        assert_eq!(
+            &data[..],
+            &truth[off as usize..(off + chunk) as usize],
+            "random frame content mismatch at {}",
+            off
+        );
+    }
+
+    let complete = Builder::new()
+        .code(RpcCode::ReadBlock)
+        .request(RequestStatus::Complete)
+        .req_id(req_id)
+        .seq_id(seq_id)
+        .build();
+    let _: Message = client.rpc(complete)?;
+
+    Ok(())
+}
+
+#[test]
 fn test_worker_complete_oversized_block_aborts_pending_block() -> CommonResult<()> {
     let conf = start_worker();
     let client = conf.worker_sync_client()?;
@@ -845,6 +940,57 @@ fn block_read(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
     let _: Message = client.rpc(msg)?;
 
     Ok(check_sum)
+}
+
+// Legacy headerless transfer: fetch the whole block with Running frames that
+// carry no DataHeaderProto, returning the raw bytes as ground truth.
+fn block_read_all_bytes(id: i64, len: i64, conf: &ClusterConf) -> CommonResult<Vec<u8>> {
+    let request = BlockReadRequest {
+        id,
+        off: 0,
+        len,
+        chunk_size: CHUNK_SIZE,
+        short_circuit: false,
+        ..Default::default()
+    };
+
+    let req_id = Utils::req_id();
+    let client = conf.worker_sync_client()?;
+    let open = Builder::new()
+        .code(RpcCode::ReadBlock)
+        .req_id(req_id)
+        .seq_id(0)
+        .request(RequestStatus::Open)
+        .proto_header(request)
+        .build();
+    let _: BlockReadResponse = client.rpc_check(open)?.parse_header()?;
+
+    let mut seq_id = 1;
+    let mut served = Vec::new();
+    while (served.len() as i64) < len {
+        let read = Builder::new()
+            .code(RpcCode::ReadBlock)
+            .req_id(req_id)
+            .seq_id(seq_id)
+            .request(RequestStatus::Running)
+            .build();
+        seq_id += 1;
+        let rep = client.rpc_check(read)?;
+        if rep.data.is_empty() {
+            break;
+        }
+        served.extend_from_slice(rep.data.as_slice());
+    }
+
+    let complete = Builder::new()
+        .code(RpcCode::ReadBlock)
+        .request(RequestStatus::Complete)
+        .req_id(req_id)
+        .seq_id(seq_id)
+        .build();
+    let _: Message = client.rpc(complete)?;
+
+    Ok(served)
 }
 
 fn block_read_bytes(id: i64, len: i64, conf: &ClusterConf) -> CommonResult<Vec<u8>> {

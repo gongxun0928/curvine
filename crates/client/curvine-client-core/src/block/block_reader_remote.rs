@@ -29,7 +29,9 @@ pub struct BlockReaderRemote {
     len: i64,
     req_id: i64,
     seq_id: i32,
-    header: Option<DataHeaderProto>,
+    /// Default (Open-time) frame length, used by `read()` so every Running
+    /// frame from a new client carries an explicit offset + read_len.
+    chunk_size: i64,
 }
 
 impl BlockReaderRemote {
@@ -68,9 +70,11 @@ impl BlockReaderRemote {
             len,
             req_id,
             seq_id,
+            fs_context.read_chunk_size() as i64,
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_opened(
         client: BlockClient,
         block: ExtendedBlock,
@@ -79,6 +83,7 @@ impl BlockReaderRemote {
         len: i64,
         req_id: i64,
         seq_id: i32,
+        chunk_size: i64,
     ) -> Self {
         Self {
             client,
@@ -88,7 +93,7 @@ impl BlockReaderRemote {
             len,
             req_id,
             seq_id,
-            header: None,
+            chunk_size,
         }
     }
 
@@ -115,34 +120,25 @@ impl BlockReaderRemote {
 
     pub fn seek(&mut self, pos: i64) -> FsResult<i64> {
         self.pos = pos;
-        self.header = Some(DataHeaderProto {
-            offset: pos,
-            flush: false,
-            is_last: false,
-            read_len: None,
-        });
         Ok(self.pos)
     }
 
+    /// Default-frame read. Every Running frame from a new client carries an
+    /// explicit offset + read_len (frozen protocol): route through
+    /// `read_with_len` with the Open-time chunk size so the frame size and
+    /// worker behavior are unchanged, only the header is now always present.
+    /// Legacy workers ignore `read_len` and answer with their fixed frame.
     pub async fn read(&mut self) -> FsResult<DataSlice> {
-        if self.remaining() <= 0 {
-            return err_box!("No readable data");
-        }
-
-        let seq_id = self.next_seq_id();
-        let header = self.header.take();
-        let chunk = self.client.read_data(self.req_id, seq_id, header).await?;
-
-        self.pos += chunk.len() as i64;
-        Ok(chunk)
+        let fetch_len = self.chunk_size.min(self.remaining()).max(1);
+        self.read_with_len(fetch_len).await
     }
 
     /// Demand-aware read: ask the worker to return up to `fetch_len` bytes in
     /// this single Running response, starting at the current position. The
-    /// header carries an explicit offset, which also supersedes any pending
-    /// seek header. A legacy worker ignores `read_len` and returns its fixed
-    /// Open-time frame; the position then advances by the actually received
-    /// bytes and the caller loops, so mixed versions stay byte-correct.
+    /// header carries an explicit offset. A legacy worker ignores `read_len`
+    /// and returns its fixed Open-time frame; the position then advances by
+    /// the actually received bytes and the caller loops, so mixed versions
+    /// stay byte-correct.
     pub async fn read_with_len(&mut self, fetch_len: i64) -> FsResult<DataSlice> {
         if self.remaining() <= 0 {
             return err_box!("No readable data");
@@ -157,7 +153,6 @@ impl BlockReaderRemote {
             is_last: false,
             read_len: Some(fetch_len),
         };
-        self.header = None;
 
         let seq_id = self.next_seq_id();
         let chunk = self

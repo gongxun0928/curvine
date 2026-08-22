@@ -238,6 +238,21 @@ macro_rules! impl_reader_for_enum {
                 }
             }
 
+            // Forward the demand-aware fetch explicitly: the trait's default
+            // implementation would drop the hint and fall back to the plain
+            // read_chunk0, losing read_len propagation on the unified path.
+            async fn read_chunk0_demand(
+                &mut self,
+                demand: ::std::option::Option<usize>,
+            ) -> ::curvine_error::FsResult<::curvine_io::DataSlice> {
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(v) => v.read_chunk0_demand(demand).await,
+                    )+
+                }
+            }
+
             async fn seek(&mut self, pos: i64) -> ::curvine_error::FsResult<()> {
                 match self {
                     $(
@@ -522,4 +537,134 @@ macro_rules! impl_filesystem_for_enum {
             }
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use curvine_fs_api::{Path, Reader};
+    use curvine_io::DataSlice;
+    use curvine_model::FileStatus;
+
+    // Inner reader that records the last demand seen by read_chunk0_demand.
+    struct DemandProbe {
+        status: FileStatus,
+        path: Path,
+        chunk: DataSlice,
+        pos: i64,
+        last_demand: Option<usize>,
+        saw_demand_call: bool,
+    }
+
+    impl DemandProbe {
+        fn new() -> Self {
+            Self {
+                status: FileStatus::default(),
+                path: Path::from("/probe"),
+                chunk: DataSlice::Empty,
+                pos: 0,
+                last_demand: None,
+                saw_demand_call: false,
+            }
+        }
+    }
+
+    impl Reader for DemandProbe {
+        fn status(&self) -> &FileStatus {
+            &self.status
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn len(&self) -> i64 {
+            0
+        }
+
+        fn chunk_mut(&mut self) -> &mut DataSlice {
+            &mut self.chunk
+        }
+
+        fn chunk_size(&self) -> usize {
+            128 * 1024
+        }
+
+        fn pos(&self) -> i64 {
+            self.pos
+        }
+
+        fn pos_mut(&mut self) -> &mut i64 {
+            &mut self.pos
+        }
+
+        async fn read_chunk0(&mut self) -> curvine_error::FsResult<DataSlice> {
+            self.saw_demand_call = false;
+            Ok(DataSlice::Empty)
+        }
+
+        async fn read_chunk0_demand(
+            &mut self,
+            demand: Option<usize>,
+        ) -> curvine_error::FsResult<DataSlice> {
+            self.saw_demand_call = true;
+            self.last_demand = demand;
+            Ok(DataSlice::Empty)
+        }
+
+        async fn seek(&mut self, _pos: i64) -> curvine_error::FsResult<()> {
+            Ok(())
+        }
+
+        async fn complete(&mut self) -> curvine_error::FsResult<()> {
+            Ok(())
+        }
+    }
+
+    enum ProbeReader {
+        Probe(DemandProbe),
+    }
+
+    impl_reader_for_enum! {
+        enum ProbeReader {
+            Probe(DemandProbe),
+        }
+    }
+
+    // Regression: the macro-generated impl must forward read_chunk0_demand
+    // to the inner reader instead of letting the trait default drop the
+    // hint and call read_chunk0.
+    #[tokio::test]
+    async fn macro_forwards_read_chunk0_demand() {
+        let mut reader = ProbeReader::Probe(DemandProbe::new());
+
+        let demand = 256 * 1024;
+        let _ = reader.read_chunk0_demand(Some(demand)).await.unwrap();
+        match &reader {
+            ProbeReader::Probe(p) => {
+                assert!(p.saw_demand_call, "demand variant not forwarded");
+                assert_eq!(p.last_demand, Some(demand));
+            }
+        }
+
+        let _ = reader.read_chunk0_demand(None).await.unwrap();
+        match &reader {
+            ProbeReader::Probe(p) => assert_eq!(p.last_demand, None),
+        }
+    }
+
+    // read_chunk (the shape FUSE's fuse_read and callers use) must also
+    // reach the inner demand-aware fetch.
+    #[tokio::test]
+    async fn macro_read_chunk_reaches_demand_path() {
+        let mut reader = ProbeReader::Probe(DemandProbe::new());
+
+        let demand = 512 * 1024;
+        let _ = reader.read_chunk(Some(demand)).await.unwrap();
+        match &reader {
+            ProbeReader::Probe(p) => {
+                assert!(p.saw_demand_call);
+                assert_eq!(p.last_demand, Some(demand));
+            }
+        }
+    }
 }

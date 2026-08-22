@@ -217,6 +217,45 @@ impl ReadDetector {
         }
     }
 
+    /// Record a served read span `[start_pos, end_pos)` as if it had been
+    /// transferred in `unit`-sized frames, feeding the detector once per
+    /// virtual unit. With dynamic (demand-aware) transfer frames a single
+    /// 1 MiB frame must advance the sequential count exactly like the
+    /// historical 8 x 128 KiB frames did, otherwise the read-pattern
+    /// semantics would depend on the frame size (a seek -> Random -> 1 MiB
+    /// sequential stream would need 7 caller reads to recover Sequential
+    /// instead of recovering within the first read). An empty span is
+    /// recorded as a single event, matching `record_read`.
+    ///
+    /// Returns true when the pattern changed to Sequential at any point
+    /// during the span.
+    pub fn record_read_span(
+        &mut self,
+        start_pos: i64,
+        end_pos: i64,
+        unit: i64,
+        path: &Path,
+    ) -> bool {
+        if !self.enabled {
+            return false;
+        }
+
+        if unit <= 0 || end_pos <= start_pos {
+            return self.record_read(start_pos, end_pos, path);
+        }
+
+        let mut changed = false;
+        let mut off = start_pos;
+        while off < end_pos {
+            let next = (off + unit).min(end_pos);
+            if self.record_read(off, next, path) {
+                changed = true;
+            }
+            off = next;
+        }
+        changed
+    }
+
     pub fn set_last_read_pos(&mut self, pos: i64) {
         self.last_read_pos = pos;
     }
@@ -237,6 +276,68 @@ mod tests {
 
     fn create_test_path() -> Path {
         Path::from_str("/test/file.txt").unwrap()
+    }
+
+    // Frame-size independence (P0 regression): after a seek -> Random, one
+    // dynamic 1 MiB frame recorded via record_read_span must leave the
+    // detector in exactly the same state as the historical eight 128 KiB
+    // frames recorded via record_read — same pattern, same seq_count, same
+    // transition signal. Before the span API the 1 MiB frame counted as a
+    // single read (seq_count=1), staying Random for 7 more caller reads.
+    #[test]
+    fn test_record_read_span_dynamic_frame_parity() {
+        let conf = create_test_conf(true, 7);
+        let path = create_test_path();
+        let unit = 128 * 1024;
+        let frame = 1024 * 1024;
+
+        let mut dynamic = ReadDetector::with_conf(&conf, 64 << 20);
+        let mut legacy = ReadDetector::with_conf(&conf, 64 << 20);
+
+        // Seek makes both Random.
+        dynamic.record_seek(&path);
+        legacy.record_seek(&path);
+        assert!(dynamic.is_random() && legacy.is_random());
+
+        // Dynamic path: one 1 MiB frame recorded in virtual 128 KiB units.
+        let changed_dynamic = dynamic.record_read_span(4096, 4096 + frame, unit, &path);
+        assert!(changed_dynamic, "must recover Sequential within the frame");
+        assert!(dynamic.is_sequential());
+        assert_eq!(dynamic.seq_count(), 8);
+
+        // Legacy path: eight 128 KiB frames.
+        let mut changed_legacy = false;
+        let mut off = 4096;
+        for _ in 0..8 {
+            if legacy.record_read(off, off + unit, &path) {
+                changed_legacy = true;
+            }
+            off += unit;
+        }
+        assert_eq!(changed_legacy, changed_dynamic);
+        assert_eq!(legacy.read_pattern(), dynamic.read_pattern());
+        assert_eq!(legacy.seq_count(), dynamic.seq_count());
+        assert!(legacy.is_sequential());
+    }
+
+    // A span not larger than the unit behaves exactly like record_read.
+    #[test]
+    fn test_record_read_span_single_unit() {
+        let conf = create_test_conf(true, 3);
+        let path = create_test_path();
+
+        let mut a = ReadDetector::with_conf(&conf, 1024 * 1024);
+        let mut b = ReadDetector::with_conf(&conf, 1024 * 1024);
+
+        let _ = a.record_read_span(0, 100, 128 * 1024, &path);
+        let _ = b.record_read(0, 100, &path);
+        assert_eq!(a.seq_count(), b.seq_count());
+        assert_eq!(a.read_pattern(), b.read_pattern());
+
+        // Empty span records a single event like record_read does.
+        a.record_read_span(100, 100, 128 * 1024, &path);
+        b.record_read(100, 100, &path);
+        assert_eq!(a.seq_count(), b.seq_count());
     }
 
     #[test]

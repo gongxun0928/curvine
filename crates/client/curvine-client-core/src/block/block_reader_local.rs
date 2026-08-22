@@ -146,6 +146,7 @@ impl BlockReaderLocal {
                     len,
                     req_id,
                     seq_id,
+                    chunk_size as i64,
                 )
             },
         )

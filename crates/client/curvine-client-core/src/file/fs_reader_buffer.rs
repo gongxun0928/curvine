@@ -115,9 +115,22 @@ struct BufferChannel {
     task_sender: AsyncSender<ReadTask>,
     err_monitor: Arc<ErrorMonitor<FsError>>,
     budget: Arc<ByteBudget>,
-    /// Bytes of the most recently received frame still counted against the
-    /// budget. Released when the frame is fully consumed, on seek, or at
-    /// completion — never while the bytes are still buffered for the caller.
+    /// Local delivery unit (historical chunk_size). Coalesced background
+    /// wire frames are delivered upward in this unit so that FsReader-level
+    /// chunk-local seek behavior and the read detector stay independent of
+    /// the wire frame size.
+    chunk_size: i64,
+    /// Remainder of a coalesced background frame not yet delivered upward.
+    /// Delivered chunk_size units at a time (or whole for a real foreground
+    /// demand larger than chunk_size). Still counted against the byte budget
+    /// until delivered; released on seek/complete if discarded.
+    pending: Option<FileChunk>,
+    /// Total byte-budget reservation of the frame currently being delivered
+    /// upward (pending remainder + delivered-but-possibly-buffered units).
+    /// Released as a WHOLE once the frame is fully delivered AND its last
+    /// unit fully consumed (the next read), or on seek/complete. Releasing
+    /// per-unit instead would let the producer grab chunk_size-sized frames
+    /// via its floor and destroy the coalesced background pipeline.
     held: i64,
 }
 
@@ -133,10 +146,14 @@ impl BufferChannel {
             return;
         };
 
-        // A real demand larger than chunk_size lifts the first frame so the
-        // foreground caller does not wait on a small first response.
+        // A real demand larger than chunk_size sets the first frame directly,
+        // capped only by the byte-budget window (further clamped downstream by
+        // the 16MB frame limit and block/slice remaining). The coalesced
+        // `target` deliberately does NOT cap the foreground demand: it exists
+        // to keep the background pipeline at depth 2, so it applies only to
+        // frames after the first one.
         if demand > args.chunk_size {
-            args.initial_len = demand.min(args.target);
+            args.initial_len = demand.min(args.budget.window);
         }
 
         let monitor = self.err_monitor.clone();
@@ -164,8 +181,9 @@ impl BufferChannel {
     }
 
     /// Release the budget held for the frame currently buffered for the
-    /// caller. Called when that frame is fully consumed, on seek, and at
-    /// completion — never while the bytes are still buffered.
+    /// caller (whole-frame reservation). Called once the frame is fully
+    /// delivered and its last unit fully consumed, and on seek/completion —
+    /// never while any of its bytes are still buffered for the caller.
     fn release_held(&mut self) {
         if self.held > 0 {
             self.budget.release(self.held);
@@ -176,24 +194,55 @@ impl BufferChannel {
     async fn read(&mut self, demand: i64) -> FsResult<FileChunk> {
         self.start_prefetch(demand);
 
-        // The previous frame has been fully consumed by this new read.
-        self.release_held();
+        // The previous frame has been fully delivered AND fully consumed by
+        // this new read (pending exhausted): release its whole reservation
+        // at once so the producer keeps fetching full coalesced background
+        // frames instead of fragmenting into chunk_size-sized ones.
+        if self.pending.is_none() {
+            self.release_held();
+        }
 
-        let chunk = self
-            .chunk_receiver
-            .recv_check()
-            .await
-            .map_err(|e| self.check_error(e))?;
+        // Local delivery cap: background frames are handed up in historical
+        // chunk_size units so FsReader's chunk-local seek fast path and the
+        // read detector see the same boundaries as with fixed chunk frames;
+        // a real foreground demand larger than chunk_size is delivered whole
+        // (the caller asked for those bytes and will consume them).
+        let cap = if demand > self.chunk_size {
+            demand
+        } else {
+            self.chunk_size
+        };
 
-        self.held = chunk.len() as i64;
+        let mut chunk = match self.pending.take() {
+            Some(rest) => rest,
+            None => {
+                let chunk = self
+                    .chunk_receiver
+                    .recv_check()
+                    .await
+                    .map_err(|e| self.check_error(e))?;
+                // Reserve the whole frame until fully consumed (see held).
+                self.held = chunk.len() as i64;
+                chunk
+            }
+        };
+
+        if chunk.len() as i64 > cap {
+            let tail = chunk.data.split_off(cap as usize);
+            self.pending = Some(FileChunk::new(chunk.off + cap, tail));
+        }
+
         Ok(chunk)
     }
 
     async fn seek(&mut self, pos: i64) -> FsResult<()> {
         self.start_prefetch(0);
 
-        // Bytes still buffered for the caller are discarded by the seek.
+        // Bytes still buffered for the caller (delivered units and the
+        // pending remainder) are discarded by the seek; the whole frame
+        // reservation is released at once.
         self.release_held();
+        self.pending = None;
 
         let budget = self.budget.clone();
         let fun = async {
@@ -217,6 +266,7 @@ impl BufferChannel {
 
     async fn complete(&mut self) -> FsResult<()> {
         self.release_held();
+        self.pending = None;
 
         if self.prefetch.is_some() {
             // Prefetch task was never started, nothing to stop.
@@ -289,6 +339,11 @@ pub struct FsReaderBuffer {
     len: i64,
 
     slice_size: i64,
+
+    /// Default transfer unit used to feed the read-pattern detector in
+    /// virtual units (see `record_read_span`): pattern semantics must not
+    /// depend on the dynamic frame size.
+    chunk_size: i64,
 
     read_detector: ReadDetector,
 }
@@ -366,6 +421,8 @@ impl FsReaderBuffer {
                     task_sender,
                     err_monitor: err_monitor.clone(),
                     budget,
+                    chunk_size: chunk_len,
+                    pending: None,
                     held: 0,
                 };
                 ReaderAdapter::Buffer(channel)
@@ -383,6 +440,7 @@ impl FsReaderBuffer {
             pos,
             len,
             slice_size,
+            chunk_size: chunk_len,
             read_detector,
         };
         Ok(reader)
@@ -488,9 +546,12 @@ impl FsReaderBuffer {
         let start_pos = self.pos;
         self.pos += bytes.len() as i64;
 
-        let is_changed = self
-            .read_detector
-            .record_read(start_pos, self.pos, &self.path);
+        // Feed the detector in virtual chunk_size units over the served span
+        // so read-pattern semantics stay independent of the dynamic transfer
+        // frame size (a 1 MiB frame must count like 8 x 128 KiB frames).
+        let is_changed =
+            self.read_detector
+                .record_read_span(start_pos, self.pos, self.chunk_size, &self.path);
 
         if is_changed && self.read_detector.is_sequential() {
             for reader in &mut self.readers {
@@ -774,5 +835,133 @@ mod tests {
         rt.block_on(reader.seek(file_len)).unwrap();
         assert!(reader.read_detector.is_random());
         assert!(reader.get_reader().is_ok());
+    }
+
+    // P0 regression (frame-size independent semantics, part 1): a coalesced
+    // 512 KiB background wire frame must be delivered upward in chunk_size
+    // (128 KiB) local delivery units, so FsReader's chunk-local seek fast
+    // path covers the same range as with historical fixed chunk frames.
+    // Part 2 (budget granularity): the frame's whole reservation is held
+    // while its units are consumed and released only once, after the last
+    // unit — a per-unit release would let the producer's floor grab
+    // chunk_size-sized frames and fragment the coalesced background
+    // pipeline. `used` must never exceed the window.
+    #[tokio::test]
+    async fn test_background_frame_delivered_in_chunk_units() {
+        let unit: i64 = 128 * 1024;
+        let frame: i64 = 512 * 1024;
+
+        let (chunk_sender, chunk_receiver) = AsyncChannel::new(2).split();
+        let (task_sender, _task_receiver) = AsyncChannel::new(2).split();
+        let budget = Arc::new(ByteBudget::new(1024 * 1024));
+        let mut channel = BufferChannel {
+            prefetch: None,
+            chunk_receiver,
+            task_sender,
+            err_monitor: Arc::new(ErrorMonitor::new()),
+            budget: budget.clone(),
+            chunk_size: unit,
+            pending: None,
+            held: 0,
+        };
+
+        // Simulated producer: reserve, then send a coalesced background
+        // frame (target = window/2 = 512 KiB), twice — pipelined frames.
+        let reserved1 = budget.try_acquire(frame, frame).unwrap();
+        chunk_sender
+            .send(FileChunk::new(
+                0,
+                DataSlice::buffer(bytes::BytesMut::zeroed(frame as usize)),
+            ))
+            .await
+            .unwrap();
+
+        // Unit 1: delivered as one chunk_size unit.
+        let c1 = channel.read(0).await.unwrap();
+        assert_eq!(c1.off, 0);
+        assert_eq!(c1.len(), unit as usize);
+        assert_eq!(budget.used.load(Ordering::Acquire), reserved1);
+
+        // Units 2..4: served from the pending remainder, still 128 KiB each.
+        for i in 1..4 {
+            let c = channel.read(0).await.unwrap();
+            assert_eq!(c.off, i * unit);
+            assert_eq!(c.len(), unit as usize);
+            // Whole-frame hold: no per-unit budget release.
+            assert_eq!(budget.used.load(Ordering::Acquire), reserved1);
+        }
+        assert!(channel.pending.is_none());
+
+        // After the last unit is consumed, the next read releases the whole
+        // frame reservation at once and takes the next pipelined frame.
+        let reserved2 = budget.try_acquire(frame, frame).unwrap();
+        chunk_sender
+            .send(FileChunk::new(
+                frame,
+                DataSlice::buffer(bytes::BytesMut::zeroed(frame as usize)),
+            ))
+            .await
+            .unwrap();
+        let c5 = channel.read(0).await.unwrap();
+        assert_eq!(c5.off, frame);
+        assert_eq!(c5.len(), unit as usize);
+        assert_eq!(budget.used.load(Ordering::Acquire), reserved2);
+
+        // Window invariant across the whole exchange.
+        assert!(budget.used.load(Ordering::Acquire) <= budget.window);
+    }
+
+    // A real foreground demand larger than chunk_size is delivered whole.
+    #[tokio::test]
+    async fn test_foreground_demand_delivered_whole() {
+        let unit: i64 = 128 * 1024;
+        let frame: i64 = 512 * 1024;
+
+        let (chunk_sender, chunk_receiver) = AsyncChannel::new(2).split();
+        let (task_sender, mut task_receiver) = AsyncChannel::new(2).split();
+        let budget = Arc::new(ByteBudget::new(1024 * 1024));
+        let mut channel = BufferChannel {
+            prefetch: None,
+            chunk_receiver,
+            task_sender,
+            err_monitor: Arc::new(ErrorMonitor::new()),
+            budget: budget.clone(),
+            chunk_size: unit,
+            pending: None,
+            held: 0,
+        };
+
+        // Mock control-task handler so seek/stop are acked.
+        tokio::spawn(async move {
+            while let Some(task) = task_receiver.recv().await {
+                match task {
+                    ReadTask::Seek(_, tx) => {
+                        let _ = tx.send(1);
+                    }
+                    ReadTask::Stop(tx) => {
+                        let _ = tx.send(1);
+                        break;
+                    }
+                    ReadTask::Pause(_) => {}
+                }
+            }
+        });
+
+        let _ = budget.try_acquire(frame, frame).unwrap();
+        chunk_sender
+            .send(FileChunk::new(
+                0,
+                DataSlice::buffer(bytes::BytesMut::zeroed(frame as usize)),
+            ))
+            .await
+            .unwrap();
+
+        let c = channel.read(frame).await.unwrap();
+        assert_eq!(c.len(), frame as usize);
+        assert!(channel.pending.is_none());
+
+        // Seek discards the pending/held state and releases the reservation.
+        channel.seek(unit).await.unwrap();
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
     }
 }
