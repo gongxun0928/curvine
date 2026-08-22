@@ -14,6 +14,7 @@
 
 use crate::master::fs::{BlockInodeState, DeleteResult};
 use crate::master::journal::{JournalEntry, JournalWriter};
+use crate::master::meta::cache::CacheManager;
 use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::*;
@@ -46,6 +47,9 @@ pub struct FsDir {
     pub(crate) journal_writer: Arc<JournalWriter>,
     pub(crate) evictor: Arc<dyn Evictor>,
     pub(crate) op_id: AtomicCounter,
+    /// Cache-mode metadata manager (task #3). Applied only via the committed
+    /// journal apply path on leader AND follower; never pre-applied.
+    pub(crate) cache: CacheManager,
 }
 
 #[derive(Default)]
@@ -89,8 +93,10 @@ impl FsDir {
             journal_writer,
             evictor,
             op_id: AtomicCounter::new(0),
+            cache: CacheManager::new(),
         };
         fs_dir.update_last_inode_id(last_inode_id)?;
+        fs_dir.cache.restore_watermarks(fs_dir.get_rocks_store())?;
 
         Ok(fs_dir)
     }
@@ -929,6 +935,7 @@ impl FsDir {
         let (last_inode_id, root_dir) = self.store.create_tree()?;
         self.root_dir = root_dir;
         self.update_last_inode_id(last_inode_id)?;
+        self.cache.restore_watermarks(self.get_rocks_store())?;
         let time2 = spend.used_ms();
 
         info!(
@@ -964,6 +971,49 @@ impl FsDir {
 
     pub fn get_rocks_store(&self) -> &RocksInodeStore {
         &self.store.store
+    }
+
+    /// Apply a committed cache-mode journal entry to the authoritative store.
+    /// This is the ONLY apply path for cache entries and runs identically on
+    /// leader and follower (journal replay); it never touches UFS.
+    pub(crate) fn apply_cache_journal_entry(&self, entry: &JournalEntry) -> CommonResult<()> {
+        let store = self.get_rocks_store();
+        match entry {
+            JournalEntry::CacheIdReserve(e) => {
+                self.cache.apply_id_reserve(store, e.token, e.start, e.end)
+            }
+            JournalEntry::CacheIncarnationAllocate(e) => {
+                self.cache
+                    .apply_incarnation_allocate(store, e.token, e.mount_id, e.incarnation)
+            }
+            JournalEntry::CacheIncarnationRevoke(e) => {
+                self.cache
+                    .apply_incarnation_revoke(store, e.mount_id, e.incarnation)
+            }
+            JournalEntry::CacheAllocate(e) => {
+                self.cache
+                    .apply_allocate(store, e.token, e.incarnation, &e.key, &e.entry)
+            }
+            JournalEntry::CacheCommit(e) => self.cache.apply_commit(
+                store,
+                e.incarnation,
+                &e.key,
+                e.generation,
+                e.expected_object_id,
+                e.len,
+                e.ufs_mtime,
+                e.expire_at,
+            ),
+            JournalEntry::CacheRemove(e) => self.cache.apply_remove(
+                store,
+                e.incarnation,
+                &e.key,
+                e.expected_generation,
+                e.new_generation,
+                e.expected_object_id,
+            ),
+            _ => err_box!("journal entry is not a cache entry variant"),
+        }
     }
 
     pub fn delete_locations(&self, worker_id: u32) -> FsResult<Vec<i64>> {

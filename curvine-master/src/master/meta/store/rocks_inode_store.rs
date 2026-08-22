@@ -44,7 +44,16 @@ impl RocksInodeStore {
             .add_cf(Self::CF_EDGES)
             .add_cf(Self::CF_BLOCK)
             .add_cf(Self::CF_LOCATION)
-            .add_cf(Self::CF_COMMON);
+            .add_cf(Self::CF_COMMON)
+            // CacheIndex column families (dual-mode metadata split). All are
+            // captured by checkpoints automatically because the checkpoint
+            // covers the whole engine.
+            .add_cf(Self::CF_CACHE_ENTRY)
+            .add_cf(Self::CF_CACHE_OBJECT)
+            .add_cf(Self::CF_CACHE_EXPIRY)
+            .add_cf(Self::CF_CACHE_IDEMPOTENCY)
+            .add_cf(Self::CF_CACHE_MOUNT)
+            .add_cf(Self::CF_CACHE_STATE);
         let db = DBEngine::new(conf, format)?;
         Ok(Self { db })
     }

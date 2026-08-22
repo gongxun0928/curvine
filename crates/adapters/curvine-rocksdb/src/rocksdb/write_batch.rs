@@ -61,6 +61,12 @@ impl<'a> WriteBatch<'a> {
         self.db.write_batch(self.batch)
     }
 
+    /// Commit with per-write WAL + fsync, overriding the DB-level
+    /// `disable_wal` default (see `DBEngine::write_batch_durable`).
+    pub fn commit_durable(self) -> CommonResult<()> {
+        self.db.write_batch_durable(self.batch)
+    }
+
     pub fn commit_and_flush_mem(self, sync: bool) -> CommonResult<()> {
         self.db.write_batch(self.batch)?;
         self.db.flush_mem(sync)?;

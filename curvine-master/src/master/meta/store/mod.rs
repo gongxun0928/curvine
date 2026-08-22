@@ -17,3 +17,6 @@ pub use self::inode_store::InodeStore;
 
 mod rocks_inode_store;
 pub use self::rocks_inode_store::*;
+
+mod rocks_cache_index;
+pub use self::rocks_cache_index::*;

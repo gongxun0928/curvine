@@ -306,6 +306,19 @@ impl DBEngine {
         Ok(())
     }
 
+    /// Write a batch with per-write durability: WAL enabled and fsync'd,
+    /// regardless of the DB-level `disable_wal` default. RocksDB applies
+    /// these WriteOptions per write, so a multi-CF batch committed this way
+    /// is crash-atomic — a process that dies right after the ACK leaves
+    /// either the whole batch or none of it.
+    pub fn write_batch_durable(&self, batch: WriteBatchWithTransaction<false>) -> CommonResult<()> {
+        let mut opt = WriteOptions::default();
+        opt.disable_wal(false);
+        opt.set_sync(true);
+        try_err!(self.db.write_opt(batch, &opt));
+        Ok(())
+    }
+
     // Delete all data with the specified prefix.
     pub fn prefix_delete<K>(&self, cf: &str, prefix: K) -> CommonResult<()>
     where

@@ -259,7 +259,14 @@ impl JournalLoader {
                     continue;
                 }
 
-                JournalEntry::CacheInvalidation(_) | JournalEntry::UfsApplied(_) => (),
+                JournalEntry::CacheInvalidation(_)
+                | JournalEntry::UfsApplied(_)
+                | JournalEntry::CacheIdReserve(_)
+                | JournalEntry::CacheIncarnationAllocate(_)
+                | JournalEntry::CacheIncarnationRevoke(_)
+                | JournalEntry::CacheAllocate(_)
+                | JournalEntry::CacheCommit(_)
+                | JournalEntry::CacheRemove(_) => (),
 
                 _ => has_ufs_affecting = true,
             }
@@ -285,14 +292,25 @@ impl JournalLoader {
                 }
             }
 
-            let res = if is_leader {
+            let res = if op_entry.is_cache_entry() {
+                // Cache-mode entries apply through the single committed
+                // CacheManager path on leader AND follower — never the
+                // leader UFS loader (no pre-apply, no UFS side effects).
+                let fs_dir = self.fs_dir.read();
+                fs_dir.apply_cache_journal_entry(&op_entry)
+            } else if is_leader {
                 self.ufs_loader.apply_entry(&op_entry).await
             } else {
                 self.apply_entry(op_entry.clone())
             };
 
             if let Err(e) = res {
-                if is_leader && skip_ufs_error {
+                // The UFS retry-skip exemption exists only for the legacy
+                // UFS-affecting replay path. A failed cache-mode apply means
+                // the authoritative RocksDB state diverged from the journal:
+                // acknowledging it (advancing applied) would ACK a command
+                // whose durable state was never written. Always fatal.
+                if is_leader && skip_ufs_error && !op_entry.is_cache_entry() {
                     error!(
                         "skip failed UFS replay after retries, entry index={}, term={}, journal={:?}, error={}",
                         entry.index, entry.term, op_entry, e
@@ -1037,5 +1055,555 @@ impl AppStorage for JournalLoader {
     fn snapshot_dir(&self, snapshot_id: u64) -> RaftResult<String> {
         let fs_dir = self.fs_dir.read();
         Ok(fs_dir.get_checkpoint_path(snapshot_id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::master::fs::{MasterFilesystem, WorkerManager};
+    use crate::master::meta::cache::{
+        state_tags, BlockIdCodec, LocalCacheIndexStore, OpOutcome, OpToken,
+    };
+    use crate::master::meta::inode::ttl::TtlBucketList;
+    use crate::master::meta::store::RocksInodeStore;
+    use crate::master::meta::FsDir;
+    use crate::master::quota::eviction::evictor::{Evictor, LRUEvictor};
+    use crate::master::quota::eviction::EvictionConf;
+    use crate::master::{MasterMonitor, MetaRaftJournal, SyncFsDir, SyncWorkerManager};
+    use curvine_config::{ClusterConf, JournalConf, MasterConf};
+    use curvine_raft::raft::RoleMonitor;
+    use curvine_runtime::common::{FileUtils, SerdeUtils, Utils};
+    use curvine_runtime::sync::StateCtl;
+    use std::sync::Arc;
+
+    fn test_conf(name: &str) -> ClusterConf {
+        let mut conf = ClusterConf {
+            testing: true,
+            format_master: true,
+            journal: JournalConf {
+                enable: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        conf.change_test_meta_dir(name);
+        conf
+    }
+
+    fn build_loader(conf: &ClusterConf) -> JournalLoader {
+        Master::init_test_metrics();
+
+        let rt = conf.journal.create_runtime();
+        let client = RaftClient::from_conf(rt.clone(), &conf.journal);
+        let journal_writer = Arc::new(JournalWriter::new(true, client, &conf.journal).unwrap());
+
+        let ttl_bucket_list =
+            Arc::new(TtlBucketList::new(conf.master.ttl_bucket_interval_ms() as i64).unwrap());
+        let eviction_conf = EvictionConf::from_conf(conf);
+        let evictor: Arc<dyn Evictor> = Arc::new(LRUEvictor::new(eviction_conf.clone()));
+        let fs_dir =
+            SyncFsDir::new(FsDir::new(conf, journal_writer, ttl_bucket_list, evictor).unwrap());
+
+        let master_monitor = MasterMonitor::new(StateCtl::new(0), StateCtl::new(0));
+        let fs = MasterFilesystem::new(
+            conf,
+            fs_dir.clone(),
+            SyncWorkerManager::new(WorkerManager::new(conf).unwrap()),
+            master_monitor,
+        );
+        let mount_manager = Arc::new(MountManager::new(fs.clone()));
+        let job_manager = Arc::new(JobManager::from_cluster_conf(
+            fs,
+            mount_manager.clone(),
+            rt,
+            conf,
+        ));
+
+        JournalLoader::new_replay_loader(fs_dir, mount_manager, &conf.journal, job_manager).unwrap()
+    }
+
+    fn cache_commit_entry() -> JournalEntry {
+        // A commit for a key with no entry: legal journal bytes, but the
+        // committed apply fails loudly (missing entry CAS).
+        JournalEntry::CacheCommit(CacheCommitEntry {
+            op_id: 1,
+            rpc_id: 0,
+            incarnation: 1,
+            key: "/missing".into(),
+            generation: 1,
+            expected_object_id: BlockIdCodec::CACHE_OBJECT_MIN,
+            len: 1,
+            ufs_mtime: 1,
+            expire_at: 0,
+        })
+    }
+
+    fn raft_entry(index: u64, entry: JournalEntry) -> Entry {
+        let mut batch = JournalBatch::new(0);
+        batch.push(entry);
+        let bytes = SerdeUtils::serialize(&batch).unwrap();
+        let mut e = Entry::default();
+        e.set_entry_type(EntryType::EntryNormal);
+        e.term = 1;
+        e.index = index;
+        e.set_data(bytes);
+        e
+    }
+
+    /// A failed cache-mode apply must be fatal even when the leader replay
+    /// runs with skip_failed_ufs_replay_after_retry: acknowledging it would
+    /// advance applied past a command whose authoritative state was never
+    /// written (gpt56 snapshot review, blocker 3).
+    #[test]
+    fn cache_apply_error_is_fatal_even_with_ufs_skip() {
+        let conf = test_conf("cache-apply-fatal");
+        let loader = build_loader(&conf);
+        let rt = conf.journal.create_runtime();
+
+        let result = rt.block_on(async {
+            loader
+                .apply_msg(
+                    true,
+                    &ApplyMsg::new_entry(raft_entry(1, cache_commit_entry())),
+                    true, // skip_ufs_error: must NOT exempt cache entries
+                )
+                .await
+        });
+
+        assert!(result.is_err(), "malformed cache entry must fail the apply");
+        let state = loader.fsm_state_snapshot().unwrap();
+        assert_eq!(
+            state.applied.index, 0,
+            "applied must not advance past a failed cache apply"
+        );
+        assert_eq!(
+            state.ufs_applied.index, 0,
+            "ufs_applied must not advance past a failed cache apply"
+        );
+    }
+
+    /// The happy-path cache entry applies through the same committed path
+    /// with skip enabled and does advance applied.
+    #[test]
+    fn cache_entry_apply_advances_applied() {
+        let conf = test_conf("cache-apply-ok");
+        let loader = build_loader(&conf);
+        let rt = conf.journal.create_runtime();
+
+        let entry = JournalEntry::CacheIdReserve(CacheIdReserveEntry {
+            op_id: 1,
+            rpc_id: 0,
+            token: OpToken {
+                client_id: 7,
+                op_seq: 1,
+            },
+            start: crate::master::meta::cache::BlockIdCodec::CACHE_OBJECT_MIN,
+            end: crate::master::meta::cache::BlockIdCodec::CACHE_OBJECT_MIN + 10,
+        });
+
+        let result = rt.block_on(async {
+            loader
+                .apply_msg(true, &ApplyMsg::new_entry(raft_entry(1, entry)), true)
+                .await
+        });
+        result.unwrap();
+
+        let state = loader.fsm_state_snapshot().unwrap();
+        assert_eq!(state.applied.index, 1);
+    }
+
+    /// Fake-ACK crash boundary (contract §7): the leader applies a cache
+    /// command (the point where the RPC would be ACKed), then the process
+    /// crashes before the client observes the ACK. On restart the journal
+    /// replay of the same entry must (a) succeed and (b) NOT execute the
+    /// command a second time — the persisted idempotency outcome is the
+    /// single source of identity. A follower replaying the same entry takes
+    /// the identical committed path and reaches the identical state.
+    #[test]
+    fn fake_ack_crash_then_restart_replay_does_not_reexecute() {
+        let name = format!("fake-ack-{}", Utils::rand_str(6));
+        let conf = test_conf(&name);
+
+        let id_reserve = || {
+            JournalEntry::CacheIdReserve(CacheIdReserveEntry {
+                op_id: 1,
+                rpc_id: 0,
+                token: OpToken {
+                    client_id: 7,
+                    op_seq: 1,
+                },
+                start: BlockIdCodec::CACHE_OBJECT_MIN,
+                end: BlockIdCodec::CACHE_OBJECT_MIN + 10,
+            })
+        };
+
+        // Leader lifetime: apply the entry (this is the ACK boundary).
+        let durable_after_leader;
+        {
+            let loader = build_loader(&conf);
+            let rt = conf.journal.create_runtime();
+            rt.block_on(async {
+                loader
+                    .apply_msg(
+                        true,
+                        &ApplyMsg::new_entry(raft_entry(1, id_reserve())),
+                        false,
+                    )
+                    .await
+            })
+            .unwrap();
+            assert_eq!(loader.fsm_state_snapshot().unwrap().applied.index, 1);
+
+            let store = loader.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            durable_after_leader = (
+                rocks.cache_get_state(state_tags::CACHE_OBJECT_ID).unwrap(),
+                rocks
+                    .cache_get_outcome(OpToken {
+                        client_id: 7,
+                        op_seq: 1,
+                    })
+                    .unwrap(),
+            );
+        }
+        // (loader + FsDir dropped: simulated process crash)
+
+        assert_eq!(
+            durable_after_leader.0,
+            Some(BlockIdCodec::CACHE_OBJECT_MIN + 9),
+            "leader apply must have durably advanced the watermark"
+        );
+
+        // Restart: a fresh FsDir over the SAME RocksDB dir replays the same
+        // journal entry — both as leader-replay and as follower — and must
+        // converge without re-executing (outcome and watermark unchanged).
+        for is_leader in [true, false] {
+            let mut conf2 = test_conf(&name);
+            conf2.format_master = false;
+            let loader2 = build_loader(&conf2);
+            let rt2 = conf2.journal.create_runtime();
+
+            rt2.block_on(async {
+                loader2
+                    .apply_msg(
+                        is_leader,
+                        &ApplyMsg::new_entry(raft_entry(1, id_reserve())),
+                        false,
+                    )
+                    .await
+            })
+            .unwrap_or_else(|e| {
+                panic!("restart replay (leader={}) must converge: {}", is_leader, e)
+            });
+
+            let store = loader2.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            assert_eq!(
+                rocks.cache_get_state(state_tags::CACHE_OBJECT_ID).unwrap(),
+                durable_after_leader.0,
+                "restart replay (leader={}) must not move the watermark",
+                is_leader
+            );
+            assert_eq!(
+                rocks
+                    .cache_get_outcome(OpToken {
+                        client_id: 7,
+                        op_seq: 1
+                    })
+                    .unwrap(),
+                durable_after_leader.1,
+                "restart replay (leader={}) must not rewrite the outcome",
+                is_leader
+            );
+        }
+    }
+
+    /// Real single-voter Raft + real JournalWriter fake-ACK fault test
+    /// (1c review blocker 6). The full production chain is exercised:
+    /// `sync_propose_cache` → RaftClient RPC → raft commit → apply worker →
+    /// `EntryWithAck` ack → `ProposeResponse{applied_index}`. The raft run
+    /// task holds the runtime (and through the loader, the metadata
+    /// RocksDB) until process exit, so the crash is simulated the faithful
+    /// way: the leader stack runs in a child process that simply exits
+    /// right after the barrier response — no graceful close whatsoever.
+    /// The parent then reopens the same RocksDB and the committed raft log
+    /// as the restarting master: the outcome and watermark must already be
+    /// durable, and replaying the committed entry (leader AND follower)
+    /// must converge without re-executing the command.
+    #[test]
+    fn real_raft_sync_propose_barrier_survives_leader_crash() {
+        let leader_mode_env = "CURVINE_TEST_CACHE_FAKE_ACK_LEADER";
+        let meta_dir_env = "CURVINE_TEST_CACHE_FAKE_ACK_META_DIR";
+        let journal_dir_env = "CURVINE_TEST_CACHE_FAKE_ACK_JOURNAL_DIR";
+
+        if std::env::var(leader_mode_env).is_ok() {
+            // Child: the leader lifetime. Exits right after the barrier ACK
+            // — this process exit IS the crash under test.
+            real_raft_leader_lifetime(meta_dir_env, journal_dir_env);
+            return;
+        }
+
+        // Parent: fresh dirs, spawn the leader process on them, wait.
+        Master::init_test_metrics();
+        let base = Utils::cur_dir_sub(format!(
+            "../target/testing/real-raft-fake-ack-{}-{}",
+            std::process::id(),
+            Utils::rand_str(6)
+        ));
+        let meta_dir = format!("{}/meta", base);
+        let journal_dir = format!("{}/journal", base);
+        let _ = FileUtils::delete_path(&base, true);
+
+        let exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("master::journal::journal_loader::tests::real_raft_sync_propose_barrier_survives_leader_crash")
+            .env(leader_mode_env, "1")
+            .env(meta_dir_env, &meta_dir)
+            .env(journal_dir_env, &journal_dir)
+            .output()
+            .expect("spawn leader test process");
+        assert!(
+            output.status.success(),
+            "leader lifetime failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let token = OpToken {
+            client_id: 7,
+            op_seq: 1,
+        };
+        let conf = || {
+            let mut journal = JournalConf::with_test();
+            journal.enable = true;
+            journal.journal_dir = journal_dir.clone();
+            ClusterConf {
+                testing: true,
+                format_master: false,
+                journal,
+                master: MasterConf {
+                    meta_dir: meta_dir.clone(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        };
+
+        // The committed raft log survived the crash: read the one data
+        // entry back from the journal RocksDB.
+        let committed_entry = {
+            let log_store = RocksLogStorage::from_conf(&conf().journal, false);
+            let last = log_store.read().last_index();
+            assert!(last >= 1, "journal log must exist after leader crash");
+            let entries = log_store.scan_entries(1, last + 1).unwrap();
+            drop(log_store);
+            let data_entries: Vec<Entry> = entries
+                .into_iter()
+                .filter(|e| e.get_entry_type() == EntryType::EntryNormal && !e.data.is_empty())
+                .collect();
+            assert_eq!(
+                data_entries.len(),
+                1,
+                "exactly one committed data entry expected"
+            );
+            data_entries.into_iter().next().unwrap()
+        };
+
+        // All-or-nothing after abrupt exit (round-2 review): the leader
+        // died via std::process::exit right after the barrier ACK — no
+        // graceful close, no destructors. Cache identity writes commit with
+        // per-write WAL + fsync (write_batch_durable), overriding the meta
+        // DB's disable_wal default, so reopening the meta RocksDB BEFORE
+        // any journal replay must show the whole identity batch: reserve
+        // watermark, token outcome, and client watermark together, or none
+        // of them. A partial batch (e.g. only the client watermark) would
+        // make the replayed Expired no-op forever unable to rebuild the
+        // identity.
+        {
+            let rocks = RocksInodeStore::new(conf().db_conf(), false).unwrap();
+            assert_eq!(
+                rocks.cache_get_state(state_tags::CACHE_OBJECT_ID).unwrap(),
+                Some(BlockIdCodec::CACHE_OBJECT_MIN + 9),
+                "pre-replay: the durable reserve watermark must have survived the abrupt exit"
+            );
+            assert_eq!(
+                rocks.cache_get_outcome(token).unwrap(),
+                Some(OpOutcome::Reserved {
+                    start: BlockIdCodec::CACHE_OBJECT_MIN,
+                    end: BlockIdCodec::CACHE_OBJECT_MIN + 10,
+                }),
+                "pre-replay: the token outcome must have survived the abrupt exit"
+            );
+            assert_eq!(
+                rocks.cache_client_watermark(7).unwrap(),
+                Some(1),
+                "pre-replay: the client watermark must have survived the abrupt exit"
+            );
+        }
+
+        // Replaying the committed entry must (re)derive the exact single
+        // identity, and every further replay — the recovering leader, a
+        // follower, and a post-recovery client retry of the same token —
+        // must converge on it without minting a second identity.
+        for (round, is_leader) in [(0, true), (1, false), (2, true)] {
+            let loader = build_loader(&conf());
+            let rt = conf().journal.create_runtime();
+            rt.block_on(async {
+                loader
+                    .apply_msg(
+                        is_leader,
+                        &ApplyMsg::new_entry(committed_entry.clone()),
+                        false,
+                    )
+                    .await
+            })
+            .unwrap_or_else(|e| {
+                panic!(
+                    "restart replay (round {}, leader={}) must converge: {}",
+                    round, is_leader, e
+                )
+            });
+
+            let store = loader.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            assert_eq!(
+                rocks.cache_get_state(state_tags::CACHE_OBJECT_ID).unwrap(),
+                Some(BlockIdCodec::CACHE_OBJECT_MIN + 9),
+                "round {}: the single segment identity must be [OBJ, OBJ+10), never re-minted",
+                round
+            );
+            assert_eq!(
+                rocks.cache_get_outcome(token).unwrap(),
+                Some(OpOutcome::Reserved {
+                    start: BlockIdCodec::CACHE_OBJECT_MIN,
+                    end: BlockIdCodec::CACHE_OBJECT_MIN + 10,
+                }),
+                "round {}: the token must resolve to exactly one outcome",
+                round
+            );
+            assert_eq!(rocks.cache_client_watermark(7).unwrap(), Some(1));
+        }
+
+        let _ = FileUtils::delete_path(&base, true);
+    }
+
+    /// The leader lifetime for the fake-ACK fault test: a REAL single-voter
+    /// raft node with the production (non-testing) JournalWriter and the
+    /// production JournalLoader (apply worker enabled). One cache id-reserve
+    /// command goes through `sync_propose_cache`, i.e. the full RPC →
+    /// commit → EntryWithAck-apply → ProposeResponse barrier.
+    fn real_raft_leader_lifetime(meta_dir_env: &str, journal_dir_env: &str) {
+        Master::init_test_metrics();
+        let meta_dir = std::env::var(meta_dir_env).unwrap();
+        let journal_dir = std::env::var(journal_dir_env).unwrap();
+
+        let mut journal = JournalConf::with_test();
+        journal.enable = true;
+        journal.journal_dir = journal_dir;
+        let conf = ClusterConf {
+            testing: true,
+            format_master: true,
+            journal,
+            master: MasterConf {
+                meta_dir,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let rt = conf.journal.create_runtime();
+        let log_store = RocksLogStorage::from_conf(&conf.journal, true);
+        let role_monitor = RoleMonitor::new();
+        let master_monitor = MasterMonitor::new(role_monitor.read_ctl(), StateCtl::new(0));
+
+        // Production writer: testing=false keeps the RaftClient and the
+        // real sync-propose barrier; the loader's apply worker runs.
+        let client = RaftClient::from_conf(rt.clone(), &conf.journal);
+        let journal_writer = Arc::new(JournalWriter::new(false, client, &conf.journal).unwrap());
+
+        let ttl_bucket_list =
+            Arc::new(TtlBucketList::new(conf.master.ttl_bucket_interval_ms() as i64).unwrap());
+        let eviction_conf = EvictionConf::from_conf(&conf);
+        let evictor: Arc<dyn Evictor> = Arc::new(LRUEvictor::new(eviction_conf.clone()));
+        let fs_dir = SyncFsDir::new(
+            FsDir::new(&conf, journal_writer.clone(), ttl_bucket_list, evictor).unwrap(),
+        );
+        let fs = MasterFilesystem::new(
+            &conf,
+            fs_dir.clone(),
+            SyncWorkerManager::new(WorkerManager::new(&conf).unwrap()),
+            master_monitor,
+        );
+        let mount_manager = Arc::new(MountManager::new(fs.clone()));
+        let job_manager = Arc::new(JobManager::from_cluster_conf(
+            fs,
+            mount_manager.clone(),
+            rt.clone(),
+            &conf,
+        ));
+
+        let loader = JournalLoader::new(
+            rt.clone(),
+            fs_dir.clone(),
+            mount_manager,
+            &conf.journal,
+            job_manager,
+            log_store.clone(),
+            journal_writer.clone(),
+        )
+        .unwrap();
+        let raft = MetaRaftJournal::new(
+            rt.clone(),
+            log_store,
+            loader.clone(),
+            conf.journal.clone(),
+            role_monitor,
+        );
+        let mut listener = rt.block_on(raft.run()).unwrap();
+        rt.block_on(listener.wait_leader()).unwrap();
+
+        let token = OpToken {
+            client_id: 7,
+            op_seq: 1,
+        };
+        let entry = JournalEntry::CacheIdReserve(CacheIdReserveEntry {
+            op_id: 1,
+            rpc_id: 0,
+            token,
+            start: BlockIdCodec::CACHE_OBJECT_MIN,
+            end: BlockIdCodec::CACHE_OBJECT_MIN + 10,
+        });
+
+        // The full barrier path: this returns only after the committed
+        // entry has been applied by the FSM (EntryWithAck).
+        let index = journal_writer.sync_propose_cache(entry).unwrap();
+        assert!(index > 0, "sync barrier must return the applied raft index");
+        assert!(
+            loader.fsm_state_snapshot().unwrap().applied.index >= index,
+            "FSM applied index must have reached the barrier index"
+        );
+
+        // The committed state this leader would ACK against.
+        let store = fs_dir.read();
+        let rocks = store.get_rocks_store();
+        assert_eq!(
+            rocks.cache_get_state(state_tags::CACHE_OBJECT_ID).unwrap(),
+            Some(BlockIdCodec::CACHE_OBJECT_MIN + 9)
+        );
+        assert_eq!(
+            rocks.cache_get_outcome(token).unwrap(),
+            Some(OpOutcome::Reserved {
+                start: BlockIdCodec::CACHE_OBJECT_MIN,
+                end: BlockIdCodec::CACHE_OBJECT_MIN + 10,
+            })
+        );
+
+        // Abrupt exit right after the barrier asserts: returning would run
+        // destructors (loader/raft runtime/RocksDB), which is a graceful
+        // shutdown, not the crash this fault test simulates. The crash point
+        // is "immediately after the barrier response, before anything else".
+        std::process::exit(0);
     }
 }

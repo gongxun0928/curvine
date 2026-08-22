@@ -24,7 +24,7 @@ use curvine_error::FsResult;
 use curvine_model::{CommitBlock, FileLock, MountInfo, RenameFlags, SetAttrOpts};
 use curvine_raft::conf::JournalConfExt;
 use curvine_raft::raft::RaftClient;
-use curvine_runtime::common::{FileUtils, LocalTime};
+use curvine_runtime::common::{FileUtils, LocalTime, SerdeUtils};
 use curvine_runtime::sync::channel::{BlockingChannel, BlockingReceiver, BlockingSender};
 use curvine_runtime::sync::AtomicCounter;
 use log::{debug, info, warn};
@@ -39,6 +39,10 @@ pub struct JournalWriter {
     metrics: &'static MasterMetrics,
     receiver: Option<Mutex<BlockingReceiver<JournalEntry>>>,
     metadata_delta_log: Mutex<MetadataDeltaLog>,
+
+    // Retained Raft client for the synchronous cache-mode barrier propose
+    // (the async SenderTask owns its own clone).
+    client: Option<RaftClient>,
 
     snapshot_entries: u64,
     entries_since_snapshot: AtomicCounter,
@@ -59,7 +63,7 @@ impl JournalWriter {
 
         let receiver = if !testing {
             // Start the send log thread.
-            let task = SenderTask::new(client, conf, 0)?;
+            let task = SenderTask::new(client.clone(), conf, 0)?;
             task.spawn(receiver)?;
             None
         } else {
@@ -73,6 +77,7 @@ impl JournalWriter {
             metrics,
             receiver,
             metadata_delta_log: Mutex::new(MetadataDeltaLog::new(conf.metadata_delta_log_capacity)),
+            client: if testing { None } else { Some(client) },
             snapshot_entries: conf.snapshot_entries,
             entries_since_snapshot: AtomicCounter::new(0),
         })
@@ -382,6 +387,56 @@ impl JournalWriter {
             locks,
         };
         self.send(fs_dir, JournalEntry::SetLocks(entry))
+    }
+
+    /// Synchronous propose for cache-mode commands (task #3). Unlike the
+    /// async fire-and-forget `send` path, this blocks until the leader has
+    /// committed AND applied the entry and returns the applied raft index:
+    /// the leader sends its ProposeResponse only after the FSM apply ack, so
+    /// an Ok return is a true barrier. Callers must still re-read committed
+    /// state by idempotency token after the ack — the barrier guarantees
+    /// visibility, and the token resolves the outcome.
+    pub fn sync_propose_cache(&self, entry: JournalEntry) -> FsResult<u64> {
+        if !self.enable {
+            return err_box!(
+                "cache command requires the journal (sync propose barrier) to be enabled"
+            );
+        }
+        if !entry.is_cache_entry() {
+            return err_box!("sync_propose_cache only accepts cache journal entries");
+        }
+
+        if self.receiver.is_some() {
+            // Testing mode: no raft cluster behind the writer, so the
+            // sync-propose barrier cannot be honored. Fail closed — the
+            // caller must not mistake an enqueued entry for a committed
+            // one (a fake-ACK is exactly what this barrier exists to
+            // prevent).
+            return err_box!(
+                "sync_propose_cache requires a raft cluster; testing-mode writers cannot provide the apply barrier"
+            );
+        }
+
+        let client = self
+            .client
+            .as_ref()
+            .expect("non-testing JournalWriter must retain its RaftClient");
+
+        let mut batch = JournalBatch::new(0);
+        batch.push(entry);
+        let bytes = SerdeUtils::serialize(&batch)?;
+        let resp = client.block_on_send_propose_response(bytes)?;
+        // Fail closed on a missing or zero applied index: the barrier
+        // promise is "response only after the FSM applied the entry", so
+        // an unset index means the barrier is broken — raft index 0 does
+        // not exist and must never be reported as a committed position.
+        match resp.applied_index {
+            Some(index) if index > 0 => Ok(index),
+            other => err_box!(
+                "sync propose barrier violated: applied_index {:?} is not a committed index",
+                other
+            ),
+        }
     }
 
     // for testing

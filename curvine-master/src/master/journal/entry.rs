@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::master::meta::cache::{CacheEntry, OpToken};
 use crate::master::meta::inode::{InodeDir, InodeFile, InodeView};
 use crate::master::meta::BlockMeta;
 use curvine_core_error::{err_box, CommonResult};
@@ -192,6 +193,94 @@ pub struct SnapshotEntry {
     pub(crate) dir: String,
 }
 
+// ---- Cache-mode metadata commands (task #3, phase 0 contract §2/§3 rev2).
+// Keep these variants appended at the enum tail so existing journal
+// discriminants remain stable. Every entry carries absolute values
+// (incarnation / generation / object id) so committed replay is
+// deterministic and identical on leader and follower. ----
+
+/// Identity-producing: reserve the global cache object id segment
+/// `[start, end)`. Replay advances the allocator watermark to `end - 1`
+/// and persists the exact outcome for the op token (bounded window).
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct CacheIdReserveEntry {
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
+    pub(crate) token: OpToken,
+    pub(crate) start: i64,
+    pub(crate) end: i64,
+}
+
+/// Identity-producing: allocate a never-reused mount incarnation and point
+/// `mount_id` at it.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct CacheIncarnationAllocateEntry {
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
+    pub(crate) token: OpToken,
+    pub(crate) mount_id: u32,
+    pub(crate) incarnation: u64,
+}
+
+/// Conditional: revoke a mount incarnation (unmount fence). The
+/// incarnation row stays forever, marked revoked; the mount's current
+/// pointer is cleared only if it still names this incarnation.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct CacheIncarnationRevokeEntry {
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
+    pub(crate) mount_id: u32,
+    pub(crate) incarnation: u64,
+}
+
+/// Identity-producing: per-key load allocation. Writes a `Reserved` entry
+/// at `entry.generation`; the persisted outcome binds the object id for the
+/// token so a retried allocate can never mint a second identity.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct CacheAllocateEntry {
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
+    pub(crate) token: OpToken,
+    pub(crate) incarnation: u64,
+    pub(crate) key: String,
+    pub(crate) entry: CacheEntry,
+}
+
+/// Conditional CAS: `Reserved@generation` -> `Valid` with the final
+/// `(len, ufs_mtime, expire_at)`. The committed apply rejects the commit
+/// when the recorded generation has advanced (Superseded is terminal: the
+/// old load is dead and its object reclaimable).
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct CacheCommitEntry {
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
+    pub(crate) incarnation: u64,
+    pub(crate) key: String,
+    pub(crate) generation: u64,
+    /// Object identity CAS (contract §2.3): the commit must land on the
+    /// object id its allocate reserved; any mismatch is divergence.
+    pub(crate) expected_object_id: i64,
+    pub(crate) len: i64,
+    pub(crate) ufs_mtime: i64,
+    pub(crate) expire_at: i64,
+}
+
+/// Conditional CAS: any state at `expected_generation` -> `Tombstoned` at
+/// `expected_generation + 1`. Kept for late-commit rejection; the expiry
+/// and reverse rows of the superseded version are dropped.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct CacheRemoveEntry {
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
+    pub(crate) incarnation: u64,
+    pub(crate) key: String,
+    pub(crate) expected_generation: u64,
+    pub(crate) new_generation: u64,
+    /// Object identity CAS (contract §2.3): the remove must target the
+    /// object id the caller observed; any mismatch is divergence.
+    pub(crate) expected_object_id: i64,
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum JournalEntry {
     Mkdir(MkdirEntry),
@@ -213,6 +302,12 @@ pub enum JournalEntry {
     Snapshot(SnapshotEntry),
     // Keep new variants appended so existing journal discriminants remain stable.
     CacheInvalidation(CacheInvalidationEntry),
+    CacheIdReserve(CacheIdReserveEntry),
+    CacheIncarnationAllocate(CacheIncarnationAllocateEntry),
+    CacheIncarnationRevoke(CacheIncarnationRevokeEntry),
+    CacheAllocate(CacheAllocateEntry),
+    CacheCommit(CacheCommitEntry),
+    CacheRemove(CacheRemoveEntry),
 }
 
 impl JournalEntry {
@@ -236,6 +331,12 @@ impl JournalEntry {
             JournalEntry::CacheInvalidation(e) => e.op_id,
             JournalEntry::UfsApplied(e) => e.op_id,
             JournalEntry::Snapshot(e) => e.op_id,
+            JournalEntry::CacheIdReserve(e) => e.op_id,
+            JournalEntry::CacheIncarnationAllocate(e) => e.op_id,
+            JournalEntry::CacheIncarnationRevoke(e) => e.op_id,
+            JournalEntry::CacheAllocate(e) => e.op_id,
+            JournalEntry::CacheCommit(e) => e.op_id,
+            JournalEntry::CacheRemove(e) => e.op_id,
         }
     }
 
@@ -259,6 +360,12 @@ impl JournalEntry {
             JournalEntry::CacheInvalidation(e) => e.rpc_id,
             JournalEntry::UfsApplied(e) => e.rpc_id,
             JournalEntry::Snapshot(e) => e.rpc_id,
+            JournalEntry::CacheIdReserve(e) => e.rpc_id,
+            JournalEntry::CacheIncarnationAllocate(e) => e.rpc_id,
+            JournalEntry::CacheIncarnationRevoke(e) => e.rpc_id,
+            JournalEntry::CacheAllocate(e) => e.rpc_id,
+            JournalEntry::CacheCommit(e) => e.rpc_id,
+            JournalEntry::CacheRemove(e) => e.rpc_id,
         }
     }
 
@@ -300,7 +407,13 @@ impl JournalEntry {
             | JournalEntry::SetLocks(_)
             | JournalEntry::CacheInvalidation(_)
             | JournalEntry::UfsApplied(_)
-            | JournalEntry::Snapshot(_) => Vec::new(),
+            | JournalEntry::Snapshot(_)
+            | JournalEntry::CacheIdReserve(_)
+            | JournalEntry::CacheIncarnationAllocate(_)
+            | JournalEntry::CacheIncarnationRevoke(_)
+            | JournalEntry::CacheAllocate(_)
+            | JournalEntry::CacheCommit(_)
+            | JournalEntry::CacheRemove(_) => Vec::new(),
         }
     }
 
@@ -311,6 +424,22 @@ impl JournalEntry {
             JournalEntry::Symlink(e) => Some(e.new_inode.id),
             _ => None,
         }
+    }
+
+    /// Whether this entry belongs to the cache metadata domain. Cache
+    /// entries are applied on leader AND follower by the single committed
+    /// `CacheManager` path — never by the leader pre-apply / UFS loader,
+    /// and they have no UFS side effects (task #3, contract §3).
+    pub fn is_cache_entry(&self) -> bool {
+        matches!(
+            self,
+            JournalEntry::CacheIdReserve(_)
+                | JournalEntry::CacheIncarnationAllocate(_)
+                | JournalEntry::CacheIncarnationRevoke(_)
+                | JournalEntry::CacheAllocate(_)
+                | JournalEntry::CacheCommit(_)
+                | JournalEntry::CacheRemove(_)
+        )
     }
 }
 
@@ -488,6 +617,299 @@ impl From<LegacyJournalEntry> for JournalEntry {
             }),
             LegacyJournalEntry::UfsApplied(entry) => Self::UfsApplied(entry),
             LegacyJournalEntry::Snapshot(entry) => Self::Snapshot(entry),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // bincode 1.x encodes an enum variant as a u32 LE positional index
+    // prefix. Journals persisted by older binaries replay on newer ones
+    // purely by positional stability, so this test is the golden wire
+    // format: 0..=17 are the pre-cache variants (identical to main at the
+    // branch base), and the cache block appended by task #3 phase 1c must
+    // occupy 18..=23. Reordering or inserting any variant silently
+    // corrupts every persisted journal.
+    fn discriminant(entry: &JournalEntry) -> u32 {
+        let bytes = SerdeUtils::serialize(entry).expect("serialize journal entry");
+        assert!(bytes.len() >= 4, "bincode output too short for variant tag");
+        let mut tag = [0u8; 4];
+        tag.copy_from_slice(&bytes[..4]);
+        u32::from_le_bytes(tag)
+    }
+
+    fn file() -> InodeFile {
+        InodeFile::new(1, 1)
+    }
+
+    fn dir() -> InodeDir {
+        InodeDir::new(1, 1)
+    }
+
+    fn token() -> OpToken {
+        OpToken {
+            client_id: 7,
+            op_seq: 3,
+        }
+    }
+
+    #[test]
+    fn test_bincode_variant_discriminants_are_stable() {
+        let cases: Vec<(JournalEntry, u32)> = vec![
+            (
+                JournalEntry::Mkdir(MkdirEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    path: "/d".into(),
+                    dir: dir(),
+                }),
+                0,
+            ),
+            (
+                JournalEntry::CreateFile(CreateFileEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    path: "/f".into(),
+                    file: file(),
+                }),
+                1,
+            ),
+            (
+                JournalEntry::ReopenFile(ReopenFileEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    path: "/f".into(),
+                    file: file(),
+                }),
+                2,
+            ),
+            (
+                JournalEntry::OverWriteFile(OverWriteFileEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    path: "/f".into(),
+                    file: file(),
+                }),
+                3,
+            ),
+            (
+                JournalEntry::AddBlock(AddBlockEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    path: "/f".into(),
+                    blocks: vec![],
+                    commit_block: vec![],
+                }),
+                4,
+            ),
+            (
+                JournalEntry::CompleteFile(CompleteFileEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    path: "/f".into(),
+                    file: file(),
+                    commit_blocks: vec![],
+                }),
+                5,
+            ),
+            (
+                JournalEntry::Rename(RenameEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    src: "/a".into(),
+                    dst: "/b".into(),
+                    mtime: 1,
+                    flags: 0,
+                    src_inode_id: 0,
+                    dst_inode_id: 0,
+                }),
+                6,
+            ),
+            (
+                JournalEntry::Delete(DeleteEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    path: "/f".into(),
+                    mtime: 1,
+                }),
+                7,
+            ),
+            (
+                JournalEntry::Mount(MountEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    info: MountInfo::default(),
+                }),
+                8,
+            ),
+            (
+                JournalEntry::UnMount(UnMountEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    id: 1,
+                }),
+                9,
+            ),
+            (
+                JournalEntry::SetAttr(SetAttrEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    path: "/f".into(),
+                    opts: SetAttrOpts::default(),
+                }),
+                10,
+            ),
+            (
+                JournalEntry::Symlink(SymlinkEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    link: "/l".into(),
+                    new_inode: file(),
+                    force: false,
+                }),
+                11,
+            ),
+            (
+                JournalEntry::Link(LinkEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    mtime: 1,
+                    src_path: "/a".into(),
+                    dst_path: "/b".into(),
+                }),
+                12,
+            ),
+            (
+                JournalEntry::SetLocks(SetLocksEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    ino: 1,
+                    locks: vec![],
+                }),
+                13,
+            ),
+            (
+                JournalEntry::Free(FreeEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    path: "/f".into(),
+                    mtime: 1,
+                    recursive: false,
+                }),
+                14,
+            ),
+            (
+                JournalEntry::UfsApplied(UfsAppliedEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    term: 1,
+                    index: 1,
+                }),
+                15,
+            ),
+            (
+                JournalEntry::Snapshot(SnapshotEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    node_id: 1,
+                    dir: "/s".into(),
+                }),
+                16,
+            ),
+            (
+                JournalEntry::CacheInvalidation(CacheInvalidationEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    inodes: vec![],
+                }),
+                17,
+            ),
+            // Cache-mode block appended at the tail (task #3 phase 1c).
+            (
+                JournalEntry::CacheIdReserve(CacheIdReserveEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    token: token(),
+                    start: 1,
+                    end: 2,
+                }),
+                18,
+            ),
+            (
+                JournalEntry::CacheIncarnationAllocate(CacheIncarnationAllocateEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    token: token(),
+                    mount_id: 1,
+                    incarnation: 1,
+                }),
+                19,
+            ),
+            (
+                JournalEntry::CacheIncarnationRevoke(CacheIncarnationRevokeEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    mount_id: 1,
+                    incarnation: 1,
+                }),
+                20,
+            ),
+            (
+                JournalEntry::CacheAllocate(CacheAllocateEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    token: token(),
+                    incarnation: 1,
+                    key: "/k".into(),
+                    entry: CacheEntry {
+                        generation: 1,
+                        state: crate::master::meta::cache::CacheEntryState::Reserved,
+                        object_id: crate::master::meta::cache::BlockIdCodec::CACHE_OBJECT_MIN,
+                        len: 0,
+                        ufs_mtime: 0,
+                        block_size: 64,
+                        expire_at: 0,
+                    },
+                }),
+                21,
+            ),
+            (
+                JournalEntry::CacheCommit(CacheCommitEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    incarnation: 1,
+                    key: "/k".into(),
+                    generation: 1,
+                    expected_object_id: crate::master::meta::cache::BlockIdCodec::CACHE_OBJECT_MIN,
+                    len: 1,
+                    ufs_mtime: 1,
+                    expire_at: 0,
+                }),
+                22,
+            ),
+            (
+                JournalEntry::CacheRemove(CacheRemoveEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    incarnation: 1,
+                    key: "/k".into(),
+                    expected_generation: 1,
+                    new_generation: 2,
+                    expected_object_id: crate::master::meta::cache::BlockIdCodec::CACHE_OBJECT_MIN,
+                }),
+                23,
+            ),
+        ];
+
+        for (entry, expected) in cases {
+            assert_eq!(
+                discriminant(&entry),
+                expected,
+                "bincode variant discriminant moved for {:?}",
+                entry
+            );
         }
     }
 }

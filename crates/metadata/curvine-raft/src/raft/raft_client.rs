@@ -92,6 +92,15 @@ impl RaftClient {
         self.rt.block_on(self.send_propose(data))
     }
 
+    /// Synchronous propose that returns the committed (applied) index from
+    /// the leader's ProposeResponse. This is the sync barrier return value:
+    /// when it returns Ok, the entry is committed AND applied on the leader;
+    /// callers must still re-read committed state (e.g. by idempotency
+    /// token) rather than trusting in-memory pre-apply state.
+    pub fn block_on_send_propose_response(&self, data: Vec<u8>) -> RaftResult<ProposeResponse> {
+        self.rt.block_on(self.send_propose_response(data))
+    }
+
     // Join the cluster.
     pub async fn join_cluster(&self, id: NodeId, addr: &InetAddr) -> RaftResult<()> {
         let change = ConfChange {

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::master::meta::block_id::BlockIdCodec;
 use crate::master::meta::inode::ROOT_INODE_ID;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_runtime::sync::AtomicLong;
@@ -38,31 +39,26 @@ impl InodeId {
 
     pub fn next(&self) -> CommonResult<i64> {
         let id = self.0.next();
-        if id > Self::ID_MASK {
-            err_box!("inode id exceeds maximum value {}", Self::ID_MASK)
+        if id > BlockIdCodec::FS_INODE_MAX {
+            err_box!(
+                "inode id exceeds maximum value {}",
+                BlockIdCodec::FS_INODE_MAX
+            )
         } else {
             Ok(id)
         }
     }
 
     pub fn create_block_id(id: i64, seq: i64) -> CommonResult<i64> {
-        if id > Self::ID_MASK {
-            return err_box!("inode id exceeds maximum value {}", Self::ID_MASK);
-        }
-        if seq > Self::SEQ_MASK {
-            return err_box!("seq id exceeds maximum value {}", Self::SEQ_MASK);
-        }
-
-        let block_id = ((id & Self::ID_MASK) << Self::SEQ_BYTES) | (seq & Self::SEQ_MASK);
-        Ok(block_id)
+        BlockIdCodec::encode_block_id(id, seq)
     }
 
     pub fn get_id(id: i64) -> i64 {
-        (id >> Self::SEQ_BYTES) & Self::ID_MASK
+        BlockIdCodec::get_owner(id)
     }
 
     pub fn get_seq(id: i64) -> i64 {
-        id & Self::SEQ_MASK
+        BlockIdCodec::get_seq(id)
     }
 
     pub fn is_root(id: i64) -> bool {
@@ -74,6 +70,16 @@ impl InodeId {
     }
 
     pub fn reset(&self, new_value: i64) -> CommonResult<()> {
+        if new_value < ROOT_INODE_ID {
+            return err_box!("inode id watermark below root: {}", new_value);
+        }
+        if new_value > BlockIdCodec::FS_INODE_MAX {
+            return err_box!(
+                "inode id watermark above fs domain end {}: {}",
+                BlockIdCodec::FS_INODE_MAX,
+                new_value
+            );
+        }
         loop {
             let c = self.current();
             if new_value < c {

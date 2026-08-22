@@ -12,8 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod cache;
 pub mod feature;
 pub mod inode;
+
+mod block_id;
+pub use self::block_id::{BlockIdCodec, CacheBlockLayout, CacheObjectId};
 
 mod fs_dir;
 pub(crate) use self::fs_dir::CacheInvalidationResult;
