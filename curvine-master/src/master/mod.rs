@@ -49,6 +49,8 @@ pub use curvine_data_transfer::RpcContext;
 
 pub mod mount;
 
+pub mod cache;
+
 pub mod quota;
 pub use self::quota::*;
 

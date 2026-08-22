@@ -71,6 +71,7 @@ pub struct MasterFilesystem {
     pub worker_manager: SyncWorkerManager,
     pub master_monitor: MasterMonitor,
     pub conf: Arc<MasterConf>,
+    pub cache_service: Arc<crate::master::cache::CacheService>,
     full_block_reports: Arc<Mutex<HashMap<u32, FullBlockReportState>>>,
     full_block_reconciles: Arc<Mutex<HashMap<u32, FullBlockReconcileState>>>,
     full_block_reconcile_executor: Arc<GroupExecutor>,
@@ -165,7 +166,13 @@ impl MasterFilesystem {
         worker_manager: SyncWorkerManager,
         master_monitor: MasterMonitor,
     ) -> Self {
+        let journal_writer = fs_dir.read().journal_writer.clone();
         Self {
+            cache_service: Arc::new(crate::master::cache::CacheService::new(
+                fs_dir.clone(),
+                journal_writer,
+                master_monitor.clone(),
+            )),
             fs_dir,
             worker_manager,
             master_monitor,
@@ -181,8 +188,15 @@ impl MasterFilesystem {
     }
 
     pub fn with_js(conf: &ClusterConf, js: &JournalSystem) -> Self {
+        let fs_dir = js.fs().fs_dir.clone();
+        let journal_writer = fs_dir.read().journal_writer.clone();
         Self {
-            fs_dir: js.fs().fs_dir.clone(),
+            cache_service: Arc::new(crate::master::cache::CacheService::new(
+                fs_dir.clone(),
+                journal_writer,
+                js.master_monitor(),
+            )),
+            fs_dir,
             worker_manager: js.worker_manager(),
             master_monitor: js.master_monitor(),
             conf: Arc::new(conf.master.clone()),

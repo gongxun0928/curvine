@@ -1,0 +1,89 @@
+// Cache-mode metadata RPC surface (dual-mode metadata split, Phase 2).
+//
+// Wire contract highlights (task #4 milestone 4a):
+// - The client never supplies an object id; CacheAllocate hands out ids
+//   minted by the leader-only segment issuer.
+// - CacheCommit locations must cover the derived block layout exactly:
+//   one location entry per block, sequence-ordered, no gaps/duplicates.
+// - CacheGet is whole-object: any missing block location is a miss and
+//   the caller falls back to the UFS.
+
+syntax = "proto2";
+package proto;
+
+option java_package = "io.curvine.proto";
+option java_multiple_files = true;
+option java_outer_classname = "CacheProto";
+
+import "common.proto";
+
+message CacheOpTokenProto {
+    required uint64 client_id = 1;
+    required uint64 op_seq = 2;
+}
+
+message CacheBlockLocationProto {
+    required int64 block_id = 1;
+    required int64 block_len = 2;
+    repeated BlockLocationProto workers = 3;
+}
+
+message CacheGetRequest {
+    required uint64 incarnation = 1;
+    required string key = 2;
+}
+
+message CacheGetResponse {
+    optional bool hit = 1 [default = false];
+    optional int64 object_id = 2;
+    optional int64 file_len = 3;
+    optional int64 block_size = 4;
+    repeated CacheBlockLocationProto blocks = 5;
+}
+
+message CacheAllocateRequest {
+    required CacheOpTokenProto token = 1;
+    required uint64 incarnation = 2;
+    required string key = 3;
+    required int64 block_size = 4;
+    optional int64 ttl_ms = 5 [default = 0];
+}
+
+message CacheAllocateResponse {
+    required int64 object_id = 1;
+    required uint64 generation = 2;
+}
+
+message CacheCommitRequest {
+    required uint64 incarnation = 1;
+    required string key = 2;
+    required uint64 generation = 3;
+    required int64 object_id = 4;
+    required int64 file_len = 5;
+    required int64 ufs_mtime = 6;
+    optional int64 ttl_ms = 7 [default = 0];
+    repeated CacheBlockLocationProto blocks = 8;
+}
+
+message CacheCommitResponse {
+}
+
+message CacheInvalidateRequest {
+    required uint64 incarnation = 1;
+    required string key = 2;
+    required uint64 expected_generation = 3;
+    required int64 expected_object_id = 4;
+}
+
+message CacheInvalidateResponse {
+}
+
+message CacheRemoveRequest {
+    required uint64 incarnation = 1;
+    required string key = 2;
+    required uint64 expected_generation = 3;
+    required int64 expected_object_id = 4;
+}
+
+message CacheRemoveResponse {
+}

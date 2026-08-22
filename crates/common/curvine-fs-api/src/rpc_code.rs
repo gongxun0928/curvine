@@ -83,6 +83,13 @@ pub enum RpcCode {
 
     MetricsReport = 60,
 
+    // cache-mode metadata interface (dual-mode metadata split, phase 2).
+    CacheGet = 55,
+    CacheAllocate = 56,
+    CacheCommit = 57,
+    CacheInvalidate = 58,
+    CacheRemove = 59,
+
     // block interface.
     WriteBlock = 80,
     ReadBlock = 81,

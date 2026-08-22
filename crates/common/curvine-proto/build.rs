@@ -26,6 +26,7 @@ fn main() {
         "job.proto",
         "transfer.proto",
         "mount.proto",
+        "cache.proto",
         "replication.proto",
     ];
 

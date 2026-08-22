@@ -837,6 +837,131 @@ impl MasterHandler {
         ctx.response(rep_header)
     }
 
+    // ---- cache-mode metadata interface (dual-mode split, phase 2). All
+    // durable mutations go through the sync-propose barrier inside
+    // CacheService; the handler is a thin wire adapter.
+
+    fn cache_block_location_to_pb(
+        block: crate::master::cache::CacheBlockLocation,
+    ) -> CacheBlockLocationProto {
+        CacheBlockLocationProto {
+            block_id: block.block_id,
+            block_len: block.block_len,
+            workers: block
+                .workers
+                .into_iter()
+                .map(ProtoUtils::block_location_to_pb)
+                .collect(),
+        }
+    }
+
+    fn cache_block_location_from_pb(
+        block: CacheBlockLocationProto,
+    ) -> crate::master::cache::CacheBlockLocation {
+        crate::master::cache::CacheBlockLocation {
+            block_id: block.block_id,
+            block_len: block.block_len,
+            workers: block
+                .workers
+                .into_iter()
+                .map(ProtoUtils::block_location_from_pb)
+                .collect(),
+        }
+    }
+
+    fn cache_get(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let request: CacheGetRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(request.key.to_string()), None);
+
+        let result = self
+            .fs
+            .cache_service
+            .get(request.incarnation, &request.key)?;
+        let mut rep = CacheGetResponse::default();
+        if let Some(hit) = result {
+            rep.hit = Some(true);
+            rep.object_id = Some(hit.object_id);
+            rep.file_len = Some(hit.len);
+            rep.block_size = Some(hit.block_size);
+            rep.blocks = hit
+                .blocks
+                .into_iter()
+                .map(Self::cache_block_location_to_pb)
+                .collect();
+        }
+        ctx.response(rep)
+    }
+
+    fn cache_allocate(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let request: CacheAllocateRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(request.key.to_string()), None);
+
+        let token = crate::master::meta::cache::OpToken {
+            client_id: request.token.client_id,
+            op_seq: request.token.op_seq,
+        };
+        let (object_id, generation) = self.fs.cache_service.allocate(
+            token,
+            request.incarnation,
+            &request.key,
+            request.block_size,
+        )?;
+        ctx.response(CacheAllocateResponse {
+            object_id,
+            generation,
+        })
+    }
+
+    fn cache_commit(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let request: CacheCommitRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(request.key.to_string()), None);
+
+        let blocks = request
+            .blocks
+            .into_iter()
+            .map(Self::cache_block_location_from_pb)
+            .collect();
+        self.fs
+            .cache_service
+            .commit(crate::master::cache::CacheCommitParams {
+                incarnation: request.incarnation,
+                key: &request.key,
+                generation: request.generation,
+                object_id: request.object_id,
+                len: request.file_len,
+                ufs_mtime: request.ufs_mtime,
+                ttl_ms: request.ttl_ms.unwrap_or(0),
+                blocks,
+            })?;
+        ctx.response(CacheCommitResponse::default())
+    }
+
+    fn cache_invalidate(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let request: CacheInvalidateRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(request.key.to_string()), None);
+
+        self.fs.cache_service.invalidate(
+            request.incarnation,
+            &request.key,
+            request.expected_generation,
+            request.expected_object_id,
+        )?;
+        ctx.response(CacheInvalidateResponse::default())
+    }
+
+    fn cache_remove(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let request: CacheRemoveRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(request.key.to_string()), None);
+
+        self.fs.cache_service.invalidate(
+            request.incarnation,
+            &request.key,
+            request.expected_generation,
+            request.expected_object_id,
+        )?;
+        ctx.response(CacheRemoveResponse::default())
+    }
+
     fn get_mount_table(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let _: GetMountTableRequest = ctx.parse_header()?;
         let table = self.mount_manager.get_mount_table()?;
@@ -1091,6 +1216,13 @@ impl MessageHandler for MasterHandler {
                 RpcCode::UnMount => self.umount(ctx),
                 RpcCode::GetMountTable => self.get_mount_table(ctx),
                 RpcCode::GetMountInfo => self.get_mount_info(ctx),
+
+                // Cache-mode metadata interface.
+                RpcCode::CacheGet => self.cache_get(ctx),
+                RpcCode::CacheAllocate => self.cache_allocate(ctx),
+                RpcCode::CacheCommit => self.cache_commit(ctx),
+                RpcCode::CacheInvalidate => self.cache_invalidate(ctx),
+                RpcCode::CacheRemove => self.cache_remove(ctx),
 
                 RpcCode::MetricsReport => self.metrics_report(ctx),
 

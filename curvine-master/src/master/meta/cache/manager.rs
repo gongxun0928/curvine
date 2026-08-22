@@ -83,6 +83,15 @@ impl CacheManager {
         self.object_ids.current()
     }
 
+    /// Leader-only issuance: consume the next object id from the volatile
+    /// allocator. Uniqueness and in-segment monotonicity are guaranteed by
+    /// the caller holding the service issue lock; the durable fence (id
+    /// must be <= the committed reserve watermark) is enforced by the
+    /// committed allocate apply.
+    pub fn next_object_id(&self) -> CommonResult<i64> {
+        self.object_ids.next()
+    }
+
     pub fn current_incarnation(&self) -> u64 {
         self.incarnations.get() as u64
     }
