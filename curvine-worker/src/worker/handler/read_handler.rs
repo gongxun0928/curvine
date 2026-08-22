@@ -184,9 +184,23 @@ impl ReadHandler {
         let file = try_option_mut!(self.file);
         let context = try_option_mut!(self.context);
 
+        // Optional demand-aware length. Newer clients send offset + read_len on
+        // every Running read; legacy clients send no header (or header without
+        // read_len) and keep the fixed Open-time chunk_size frame.
+        let mut read_len: Option<i64> = None;
         if msg.header_len() > 0 {
             let header: DataHeaderProto = msg.parse_header()?;
             file.seek_to(header.offset)?;
+            if let Some(len) = header.read_len {
+                if len <= 0 || len > Self::MAX_READ_AHEAD {
+                    return err_box!(
+                        "Invalid read_len: {}, allowed range is (0, {}]",
+                        len,
+                        Self::MAX_READ_AHEAD
+                    );
+                }
+                read_len = Some(len);
+            }
         }
 
         let spend = TimeSpent::new();
@@ -195,7 +209,17 @@ impl ReadHandler {
         }
 
         let enable_send_file = self.enable_send_file && file.supports_send_file();
-        let region = file.read_region(enable_send_file, context.chunk_size)?;
+        let frame_len = read_len.unwrap_or(context.chunk_size as i64);
+        let start_pos = file.block_pos();
+        let region = file.read_region(enable_send_file, frame_len as i32)?;
+
+        // Maintain OS read-ahead continuity by the ACTUAL returned frame end so
+        // variable-sized frames (read_len) are still classified as sequential
+        // when contiguous. Judging by the Open-time chunk_size would misclassify
+        // every read after a large frame as random and silently drop fadvise.
+        if let Some(task) = self.last_task.as_mut() {
+            task.record_served(start_pos, region.len() as i64);
+        }
 
         let used = spend.used_us();
         if used >= self.io_slow_us {

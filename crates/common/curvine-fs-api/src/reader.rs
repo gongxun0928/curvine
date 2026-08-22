@@ -49,10 +49,23 @@ pub trait Reader {
 
     fn read_chunk0(&mut self) -> impl Future<Output = FsResult<DataSlice>>;
 
+    /// Demand-aware frame fetch: like `read_chunk0`, but `Some(demand)` tells
+    /// the underlying reader the caller's real current demand in bytes, so a
+    /// demand larger than the default chunk can be served by one large frame
+    /// instead of many chunk_size frames (fewer RTTs). Demands at or below
+    /// the default chunk size must keep the existing behavior. The default
+    /// implementation ignores the hint.
+    fn read_chunk0_demand(
+        &mut self,
+        _demand: Option<usize>,
+    ) -> impl Future<Output = FsResult<DataSlice>> {
+        async move { self.read_chunk0().await }
+    }
+
     fn read_chunk(&mut self, len: Option<usize>) -> impl Future<Output = FsResult<DataSlice>> {
         async move {
             if self.chunk_mut().is_empty() {
-                *self.chunk_mut() = self.read_chunk0().await?;
+                *self.chunk_mut() = self.read_chunk0_demand(len).await?;
             }
 
             let read_len = match len {

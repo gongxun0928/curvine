@@ -1,7 +1,7 @@
 use curvine_proto::{
     BlockReadRequest, BlockWriteRequest, BlocksBatchCommitRequest, BlocksBatchWriteRequest,
-    ComponentInfoProto, ExtendedBlockProto, FileTypeProto, FileWriteData, FilesBatchWriteRequest,
-    StorageTypeProto,
+    ComponentInfoProto, DataHeaderProto, ExtendedBlockProto, FileTypeProto, FileWriteData,
+    FilesBatchWriteRequest, StorageTypeProto,
 };
 use prost::Message;
 
@@ -425,4 +425,64 @@ fn test_dataplane_unknown_high_fields_are_skipped() {
     let decoded = BlockWriteRequest::decode(encoded.as_slice()).unwrap();
     assert_eq!(decoded.component_info, req.component_info);
     assert_eq!(decoded.client_name, "client-1");
+}
+
+// ---------------------------------------------------------------------------
+// DataHeaderProto.read_len (field 4): demand-aware read frames.
+// ---------------------------------------------------------------------------
+
+/// The exact header a pre-change client sent: fields 1-3 only, no read_len.
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct LegacyDataHeaderProto {
+    #[prost(int64, required, tag = "1")]
+    offset: i64,
+    #[prost(bool, required, tag = "2")]
+    flush: bool,
+    #[prost(bool, required, tag = "3")]
+    is_last: bool,
+}
+
+#[test]
+fn test_data_header_legacy_client_new_worker() {
+    // Old client -> new worker: read_len must decode as None so the worker
+    // falls back to the Open-time chunk_size frame.
+    let legacy = LegacyDataHeaderProto {
+        offset: 4096,
+        flush: false,
+        is_last: false,
+    };
+    let decoded = DataHeaderProto::decode(legacy.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(decoded.offset, 4096);
+    assert!(!decoded.flush);
+    assert!(!decoded.is_last);
+    assert!(decoded.read_len.is_none());
+}
+
+#[test]
+fn test_data_header_new_client_legacy_worker() {
+    // New client -> old worker: the legacy worker skips unknown field 4 and
+    // still decodes the header; it answers with its fixed Open-time frame and
+    // the client advances by the actually received length.
+    let header = DataHeaderProto {
+        offset: 1048576,
+        flush: false,
+        is_last: false,
+        read_len: Some(1024 * 1024),
+    };
+    let legacy = LegacyDataHeaderProto::decode(header.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(legacy.offset, 1048576);
+    assert!(!legacy.flush);
+    assert!(!legacy.is_last);
+}
+
+#[test]
+fn test_data_header_read_len_round_trip() {
+    let header = DataHeaderProto {
+        offset: 0,
+        flush: false,
+        is_last: false,
+        read_len: Some(256 * 1024),
+    };
+    let decoded = DataHeaderProto::decode(header.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(decoded, header);
 }

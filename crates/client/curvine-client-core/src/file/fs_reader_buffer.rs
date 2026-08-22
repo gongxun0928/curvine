@@ -26,8 +26,10 @@ use curvine_runtime::sync::channel::{
 };
 use curvine_runtime::sync::ErrorMonitor;
 use log::error;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::Permit;
+use tokio::sync::Notify;
 
 // Control task type
 enum ReadTask {
@@ -36,9 +38,56 @@ enum ReadTask {
     Pause((i64, bool)),
 }
 
-enum SelectTask<'a> {
-    Control(ReadTask),
-    Permit(Permit<'a, FileChunk>),
+/// Byte-budgeted prefetch window shared between one lane's producer task and
+/// its consumer. The producer reserves bytes before fetching a frame; the
+/// consumer releases them once the frame is fully consumed (the caller only
+/// pulls the next frame after its buffer is empty), discarded on seek, or at
+/// completion. One lane therefore holds at most `window` bytes across queued,
+/// in-flight, and currently buffered data, independent of the frame size —
+/// message-count capacity alone would let 1 MiB frames inflate the lane to
+/// 8 MiB.
+struct ByteBudget {
+    window: i64,
+    used: AtomicI64,
+    notify: Notify,
+}
+
+impl ByteBudget {
+    fn new(window: i64) -> Self {
+        Self {
+            window,
+            used: AtomicI64::new(0),
+            notify: Notify::new(),
+        }
+    }
+
+    /// Non-blocking reserve of up to `want` bytes. Returns `None` when fewer
+    /// than `floor` bytes are free. `want` must be >= floor >= 1.
+    fn try_acquire(&self, want: i64, floor: i64) -> Option<i64> {
+        let mut cur = self.used.load(Ordering::Acquire);
+        loop {
+            let take = want.min(self.window - cur);
+            if take < floor {
+                return None;
+            }
+            match self.used.compare_exchange_weak(
+                cur,
+                cur + take,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(take),
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    fn release(&self, n: i64) {
+        if n > 0 {
+            self.used.fetch_sub(n, Ordering::AcqRel);
+            self.notify.notify_waiters();
+        }
+    }
 }
 
 struct PrefetchArgs {
@@ -46,6 +95,15 @@ struct PrefetchArgs {
     reader: FsReaderParallel,
     chunk_sender: AsyncSender<FileChunk>,
     task_receiver: AsyncReceiver<ReadTask>,
+    budget: Arc<ByteBudget>,
+    /// First-frame length: the real demand that started this lane (when it
+    /// exceeds chunk_size) or chunk_size. Keeps a small foreground read from
+    /// waiting on a large first response.
+    initial_len: i64,
+    /// Client local delivery unit / legacy fallback frame size.
+    chunk_size: i64,
+    /// Coalesced sequential transfer target for subsequent frames.
+    target: i64,
 }
 
 // A parallel task description structure
@@ -56,6 +114,11 @@ struct BufferChannel {
     chunk_receiver: AsyncReceiver<FileChunk>,
     task_sender: AsyncSender<ReadTask>,
     err_monitor: Arc<ErrorMonitor<FsError>>,
+    budget: Arc<ByteBudget>,
+    /// Bytes of the most recently received frame still counted against the
+    /// budget. Released when the frame is fully consumed, on seek, or at
+    /// completion — never while the bytes are still buffered for the caller.
+    held: i64,
 }
 
 impl BufferChannel {
@@ -63,18 +126,33 @@ impl BufferChannel {
         self.err_monitor.take_error().unwrap_or(e.into())
     }
 
-    fn start_prefetch(&mut self) {
-        let Some(args) = self.prefetch.take() else {
+    /// Start the prefetch task on the first read. `demand` is the caller's
+    /// real current demand in bytes (<= 0 means unknown, keep chunk_size).
+    fn start_prefetch(&mut self, demand: i64) {
+        let Some(mut args) = self.prefetch.take() else {
             return;
         };
+
+        // A real demand larger than chunk_size lifts the first frame so the
+        // foreground caller does not wait on a small first response.
+        if demand > args.chunk_size {
+            args.initial_len = demand.min(args.target);
+        }
 
         let monitor = self.err_monitor.clone();
         let parallel_id = args.reader.parallel_id();
 
         args.rt.spawn(async move {
-            let res =
-                FsReaderBuffer::read_future(args.chunk_sender, args.task_receiver, args.reader)
-                    .await;
+            let res = FsReaderBuffer::read_future(
+                args.chunk_sender,
+                args.task_receiver,
+                args.budget,
+                args.initial_len,
+                args.chunk_size,
+                args.target,
+                args.reader,
+            )
+            .await;
             match res {
                 Ok(_) => {}
                 Err(e) => {
@@ -85,18 +163,39 @@ impl BufferChannel {
         });
     }
 
-    async fn read(&mut self) -> FsResult<FileChunk> {
-        self.start_prefetch();
+    /// Release the budget held for the frame currently buffered for the
+    /// caller. Called when that frame is fully consumed, on seek, and at
+    /// completion — never while the bytes are still buffered.
+    fn release_held(&mut self) {
+        if self.held > 0 {
+            self.budget.release(self.held);
+            self.held = 0;
+        }
+    }
 
-        self.chunk_receiver
+    async fn read(&mut self, demand: i64) -> FsResult<FileChunk> {
+        self.start_prefetch(demand);
+
+        // The previous frame has been fully consumed by this new read.
+        self.release_held();
+
+        let chunk = self
+            .chunk_receiver
             .recv_check()
             .await
-            .map_err(|e| self.check_error(e))
+            .map_err(|e| self.check_error(e))?;
+
+        self.held = chunk.len() as i64;
+        Ok(chunk)
     }
 
     async fn seek(&mut self, pos: i64) -> FsResult<()> {
-        self.start_prefetch();
+        self.start_prefetch(0);
 
+        // Bytes still buffered for the caller are discarded by the seek.
+        self.release_held();
+
+        let budget = self.budget.clone();
         let fun = async {
             // Notify seek and seek will pause data reading.
             let (tx, rx) = CallChannel::channel();
@@ -106,7 +205,10 @@ impl BufferChannel {
             // Clear the buffer data to remove old prefetched data before seek.
             // Both random and sequential reads need to clear buffer after seek,
             // because the prefetched data may be from the old position.
-            while self.chunk_receiver.try_recv()?.is_some() {}
+            // Every discarded frame also releases its byte budget.
+            while let Some(chunk) = self.chunk_receiver.try_recv()? {
+                budget.release(chunk.len() as i64);
+            }
 
             Ok::<(), FsError>(())
         };
@@ -114,6 +216,8 @@ impl BufferChannel {
     }
 
     async fn complete(&mut self) -> FsResult<()> {
+        self.release_held();
+
         if self.prefetch.is_some() {
             // Prefetch task was never started, nothing to stop.
             return Ok(());
@@ -145,10 +249,12 @@ enum ReaderAdapter {
 }
 
 impl ReaderAdapter {
-    async fn read(&mut self) -> FsResult<FileChunk> {
+    /// Demand-aware read: `demand > 0` is the caller's real current demand in
+    /// bytes; `demand <= 0` keeps the default frame behavior.
+    async fn read_demand(&mut self, demand: i64) -> FsResult<FileChunk> {
         match self {
-            ReaderAdapter::Buffer(r) => r.read().await,
-            ReaderAdapter::Base(r) => r.read().await,
+            ReaderAdapter::Buffer(r) => r.read(demand).await,
+            ReaderAdapter::Base(r) => r.read_with_len(demand).await,
         }
     }
 
@@ -188,6 +294,9 @@ pub struct FsReaderBuffer {
 }
 
 impl FsReaderBuffer {
+    /// Coalesced sequential transfer target for background prefetch frames.
+    const SEQ_FETCH_TARGET: i64 = 1024 * 1024;
+
     pub fn new(
         path: Path,
         fs_context: Arc<FsContext>,
@@ -201,6 +310,14 @@ impl FsReaderBuffer {
         let chunk_num = conf.read_chunk_num;
         let chunk_size = conf.read_chunk_size;
         let slice_size = conf.read_slice_size;
+
+        // Byte-budgeted prefetch window: with large frames the message-count
+        // channel capacity alone would let one lane buffer
+        // read_chunk_num * target bytes. Keep the window at the historical
+        // read_chunk_size * read_chunk_num bytes.
+        let chunk_len = chunk_size as i64;
+        let window_bytes = chunk_len.saturating_mul(chunk_num as i64).max(chunk_len);
+        let seq_fetch_len = Self::SEQ_FETCH_TARGET.min(window_bytes);
 
         let pos = 0;
         let len = file_blocks.status.len;
@@ -229,16 +346,23 @@ impl FsReaderBuffer {
             } else {
                 let (chunk_sender, chunk_receiver) = AsyncChannel::new(chunk_num).split();
                 let (task_sender, task_receiver) = AsyncChannel::new(2).split();
+                let budget = Arc::new(ByteBudget::new(window_bytes));
                 let channel = BufferChannel {
                     prefetch: Some(PrefetchArgs {
                         rt: rt.clone(),
                         reader,
                         chunk_sender,
                         task_receiver,
+                        budget: budget.clone(),
+                        initial_len: chunk_len,
+                        chunk_size: chunk_len,
+                        target: seq_fetch_len,
                     }),
                     chunk_receiver,
                     task_sender,
                     err_monitor: err_monitor.clone(),
+                    budget,
+                    held: 0,
                 };
                 ReaderAdapter::Buffer(channel)
             };
@@ -326,12 +450,19 @@ impl FsReaderBuffer {
     }
 
     pub async fn read(&mut self) -> FsResult<DataSlice> {
+        self.read_demand(0).await
+    }
+
+    /// Demand-aware read: `demand > 0` is the caller's real current demand in
+    /// bytes and may be served by one large frame instead of many chunk_size
+    /// frames. `demand <= 0` keeps the default frame behavior.
+    pub async fn read_demand(&mut self, demand: i64) -> FsResult<DataSlice> {
         if !self.has_remaining() {
             return Ok(DataSlice::Empty);
         }
 
         let reader = self.get_reader()?;
-        let mut chunk = reader.read().await?;
+        let mut chunk = reader.read_demand(demand).await?;
 
         // Handle data alignment issues.
         // The chunk read by the underlying reader may be aligned according to chunk_size,
@@ -391,72 +522,192 @@ impl FsReaderBuffer {
         Ok(())
     }
 
+    /// Producer body of one prefetch lane. `next_len` is the frame size the
+    /// lane starts with (chunk_size, or the real demand that started the
+    /// lane); after the first frame, background frames are coalesced to
+    /// `target` bytes, each bounded by the byte budget window.
     async fn read_future(
         chunk_sender: AsyncSender<FileChunk>,
         mut task_receiver: AsyncReceiver<ReadTask>,
+        budget: Arc<ByteBudget>,
+        mut next_len: i64,
+        chunk_size: i64,
+        target: i64,
         mut reader: FsReaderParallel,
     ) -> FsResult<()> {
         let mut paused = false;
         loop {
-            let select_task = if paused {
-                match task_receiver.recv().await {
-                    Some(task) => SelectTask::Control(task),
-                    None => return Ok(()), // control channel closed while paused
-                }
-            } else {
-                tokio::select! {
-                    biased;
+            // Acquire a send permit AND window bytes before fetching the next
+            // frame. Control tasks keep being serviced while waiting, so
+            // seek/stop can never deadlock behind a full window.
+            let mut permit: Option<Permit<'_, FileChunk>> = None;
+            let reserved;
+            {
+                // Register the budget waiter BEFORE each check so a release
+                // between check and wait cannot be missed.
+                let notified = budget.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
 
-                    task_opt = task_receiver.recv() => {
-                        match task_opt {
-                            Some(task) => SelectTask::Control(task),
-                            None => return Ok(()), // control channel closed: normal shutdown
+                loop {
+                    if paused {
+                        // Fetching was paused by a control task: release any
+                        // held send permit and wait for the next control task.
+                        if let Some(p) = permit.take() {
+                            drop(p);
+                        }
+                        match task_receiver.recv().await {
+                            Some(task) => {
+                                if Self::handle_control(
+                                    task,
+                                    &mut reader,
+                                    &mut paused,
+                                    &mut next_len,
+                                    chunk_size,
+                                )
+                                .await?
+                                {
+                                    return Ok(());
+                                }
+                                continue;
+                            }
+                            None => return Ok(()), // control channel closed while paused
                         }
                     }
 
-                    permit_res = chunk_sender.reserve() => {
-                        match permit_res {
-                            Ok(permit) => SelectTask::Permit(permit),
-                            Err(_e) => return Ok(()), // data channel closed: normal shutdown
+                    if permit.is_none() {
+                        tokio::select! {
+                            biased;
+
+                            task_opt = task_receiver.recv() => {
+                                match task_opt {
+                                    Some(task) => {
+                                        if Self::handle_control(
+                                            task,
+                                            &mut reader,
+                                            &mut paused,
+                                            &mut next_len,
+                                            chunk_size,
+                                        )
+                                        .await?
+                                        {
+                                            return Ok(());
+                                        }
+                                        continue;
+                                    }
+                                    None => return Ok(()), // control channel closed: normal shutdown
+                                }
+                            }
+
+                            permit_res = chunk_sender.reserve() => {
+                                match permit_res {
+                                    Ok(p) => permit = Some(p),
+                                    Err(_e) => return Ok(()), // data channel closed: normal shutdown
+                                }
+                            }
                         }
                     }
-                }
-            };
 
-            match select_task {
-                SelectTask::Control(task) => match task {
-                    ReadTask::Seek(pos, tx) => {
-                        // 1. reader executes seek
-                        // 2. Set paused = true
-                        // 3. The notification pause was successful
-                        paused = true;
-                        reader.seek(pos).await?;
-                        tx.send(1)?;
+                    // Permit held: reserve window bytes. The floor is
+                    // chunk_size so a fragmented window still admits a
+                    // default-sized frame.
+                    if let Some(take) = budget.try_acquire(next_len, next_len.min(chunk_size)) {
+                        reserved = take;
+                        break;
                     }
 
-                    ReadTask::Pause((pos, v)) => {
-                        paused = v;
-                        reader.seek(pos).await?;
-                    }
+                    // Window full: wait for a consumer release or a control
+                    // task. Holding the permit here is safe — the consumer
+                    // frees budget exactly by draining the queue.
+                    tokio::select! {
+                        biased;
 
-                    ReadTask::Stop(tx) => {
-                        reader.complete().await?;
-                        tx.send(1)?;
-                        return Ok(());
-                    }
-                },
+                        task_opt = task_receiver.recv() => {
+                            match task_opt {
+                                Some(task) => {
+                                    if Self::handle_control(
+                                        task,
+                                        &mut reader,
+                                        &mut paused,
+                                        &mut next_len,
+                                        chunk_size,
+                                    )
+                                    .await?
+                                    {
+                                        return Ok(());
+                                    }
+                                    continue;
+                                }
+                                None => return Ok(()), // control channel closed: normal shutdown
+                            }
+                        }
 
-                SelectTask::Permit(permit) => {
-                    // paused is guaranteed false here (paused branch never yields a Permit).
-                    let chunk = reader.read().await?;
-                    if chunk.is_empty() {
-                        paused = true;
+                        _ = &mut notified => {
+                            notified.set(budget.notify.notified());
+                            notified.as_mut().enable();
+                        }
                     }
-                    // Send the chunk (possibly empty) so the reader side does not block.
-                    permit.send(chunk);
                 }
             }
+
+            let permit = match permit {
+                Some(p) => p,
+                // paused is guaranteed false here (paused branch never yields a Permit)
+                None => unreachable!("acquired budget without a permit"),
+            };
+
+            let chunk = reader.read_with_len(reserved).await?;
+            if chunk.is_empty() {
+                paused = true;
+            }
+            // Return over-reservation (short frame, EOF, or a legacy worker
+            // falling back to its fixed frame) so the window does not leak.
+            let slack = reserved - chunk.len() as i64;
+            if slack > 0 {
+                budget.release(slack);
+            }
+            // Send the chunk (possibly empty) so the reader side does not block.
+            permit.send(chunk);
+
+            // After the first frame, coalesce background prefetch to target.
+            if !paused {
+                next_len = target;
+            }
         }
+    }
+
+    /// Handle one control task. Returns `true` when the lane must stop.
+    async fn handle_control(
+        task: ReadTask,
+        reader: &mut FsReaderParallel,
+        paused: &mut bool,
+        next_len: &mut i64,
+        chunk_size: i64,
+    ) -> FsResult<bool> {
+        match task {
+            ReadTask::Seek(pos, tx) => {
+                // 1. reader executes seek
+                // 2. Set paused = true
+                // 3. The notification pause was successful
+                *paused = true;
+                *next_len = chunk_size;
+                reader.seek(pos).await?;
+                tx.send(1)?;
+            }
+
+            ReadTask::Pause((pos, v)) => {
+                *paused = v;
+                *next_len = chunk_size;
+                reader.seek(pos).await?;
+            }
+
+            ReadTask::Stop(tx) => {
+                reader.complete().await?;
+                tx.send(1)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -465,6 +716,25 @@ mod tests {
     use super::*;
     use curvine_config::ClusterConf;
     use curvine_model::FileStatus;
+
+    #[test]
+    fn test_byte_budget_try_acquire_release() {
+        let budget = ByteBudget::new(1000);
+
+        assert_eq!(budget.try_acquire(600, 600), Some(600));
+        // Partial grant: only 400 bytes free, floor 400 is satisfied.
+        assert_eq!(budget.try_acquire(500, 400), Some(400));
+        // Window exhausted: even a default-sized frame cannot be admitted.
+        assert_eq!(budget.try_acquire(500, 400), None);
+        assert_eq!(budget.try_acquire(100, 100), None);
+
+        // Releasing consumed bytes unblocks a floor-sized frame.
+        budget.release(400);
+        assert_eq!(budget.try_acquire(500, 400), Some(400));
+
+        // Zero release is a no-op.
+        budget.release(0);
+    }
 
     fn sparse_file_blocks(len: i64) -> FileBlocks {
         FileBlocks::new(

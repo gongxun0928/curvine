@@ -215,6 +215,7 @@ impl BlockReaderLocal {
     }
 
     pub async fn read(&mut self) -> FsResult<DataSlice> {
+        let start_pos = self.file.as_ref().pos();
         let mut chunk = self.get_chunk()?;
         let file = self.file.clone();
 
@@ -230,16 +231,27 @@ impl BlockReaderLocal {
                 Ok::<BytesMut, FsError>(chunk)
             })
             .await??;
+
+        // Track the actual served end so OS read-ahead continuity survives
+        // variable-sized frames.
+        if let Some(task) = self.last_task.as_mut() {
+            task.record_served(start_pos, chunk.len() as i64);
+        }
         Ok(DataSlice::buffer(chunk))
     }
 
     pub fn blocking_read(&mut self) -> FsResult<DataSlice> {
+        let start_pos = self.file.as_ref().pos();
         let mut chunk = self.get_chunk()?;
         self.last_task = self
             .file
             .as_mut()
             .read_ahead(&self.os_cache, self.last_task.take());
         self.file.as_mut().read_all(&mut chunk)?;
+
+        if let Some(task) = self.last_task.as_mut() {
+            task.record_served(start_pos, chunk.len() as i64);
+        }
         Ok(DataSlice::buffer(chunk))
     }
 

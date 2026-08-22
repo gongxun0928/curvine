@@ -42,6 +42,16 @@ impl ReaderAdapter {
         }
     }
 
+    /// Demand-aware read: only the remote reader benefits from a larger frame
+    /// (one RTT per Running response). Local and hole readers keep their
+    /// default chunk behavior — there is no network RTT to amortize.
+    async fn read_with_len(&mut self, fetch_len: i64) -> FsResult<DataSlice> {
+        match self {
+            Remote(r) => r.read_with_len(fetch_len).await,
+            _ => self.read().await,
+        }
+    }
+
     #[allow(unused)]
     fn blocking_read(&mut self, rt: &Runtime) -> FsResult<DataSlice> {
         match self {
@@ -234,13 +244,27 @@ impl BlockReader {
 
     // Based on network transmission efficiency considerations, the data size of the underlying tcp is fixed each time.
     pub async fn read(&mut self) -> FsResult<DataSlice> {
+        self.read_frame(0).await
+    }
+
+    /// Demand-aware read: `fetch_len > 0` asks the remote worker for a single
+    /// response of up to that many bytes (bounded by block remaining and the
+    /// worker's frame limit). `fetch_len <= 0` keeps the legacy fixed frame.
+    /// Worker failover reopens at the first byte not yet delivered; already
+    /// returned bytes stay committed.
+    pub async fn read_frame(&mut self, fetch_len: i64) -> FsResult<DataSlice> {
         if !self.has_remaining() {
             // end of block file
             return Ok(DataSlice::empty());
         }
 
         loop {
-            match self.inner.read().await {
+            let res = if fetch_len > 0 {
+                self.inner.read_with_len(fetch_len).await
+            } else {
+                self.inner.read().await
+            };
+            match res {
                 Ok(v) => return Ok(v),
 
                 Err(e) => {

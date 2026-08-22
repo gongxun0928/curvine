@@ -368,6 +368,7 @@ fn test_worker_batch_remote_write_complete_and_read_back() -> CommonResult<()> {
         offset: 0,
         flush: false,
         is_last: false,
+        read_len: None,
     };
     let non_flush_msg = Builder::new()
         .code(RpcCode::WriteBlock)
@@ -382,6 +383,7 @@ fn test_worker_batch_remote_write_complete_and_read_back() -> CommonResult<()> {
         offset: 0,
         flush: true,
         is_last: false,
+        read_len: None,
     };
     let flush_msg = Builder::new()
         .code(RpcCode::WriteBlock)

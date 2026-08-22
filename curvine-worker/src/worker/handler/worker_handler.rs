@@ -595,6 +595,7 @@ mod tests {
             offset: 0,
             flush: false,
             is_last: false,
+            read_len: None,
         };
         let running = build_msg(RpcCode::WriteBlock, RequestStatus::Running, header);
         assert_eq!(WorkerHandler::extract_component_info(&running), None);
@@ -705,6 +706,7 @@ mod tests {
                 offset: 0,
                 flush: false,
                 is_last: false,
+                read_len: None,
             },
         );
         assert_eq!(WorkerHandler::resolve_connection_peer(&running), None);

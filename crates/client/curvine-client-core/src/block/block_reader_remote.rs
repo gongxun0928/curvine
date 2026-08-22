@@ -33,6 +33,10 @@ pub struct BlockReaderRemote {
 }
 
 impl BlockReaderRemote {
+    /// Mirror of the worker's `ReadHandler::MAX_READ_AHEAD`: the largest frame
+    /// length a worker accepts on a Running read.
+    pub const MAX_READ_LEN: i64 = 16 * 1024 * 1024;
+
     pub async fn new(
         fs_context: &FsContext,
         block: ExtendedBlock,
@@ -115,6 +119,7 @@ impl BlockReaderRemote {
             offset: pos,
             flush: false,
             is_last: false,
+            read_len: None,
         });
         Ok(self.pos)
     }
@@ -128,6 +133,40 @@ impl BlockReaderRemote {
         let header = self.header.take();
         let chunk = self.client.read_data(self.req_id, seq_id, header).await?;
 
+        self.pos += chunk.len() as i64;
+        Ok(chunk)
+    }
+
+    /// Demand-aware read: ask the worker to return up to `fetch_len` bytes in
+    /// this single Running response, starting at the current position. The
+    /// header carries an explicit offset, which also supersedes any pending
+    /// seek header. A legacy worker ignores `read_len` and returns its fixed
+    /// Open-time frame; the position then advances by the actually received
+    /// bytes and the caller loops, so mixed versions stay byte-correct.
+    pub async fn read_with_len(&mut self, fetch_len: i64) -> FsResult<DataSlice> {
+        if self.remaining() <= 0 {
+            return err_box!("No readable data");
+        }
+
+        // Bound the request by what is left in this block and by the worker's
+        // maximum accepted frame length.
+        let fetch_len = fetch_len.clamp(1, Self::MAX_READ_LEN).min(self.remaining());
+        let header = DataHeaderProto {
+            offset: self.pos,
+            flush: false,
+            is_last: false,
+            read_len: Some(fetch_len),
+        };
+        self.header = None;
+
+        let seq_id = self.next_seq_id();
+        let chunk = self
+            .client
+            .read_data(self.req_id, seq_id, Some(header))
+            .await?;
+
+        // Advance only by the actual returned length: a short frame (legacy
+        // worker, block/file tail) is valid progress, not an error.
         self.pos += chunk.len() as i64;
         Ok(chunk)
     }

@@ -69,6 +69,15 @@ message DataHeaderProto {
     required int64 offset = 1;
     required bool flush = 2;
     required bool is_last = 3;
+
+    // Demand-aware read length for Running read requests. Sent by newer
+    // clients that want this single Worker response to carry up to read_len
+    // bytes starting at `offset`. Legacy clients omit the field; a new Worker
+    // treats absence as "use the Open-time chunk_size", and a legacy Worker
+    // ignores the unknown field and returns its fixed Open-time frame (the
+    // client then advances by the actually received length and continues).
+    // Writes never set this field. Valid values on reads: 0 < read_len <= 16MB.
+    optional int64 read_len = 4;
 }
 
 message DeleteBlockCmdProto {

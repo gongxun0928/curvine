@@ -168,13 +168,18 @@ impl Reader for FallbackFsReader {
     }
 
     async fn read_chunk0(&mut self) -> FsResult<DataSlice> {
+        self.read_chunk0_demand(None).await
+    }
+
+    async fn read_chunk0_demand(&mut self, demand: Option<usize>) -> FsResult<DataSlice> {
         // Already fallen back to UFS — read directly, no retry to Curvine.
         if let Some(ufs) = &mut self.ufs_reader {
             return ufs.read_chunk0().await;
         }
 
-        // Try reading from Curvine.
-        match self.cv_reader.read_chunk0().await {
+        // Try reading from Curvine, forwarding the demand hint so a large
+        // read can be served by one large frame.
+        match self.cv_reader.read_chunk0_demand(demand).await {
             Ok(data) => Ok(data),
 
             Err(e) if is_worker_err(&e) => {

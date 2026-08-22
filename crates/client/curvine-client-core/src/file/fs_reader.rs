@@ -107,6 +107,18 @@ impl Reader for FsReader {
         self.metrics.track_read(self.inner.read()).await
     }
 
+    async fn read_chunk0_demand(&mut self, demand: Option<usize>) -> FsResult<DataSlice> {
+        // Only lift the frame size for demands larger than the default chunk;
+        // at or below it, small-IO behavior must stay exactly as before.
+        let demand = match demand {
+            Some(v) if v > self.chunk_size => v as i64,
+            _ => 0,
+        };
+        self.metrics
+            .track_read(self.inner.read_demand(demand))
+            .await
+    }
+
     async fn seek(&mut self, pos: i64) -> FsResult<()> {
         if pos < 0 {
             return err_box!("Cannot seek to negative offset");

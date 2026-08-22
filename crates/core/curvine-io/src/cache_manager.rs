@@ -23,7 +23,26 @@ pub struct ReadAheadTask {
     off: i64,
     len: i64,
     handle: SysResult<CInt>,
-    last_read_off: i64,
+    /// End offset (exclusive) of the most recently served read frame:
+    /// `frame_start + actual_returned_len`. The continuity test for the next
+    /// read is `cur_pos == last_served_end`, which stays correct when transfer
+    /// frames are variable-sized (demand-aware `read_len`). The worker/client
+    /// must call `record_served` after each frame is actually read.
+    last_served_end: i64,
+    /// Whether the access that created this task was classified sequential
+    /// (and therefore issued real read-ahead advice). Kept for tests and
+    /// diagnostics.
+    pub is_sequential: bool,
+}
+
+impl ReadAheadTask {
+    /// Record the end of a served read frame (`start_off + actual_len`) so the
+    /// next continuity test compares against what was actually returned, not a
+    /// fixed frame size. Callers must invoke this after every completed read,
+    /// including short/legacy frames.
+    pub fn record_served(&mut self, start_off: i64, actual_len: i64) {
+        self.last_served_end = start_off.saturating_add(actual_len);
+    }
 }
 
 /// Operating system page cache manager, currently only supports linux。
@@ -69,9 +88,13 @@ impl CacheManager {
     /// # Random Read Detection Strategy
     ///
     /// The method detects random reads by comparing the current read position with
-    /// the expected next position based on the previous read:
-    /// - Sequential read: `cur_pos == last_read_end_pos` (where `last_read_end_pos = last_task.off + chunk_size`)
-    /// - Random read: `cur_pos != last_read_end_pos` (position jump detected)
+    /// the end of the previously served frame:
+    /// - Sequential read: `cur_pos == last_served_end` (frame start + actual returned length)
+    /// - Random read: `cur_pos != last_served_end` (position jump or re-read detected)
+    ///
+    /// Continuity is judged by the ACTUAL bytes served, not by the Open-time
+    /// chunk size, so the classification is independent of transfer frame size
+    /// (demand-aware `read_len` frames may be larger or smaller than chunk_size).
     ///
     /// When a random read is detected, read-ahead is disabled to avoid prefetching
     /// data that is unlikely to be used, reducing unnecessary I/O operations and
@@ -79,17 +102,16 @@ impl CacheManager {
     ///
     /// # Backward Seek Handling
     ///
-    /// When a backward seek is detected (current position < last read position),
-    /// read-ahead is triggered immediately to ensure prefetching works correctly
-    /// after backward seeks. This allows read-ahead to resume properly when reading
-    /// from a previous position.
+    /// When a backward seek is detected (current position < last served end),
+    /// read-ahead advice is suppressed for that access; it resumes once reads
+    /// are contiguous with the served stream again.
     ///
     /// # Arguments
     ///
     /// * `file` - The file handle to perform read-ahead on
     /// * `cur_pos` - Current read position
     /// * `total_len` - Total file length
-    /// * `last_task` - Previous read-ahead task (contains last read position and length)
+    /// * `last_task` - Previous read-ahead task (contains last served end)
     ///
     /// # Returns
     ///
@@ -99,7 +121,7 @@ impl CacheManager {
         file: &File,
         cur_pos: i64,
         total_len: i64,
-        mut last_task: Option<ReadAheadTask>,
+        last_task: Option<ReadAheadTask>,
     ) -> Option<ReadAheadTask> {
         // The file is greater than 256kb, use the read-previous API.It is not necessary to use pre-reading of small files.
         if !self.enable || total_len < LONG_READ_THRESHOLD_LEN {
@@ -109,9 +131,9 @@ impl CacheManager {
 
         // Determine last offset and sequential status, handling backward seeks
         let (last_offset, is_sequential) = match last_task.as_ref() {
-            Some(t) if cur_pos < t.last_read_off => (i64::MIN, false),
+            Some(t) if cur_pos < t.last_served_end => (i64::MIN, false),
 
-            Some(t) => (t.off, t.last_read_off + self.chunk_size == cur_pos),
+            Some(t) => (t.off, t.last_served_end == cur_pos),
 
             None => (i64::MIN, true),
         };
@@ -133,13 +155,13 @@ impl CacheManager {
                     off: cur_pos,
                     len,
                     handle,
-                    last_read_off: cur_pos,
+                    last_served_end: cur_pos,
+                    is_sequential,
                 })
             }
         } else {
-            if let Some(task) = last_task.as_mut() {
-                task.last_read_off = cur_pos
-            }
+            // Frame continuity state (last_served_end) is maintained by the
+            // caller via `record_served` once the actual bytes are returned.
             last_task
         }
     }
@@ -148,5 +170,109 @@ impl CacheManager {
 impl Default for CacheManager {
     fn default() -> Self {
         Self::with_place()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Continuity must be judged by the ACTUAL bytes served, not by the
+    // Open-time chunk size: a demand-aware 512 KiB frame followed by a read
+    // at its end is sequential. With the old fixed-chunk arithmetic
+    // (`last_read_off + chunk_size == cur_pos`) this read was misclassified
+    // as random and read-ahead advice was silently dropped.
+    #[test]
+    fn test_read_ahead_sequential_after_large_frame() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+
+        let dir = std::env::temp_dir().join("cv-cache-manager-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("large-frame-seq.bin");
+        std::fs::write(&path, vec![0u8; 1024 * 1024]).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+
+        // chunk_size = 128 KiB (the default transfer frame), read_ahead 128 KiB
+        // so each new frame position crosses the half-window re-check.
+        let cm = CacheManager::new(true, 128 * 1024, 1024 * 1024, 128 * 1024);
+        assert!(cm.enable);
+
+        // First read at 0: no history, sequential by definition.
+        let t1 = cm.read_ahead(&file, 0, 1024 * 1024, None).unwrap();
+        assert!(t1.is_sequential);
+
+        // A demand-aware frame serves 512 KiB starting at 0.
+        let mut t1 = t1;
+        t1.record_served(0, 512 * 1024);
+
+        // Next read at 512 KiB: crosses off + read_ahead_len/2, so a new task
+        // is created. It must still be classified sequential.
+        let t2 = cm
+            .read_ahead(&file, 512 * 1024, 1024 * 1024, Some(t1))
+            .unwrap();
+        assert!(t2.is_sequential, "large-frame continuation misclassified");
+        assert_eq!(t2.last_served_end, 512 * 1024);
+
+        // Fixed-frame parity: a default 128 KiB frame keeps working too.
+        let mut t2 = t2;
+        t2.record_served(512 * 1024, 128 * 1024);
+        let t3 = cm
+            .read_ahead(&file, 640 * 1024, 1024 * 1024, Some(t2))
+            .unwrap();
+        assert!(t3.is_sequential);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    // A position jump forward past the served end is random: no read-ahead.
+    #[test]
+    fn test_read_ahead_random_jump() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+
+        let dir = std::env::temp_dir().join("cv-cache-manager-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("random-jump.bin");
+        std::fs::write(&path, vec![0u8; 1024 * 1024]).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+
+        let cm = CacheManager::new(true, 512 * 1024, 1024 * 1024, 128 * 1024);
+
+        let t1 = cm.read_ahead(&file, 0, 1024 * 1024, None).unwrap();
+        let mut t1 = t1;
+        t1.record_served(0, 128 * 1024);
+
+        // Jump to 512 KiB: not contiguous with the 128 KiB served end.
+        let t2 = cm
+            .read_ahead(&file, 512 * 1024, 1024 * 1024, Some(t1))
+            .unwrap();
+        assert!(!t2.is_sequential);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    // record_served tracks the actual end including short/EOF frames.
+    #[test]
+    fn test_record_served() {
+        let dir = std::env::temp_dir().join("cv-cache-manager-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("record-served.bin");
+        std::fs::write(&path, vec![0u8; 512 * 1024]).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+
+        let cm = CacheManager::new(true, 256 * 1024, 1024 * 1024, 128 * 1024);
+        let mut t = cm.read_ahead(&file, 0, 512 * 1024, None).unwrap();
+
+        t.record_served(100 * 1024, 3);
+        assert_eq!(t.last_served_end, 100 * 1024 + 3);
+
+        // Empty frame (EOF): end stays at the frame start.
+        t.record_served(200 * 1024, 0);
+        assert_eq!(t.last_served_end, 200 * 1024);
+
+        std::fs::remove_file(&path).ok();
     }
 }

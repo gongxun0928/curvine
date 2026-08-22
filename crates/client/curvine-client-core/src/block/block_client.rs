@@ -190,6 +190,7 @@ impl BlockClient {
             offset: pos,
             flush: true,
             is_last: false,
+            read_len: None,
         };
 
         let msg = Builder::new()

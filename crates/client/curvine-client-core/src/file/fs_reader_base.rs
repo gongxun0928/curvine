@@ -109,6 +109,24 @@ impl FsReaderBase {
         Ok(chunk)
     }
 
+    /// Demand-aware read: fetch up to `fetch_len` bytes in one remote frame
+    /// (clamped by the current block's remaining bytes). The position advances
+    /// by the actual returned length.
+    pub async fn read_with_len(&mut self, fetch_len: i64) -> FsResult<DataSlice> {
+        if !self.has_remaining() {
+            return Ok(DataSlice::empty());
+        }
+
+        let cur_reader = self.get_reader().await?;
+        let chunk = if fetch_len > 0 {
+            cur_reader.read_frame(fetch_len).await?
+        } else {
+            cur_reader.read().await?
+        };
+        self.pos += chunk.len() as i64;
+        Ok(chunk)
+    }
+
     pub fn blocking_read(&mut self, rt: &Runtime) -> FsResult<DataSlice> {
         if self.pos == self.len {
             return Ok(DataSlice::empty());

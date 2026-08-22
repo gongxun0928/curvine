@@ -129,6 +129,13 @@ impl FsReaderParallel {
     }
 
     pub async fn read(&mut self) -> FsResult<FileChunk> {
+        self.read_with_len(0).await
+    }
+
+    /// Demand-aware read: fetch up to `fetch_len` bytes in one frame, clamped
+    /// to the current slice's remaining bytes so one request never crosses
+    /// into a slice owned by another parallel reader.
+    pub async fn read_with_len(&mut self, fetch_len: i64) -> FsResult<FileChunk> {
         match self.cur_idx {
             None => {
                 // To read the first slice, you need to seek to start position.
@@ -151,7 +158,18 @@ impl FsReaderParallel {
         }
 
         let pos = self.inner.pos();
-        let bytes = self.inner.read().await?;
+        let fetch_len = match self.cur_idx {
+            Some(idx) if fetch_len > 0 => {
+                // Cap by the slice end: the final frame of a slice may be short.
+                fetch_len.min(self.alloc_slices[idx].end - pos)
+            }
+            _ => fetch_len,
+        };
+        let bytes = if fetch_len > 0 {
+            self.inner.read_with_len(fetch_len).await?
+        } else {
+            self.inner.read().await?
+        };
         let chunk = FileChunk::new(pos, bytes);
 
         Ok(chunk)
