@@ -1329,21 +1329,37 @@ impl MasterFilesystem {
     /// AFTER the WorkerManager validated the registration (R7-1 order
     /// fix: no accumulator or session state moves on a rejected Start).
     /// Declared order inside the critical section: accumulator control
-    /// first, then the volatile guard. Legacy workers (empty session
-    /// id) skip the session registry entirely — their reports keep the
-    /// FS-only path untouched.
+    /// first, then the volatile guard. A legacy worker (EMPTY session
+    /// id) fail-closes the cache domain instead of skipping it (RC3,
+    /// gpt56 `7ceef2ff` item 3): its accumulator is terminated and any
+    /// current cache session retired — nothing installed in its place —
+    /// so a legacy Start can never inherit or revive a predecessor's
+    /// cache session, and no cache plan/location can reference the
+    /// worker until a non-empty Start reopens.
     pub fn begin_worker_session(&self, address: &WorkerAddress, session: &str) {
         // Accumulator domain first (FS full-report accumulation + any
         // running reconcile for this worker).
         self.reset_full_block_report(address.worker_id);
         if session.is_empty() {
+            self.cache_service
+                .purge_worker_cache_session(address.worker_id);
             return;
         }
         // 4d R9-3: atomic cache-session install — accumulator guard and
         // volatile guard held simultaneously (accumulator first): fresh
         // registry row + fresh accumulator bound to the new session.
-        self.cache_service
-            .begin_cache_session(address.worker_id, session, address);
+        // RC5: a tag-issuer exhaustion is a loud refusal — nothing is
+        // installed and the failure is surfaced (never silently
+        // continued past).
+        if let Err(e) = self
+            .cache_service
+            .begin_cache_session(address.worker_id, session, address)
+        {
+            error!(
+                "cache session install refused for worker {} ({}): {}",
+                address.worker_id, address, e
+            );
+        }
     }
 
     /// 4d (R9-2): an End heartbeat's cache-domain retirement —

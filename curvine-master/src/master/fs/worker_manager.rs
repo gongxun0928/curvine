@@ -95,7 +95,31 @@ impl WorkerManager {
 
             HeartbeatStatus::End => {
                 info!("Worker unregister: {}", addr);
-                let _ = self.worker_map.remove_offline(addr.worker_id);
+                // 4d RC2 (gpt56 `7ceef2ff` item 2): an End is
+                // session-exact in the WorkerManager too. A DELAYED End
+                // from an old process (its Start was already superseded
+                // by a newer process's Start/Running on the same
+                // worker_id) must NOT delete the new row — the WM and
+                // the cache registry would otherwise split (the cache
+                // side no-ops on the stale session while the WM row for
+                // the new session is gone). Only an End whose wire
+                // session matches the stored row's session removes it.
+                let stored_session = self
+                    .worker_map
+                    .workers()
+                    .get(&addr.worker_id)
+                    .map(|w| w.worker_session_id.clone());
+                match stored_session {
+                    Some(current) if current != worker_session_id => {
+                        warn!(
+                            "Ignore stale End from worker {} session {:?}: current session differs",
+                            addr.worker_id, worker_session_id
+                        );
+                    }
+                    _ => {
+                        let _ = self.worker_map.remove_offline(addr.worker_id);
+                    }
+                }
                 return Ok(vec![]);
             }
         };
@@ -330,6 +354,102 @@ mod tests {
         worker.address.worker_id = worker_id;
         worker.available = available;
         worker
+    }
+
+    /// 4d RC2 (gpt56 `7ceef2ff` item 2): an End heartbeat is
+    /// session-exact in the WorkerManager — a DELAYED End from an old
+    /// process must not delete the row a newer process's Start/Running
+    /// installed.
+    #[test]
+    fn end_heartbeat_is_session_exact() {
+        let mut manager = WorkerManager::new(&ClusterConf::default()).unwrap();
+        let cluster_id = manager.cluster_id.clone();
+        let addr = WorkerAddress {
+            worker_id: 1,
+            ..Default::default()
+        };
+
+        // Start(A): validates and clears the slot; inserts nothing.
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Start,
+                addr.clone(),
+                1,
+                "A".to_string(),
+                Default::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert!(!manager.worker_map.workers().contains_key(&1));
+
+        // Running(B): inserts the row bound to session B.
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                addr.clone(),
+                1,
+                "B".to_string(),
+                Default::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            manager
+                .worker_map
+                .workers()
+                .get(&1)
+                .unwrap()
+                .worker_session_id,
+            "B"
+        );
+
+        // Late End(A): zero side effect — the newer session's row
+        // survives (the cache registry side is exact-match too, so both
+        // domains stay consistent).
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::End,
+                addr.clone(),
+                1,
+                "A".to_string(),
+                Default::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert!(
+            manager.worker_map.workers().contains_key(&1),
+            "stale End must not delete the new session's row"
+        );
+
+        // End(B): the matching session removes the row.
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::End,
+                addr.clone(),
+                1,
+                "B".to_string(),
+                Default::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert!(!manager.worker_map.workers().contains_key(&1));
+        assert!(manager.worker_map.lost_workers().contains_key(&1));
     }
 
     #[test]

@@ -2054,6 +2054,10 @@ mod tests {
         // advances on role transitions, and the cache service under test.
         let epoch_ctl = role_monitor.epoch_ctl();
         let cache = fs.cache_service.clone();
+        // Captured before `fs` moves into the job manager: the 4d
+        // epoch-hook seam re-registers the worker's cache session
+        // (leader re-solicit) inside the barrier hook.
+        let hook_fs = fs.clone();
 
         // 4b: grant incarnation 1 an active row so the apply/service
         // fences admit the allocates below (the real issuer path —
@@ -2088,6 +2092,7 @@ mod tests {
         worker.status = WorkerStatus::Live;
         worker.capacity = 1 << 30;
         worker.available = 1 << 30;
+        let worker_addr = worker.address.clone();
         fs.add_test_worker(worker);
 
         let mount_manager = Arc::new(MountManager::new(fs.clone()));
@@ -2117,6 +2122,13 @@ mod tests {
         );
         let mut listener = rt.block_on(raft.run()).unwrap();
         rt.block_on(listener.wait_leader()).unwrap();
+        // 4d RC1: plan fences bind the worker's cache session — the
+        // production equivalent is the worker's Start heartbeat, which
+        // the leader re-solicits after every leadership change (each
+        // cold clear wipes the registry with the epoch advance). This
+        // must run AFTER leadership settles: an earlier registration is
+        // cold-cleared by the epoch advance of the role transition.
+        hook_fs.begin_worker_session(&worker_addr, "raft-test-w1");
 
         const SEG: i64 = 4096; // cache_service::CACHE_RESERVE_SEGMENT
         let min = BlockIdCodec::CACHE_OBJECT_MIN;
@@ -2130,7 +2142,15 @@ mod tests {
         //    first issued id is therefore MIN+SEG, not MIN. (The old code
         //    sampled the epoch once outside the loop and never converged.)
         let hook_ctl = epoch_ctl.clone();
-        cache.set_barrier_hook(Box::new(move || hook_ctl.advance()));
+        let hook_addr = worker_addr.clone();
+        let hook_fs_seam = hook_fs.clone();
+        cache.set_barrier_hook(Box::new(move || {
+            hook_ctl.advance();
+            // Leadership changed: production re-solicits the worker's
+            // Start (the cold clear wiped the registry); replay it so
+            // the retry's fresh plan captures a live session fence.
+            hook_fs_seam.begin_worker_session(&hook_addr, "raft-test-w1");
+        }));
         let a = cache
             .allocate(
                 OpToken {
@@ -2213,6 +2233,7 @@ mod tests {
         //    allocate re-reserves contiguously under the new epoch.
         epoch_ctl.advance();
         assert_ne!(epoch_ctl.value(), epoch_before);
+        hook_fs.begin_worker_session(&worker_addr, "raft-test-w1");
         let c = cache
             .allocate(
                 OpToken {
@@ -2435,6 +2456,10 @@ mod tests {
         )
         .unwrap();
         let cache = fs.cache_service.clone();
+        // 4d RC1: captured before `fs` moves into the job manager —
+        // registers the worker's cache session (Start-heartbeat
+        // stand-in) once leadership settles below.
+        let session_fs = fs.clone();
 
         // One live worker so the production PolicyWorkerChooser can plan.
         let mut worker = WorkerInfo::new(
@@ -2447,6 +2472,7 @@ mod tests {
         worker.status = WorkerStatus::Live;
         worker.capacity = 1 << 30;
         worker.available = 1 << 30;
+        let worker_addr = worker.address.clone();
         fs.add_test_worker(worker);
 
         let mount_manager = Arc::new(MountManager::new(fs.clone()));
@@ -2476,6 +2502,11 @@ mod tests {
         );
         let mut listener = rt.block_on(raft.run()).unwrap();
         rt.block_on(listener.wait_leader()).unwrap();
+        // 4d RC1: plan fences bind the worker's cache session (the
+        // production Start heartbeat); registered AFTER leadership
+        // settles so the role-transition epoch advance cannot
+        // cold-clear it.
+        session_fs.begin_worker_session(&worker_addr, "raft-revoke-w1");
 
         // The caller's persistent issuance token for mount 5.
         let issue = OpToken {
