@@ -250,6 +250,12 @@ pub struct CacheService {
     /// Volatile load plans by allocate token.
     plans: Mutex<HashMap<OpToken, LoadPlan>>,
     locations: Mutex<HashMap<i64, ObjectLocations>>,
+    /// One-shot fault-injection seam fired between a sync-propose
+    /// barrier's return and the code's post-barrier verification (reserve
+    /// epoch check / commit-invalidate readback). Tests use it to make
+    /// "another mutation raced the barrier" deterministic. Never set in
+    /// production.
+    barrier_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl CacheService {
@@ -268,6 +274,26 @@ impl CacheService {
             segment: Mutex::new(None),
             plans: Mutex::new(HashMap::new()),
             locations: Mutex::new(HashMap::new()),
+            barrier_hook: Mutex::new(None),
+        }
+    }
+
+    /// Arm the one-shot post-barrier fault-injection seam (test-only).
+    /// The hook fires exactly once, at the first sync-propose barrier
+    /// return after arming, before that call's post-barrier verification.
+    #[cfg(test)]
+    pub(crate) fn set_barrier_hook(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        *self.barrier_hook.lock().unwrap() = Some(hook);
+    }
+
+    /// Fire (and disarm) the barrier hook if armed. The guard is released
+    /// before invoking the hook: a hook that re-enters the service (e.g. a
+    /// nested invalidate proposing its own command) must not re-lock this
+    /// mutex on the same thread.
+    fn fire_barrier_hook(&self) {
+        let hook = self.barrier_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 
@@ -804,46 +830,15 @@ impl CacheService {
             }
         }
 
-        // The volatile plan is mandatory: without it the reported
-        // locations cannot be validated against what the master planned
-        // (master restart), and a silent re-plan would misattribute old
-        // writes. Fail closed as a retryable miss — the caller retries the
-        // exact allocate (which re-plans the same identity) and re-commits.
-        let plan = {
-            let plans = self.plans.lock().unwrap();
-            plans
-                .get(&load_token)
-                .cloned()
-                .ok_or_else(|| {
-                    cm_err(format!(
-                        "cache commit for load token {:?} has no live plan (master restart or unknown token): retryable miss, replay the exact allocate to re-plan, then re-commit",
-                        load_token
-                    ))
-                })?
-        };
-        if plan.object_id != object_id || plan.generation != generation {
-            return err_box!(
-                "cache commit identity does not match the load plan: request ({}, {}) vs plan ({}, {})",
-                generation,
-                object_id,
-                plan.generation,
-                plan.object_id
-            );
-        }
-        if plan.file_len != len {
-            return err_box!(
-                "cache commit file length {} differs from the allocated plan {}",
-                len,
-                plan.file_len
-            );
-        }
-
-        // Committed row classification. The plan is volatile, so the
-        // committed row remains the authority for identity. Every terminal
-        // classification below clears the plan for this load token — the
-        // load binding above already verified the plan's identity against
-        // the durable Allocated outcome, so this can never delete another
-        // load's plan.
+        // Committed row classification — BEFORE the volatile plan lookup:
+        // terminal states must resolve from durable state alone. If the
+        // plan were consulted first, a retry whose Superseded response was
+        // lost (and whose plan was already cleared by the fencing
+        // invalidate/remove, or by a restart) would report a retryable
+        // "no live plan" miss instead of the terminal Superseded the
+        // committed row still proves. The load binding above verified the
+        // token's identity, so clearing the plan below can never delete
+        // another load's plan.
         {
             let store = self.fs_dir.read();
             let rocks = store.get_rocks_store();
@@ -914,6 +909,40 @@ impl CacheService {
             }
         }
 
+        // The volatile plan is mandatory: without it the reported
+        // locations cannot be validated against what the master planned
+        // (master restart), and a silent re-plan would misattribute old
+        // writes. Fail closed as a retryable miss — the caller retries the
+        // exact allocate (which re-plans the same identity) and re-commits.
+        let plan = {
+            let plans = self.plans.lock().unwrap();
+            plans
+                .get(&load_token)
+                .cloned()
+                .ok_or_else(|| {
+                    cm_err(format!(
+                        "cache commit for load token {:?} has no live plan (master restart or unknown token): retryable miss, replay the exact allocate to re-plan, then re-commit",
+                        load_token
+                    ))
+                })?
+        };
+        if plan.object_id != object_id || plan.generation != generation {
+            return err_box!(
+                "cache commit identity does not match the load plan: request ({}, {}) vs plan ({}, {})",
+                generation,
+                object_id,
+                plan.generation,
+                plan.object_id
+            );
+        }
+        if plan.file_len != len {
+            return err_box!(
+                "cache commit file length {} differs from the allocated plan {}",
+                len,
+                plan.file_len
+            );
+        }
+
         // Evidence validation against the plan happens before the
         // barrier: every rejected set below never touches the journal.
         validate_commit_against_plan(&plan, &blocks)?;
@@ -935,6 +964,9 @@ impl CacheService {
         self.journal_writer
             .sync_propose_cache(entry)
             .map_err(fs_err)?;
+        // Test seam: "another mutation raced the barrier" lands
+        // deterministically here, before the terminal readback.
+        self.fire_barrier_hook();
 
         // Readback from committed state, re-classified from the committed
         // row: another mutation (invalidate, a later allocation) may have
@@ -1133,6 +1165,9 @@ impl CacheService {
         self.journal_writer
             .sync_propose_cache(entry)
             .map_err(fs_err)?;
+        // Test seam: "another mutation raced the barrier" lands
+        // deterministically here, before the terminal readback.
+        self.fire_barrier_hook();
 
         // Readback from committed state, re-classified from the committed
         // row: another mutation may have fenced past ours between the
@@ -1297,6 +1332,9 @@ impl CacheService {
             self.journal_writer
                 .sync_propose_cache(entry)
                 .map_err(fs_err)?;
+            // Test seam: "the epoch changed while the barrier ran" lands
+            // deterministically here, before the post-barrier epoch check.
+            self.fire_barrier_hook();
             let now_hw = {
                 let store = self.fs_dir.read();
                 store
@@ -2204,22 +2242,14 @@ mod tests {
             err
         );
 
-        // A different commit token for the same load: the plan is missing
-        // (restart), so replay the exact allocate to re-plan — then the row
-        // check runs and the Tombstoned@2 row supersedes generation 1.
-        let err = service
-            .commit(commit_params(token(2, 1), token(4, 1), vec![]))
-            .unwrap_err();
-        assert!(format!("{}", err).contains("live plan"), "{}", err);
-        let lay = layout(OBJ, 130);
-        service.install_plan(token(2, 1), plan_for(&lay));
+        // A different commit token for the same load: even with NO live
+        // plan (restart, or the fencing invalidate already cleared it),
+        // the committed Tombstoned@2 row resolves the retry to terminal
+        // Superseded — durable state alone classifies, never a retryable
+        // "no live plan" miss.
         assert_eq!(
             service
-                .commit(commit_params(
-                    token(2, 1),
-                    token(4, 1),
-                    full_locations(&lay)
-                ))
+                .commit(commit_params(token(2, 1), token(4, 1), vec![]))
                 .unwrap(),
             CacheOpStatus::Superseded {
                 expected: 1,
@@ -2230,6 +2260,73 @@ mod tests {
             !service.plans.lock().unwrap().contains_key(&token(2, 1)),
             "pre-read Superseded must clear the load's plan"
         );
+    }
+
+    /// Gap-2 regression: a commit that raced an invalidate (row fenced,
+    /// no commit outcome recorded) and lost its Superseded response must
+    /// still resolve a same-token retry to terminal Superseded from the
+    /// durable row — with or without a live plan.
+    #[test]
+    fn test_commit_superseded_retry_without_plan() {
+        let service = build_service("commit-superseded-retry", chooser(vec![worker(1)]));
+        // Reserved row + recorded load allocation.
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let mgr = &store.cache;
+            mgr.apply_id_reserve(rocks, token(1, 1), OBJ, OBJ + 100)
+                .unwrap();
+            let alloc = CacheEntry {
+                generation: 1,
+                state: CacheEntryState::Reserved,
+                object_id: OBJ,
+                len: 0,
+                ufs_mtime: 0,
+                block_size: 64,
+                expire_at: 0,
+            };
+            mgr.apply_allocate(rocks, token(9, 1), 1, "/k", 130, &alloc)
+                .unwrap();
+        }
+        // The invalidate that fenced the row also cleared the load's plan
+        // (verified-identity cleanup) — the commit's Superseded response
+        // was lost in between.
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            store.cache.apply_remove(rocks, 1, "/k", 1, 2, OBJ).unwrap();
+        }
+        assert!(!service.plans.lock().unwrap().contains_key(&token(9, 1)));
+
+        // First (lost-response replay) attempt: terminal Superseded, not a
+        // retryable "no live plan" miss.
+        assert_eq!(
+            service
+                .commit(commit_params(token(9, 1), token(9, 2), vec![]))
+                .unwrap(),
+            CacheOpStatus::Superseded {
+                expected: 1,
+                current: 2
+            }
+        );
+        // And again after any plan re-appears (exact allocate replay):
+        // still terminal, still durable-state-classified.
+        let lay = layout(OBJ, 130);
+        service.install_plan(token(9, 1), plan_for(&lay));
+        assert_eq!(
+            service
+                .commit(commit_params(
+                    token(9, 1),
+                    token(9, 2),
+                    full_locations(&lay)
+                ))
+                .unwrap(),
+            CacheOpStatus::Superseded {
+                expected: 1,
+                current: 2
+            }
+        );
+        assert!(!service.plans.lock().unwrap().contains_key(&token(9, 1)));
     }
 
     /// TTL stays fail-closed until mount-policy TTL lands (4b).

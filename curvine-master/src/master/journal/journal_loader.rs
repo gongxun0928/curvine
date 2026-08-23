@@ -1061,6 +1061,7 @@ impl AppStorage for JournalLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::master::cache::{CacheCommitParams, CacheOpStatus};
     use crate::master::fs::{MasterFilesystem, WorkerManager};
     use crate::master::meta::cache::{
         state_tags, BlockIdCodec, CacheEntryState, LocalCacheIndexStore, OpOutcome, OpToken,
@@ -1624,17 +1625,28 @@ mod tests {
     }
 
     /// Real single-voter Raft barrier coverage for the CacheService
-    /// allocate path (4a rework, real-barrier test gap): the FIRST
-    /// allocate reserves the first id segment and issues its first id
-    /// through the real `sync_propose_cache` barrier; a second allocate
-    /// consumes the SAME segment (exactly one reserve); a lost-response
-    /// retry of the same token resolves to the committed identity with a
-    /// regenerated plan; and an epoch change burns the live segment so
-    /// the next allocate reserves a fresh contiguous one under the new
-    /// epoch — the P0-1 regression: the reserve loop re-reads the epoch
-    /// every attempt and converges, it never burns forever.
+    /// (4a rework, real-barrier test gap), all through the REAL raft
+    /// propose/apply barrier:
+    ///
+    /// 1. **P0-1 regression**: a one-shot post-barrier seam advances the
+    ///    epoch between the FIRST reserve barrier's return and the
+    ///    post-barrier epoch check — inside one `ensure_segment_and_issue`
+    ///    call. The next loop attempt must re-read the epoch and reserve
+    ///    a fresh contiguous segment under it (old code sampled the epoch
+    ///    once outside the loop and burned segments forever).
+    /// 2. A second allocate consumes the SAME segment (exactly one more
+    ///    reserve in total).
+    /// 3. A lost-response retry of the same allocate token resolves to
+    ///    the committed identity with a regenerated plan.
+    /// 4. An epoch change between calls burns the segment: the next
+    ///    allocate re-reserves contiguously under the new epoch.
+    /// 5. **Commit-vs-Invalidate interleave**: a one-shot seam injects a
+    ///    full invalidate between the commit propose barrier's return and
+    ///    the commit's terminal readback; the readback must re-classify to
+    ///    terminal `Superseded{1, 2}` (P1-3), and a same-token retry must
+    ///    resolve from the recorded Committed outcome as AlreadyApplied.
     #[test]
-    fn real_raft_allocate_segment_retry_and_epoch_burn() {
+    fn real_raft_allocate_commit_epoch_interleave() {
         let leader_mode_env = "CURVINE_TEST_CACHE_ALLOC_LEADER";
         let meta_dir_env = "CURVINE_TEST_CACHE_ALLOC_META_DIR";
         let journal_dir_env = "CURVINE_TEST_CACHE_ALLOC_JOURNAL_DIR";
@@ -1658,7 +1670,7 @@ mod tests {
         let exe = std::env::current_exe().unwrap();
         let output = std::process::Command::new(exe)
             .arg("--exact")
-            .arg("master::journal::journal_loader::tests::real_raft_allocate_segment_retry_and_epoch_burn")
+            .arg("master::journal::journal_loader::tests::real_raft_allocate_commit_epoch_interleave")
             .env(leader_mode_env, "1")
             .env(meta_dir_env, &meta_dir)
             .env(journal_dir_env, &journal_dir)
@@ -1691,9 +1703,9 @@ mod tests {
             }
         };
 
-        // Exactly the expected committed data entries: reserve#1,
-        // allocate /a, allocate /b, (same-token retry: no new entry),
-        // reserve#2 after the epoch burn, allocate /c.
+        // Exactly the expected committed data entries: reserve#1 (burned
+        // mid-call by the seam), reserve#2, allocate /a, allocate /b,
+        // reserve#3 (post epoch burn), allocate /c, commit /a, remove /a.
         {
             let log_store = RocksLogStorage::from_conf(&conf().journal, false);
             let last = log_store.read().last_index();
@@ -1704,56 +1716,99 @@ mod tests {
                 .into_iter()
                 .filter(|e| e.get_entry_type() == EntryType::EntryNormal && !e.data.is_empty())
                 .collect();
-            assert_eq!(
-                data_entries.len(),
-                5,
-                "expected exactly reserve/alloc/reserve/alloc + alloc entries"
-            );
+            assert_eq!(data_entries.len(), 8, "unexpected journal entry count");
         }
 
-        // Durable committed state: the burned segment's tail [MIN+1,
-        // MIN+SEG) is permanently lost, the new segment starts contiguous,
-        // and every issued identity is exactly as the leader observed.
+        // Durable committed state: the burned segments' tails are
+        // permanently lost, every reserve is contiguous, and every issued
+        // identity is exactly as the leader observed.
         {
             let rocks = RocksInodeStore::new(conf().db_conf(), false).unwrap();
             assert_eq!(
                 rocks.cache_get_state(state_tags::CACHE_OBJECT_ID).unwrap(),
-                Some(min + 2 * SEG - 1),
-                "two contiguous reserves [MIN, MIN+SEG) and [MIN+SEG, MIN+2*SEG)"
+                Some(min + 3 * SEG - 1),
+                "three contiguous reserves: [MIN,MIN+SEG), [MIN+SEG,MIN+2SEG), [MIN+2SEG,MIN+3SEG)"
             );
-            for (key, object_id) in [("/a", min), ("/b", min + 1), ("/c", min + SEG)] {
+            // /a was committed then invalidated mid-commit: Tombstoned@2.
+            let a = rocks.cache_get_entry(1, "/a").unwrap().expect("/a row");
+            assert_eq!(a.state, CacheEntryState::Tombstoned);
+            assert_eq!(a.generation, 2);
+            assert_eq!(a.object_id, min + SEG);
+            for (key, object_id) in [("/b", min + SEG + 1), ("/c", min + 2 * SEG)] {
                 let entry = rocks.cache_get_entry(1, key).unwrap().expect("row");
                 assert_eq!(entry.state, CacheEntryState::Reserved, "{}", key);
                 assert_eq!(entry.generation, 1, "{}", key);
                 assert_eq!(entry.object_id, object_id, "{}", key);
                 assert_eq!(entry.len, 0, "{}", key);
             }
-            for (op_seq, object_id) in [(1, min), (2, min + 1), (3, min + SEG)] {
-                match rocks
-                    .cache_get_outcome(OpToken {
-                        client_id: 9,
-                        op_seq,
-                    })
-                    .unwrap()
-                {
-                    Some(OpOutcome::Allocated { object_id: out, .. }) => {
-                        assert_eq!(out, object_id, "op_seq {}", op_seq)
-                    }
-                    other => panic!("op_seq {} outcome: {:?}", op_seq, other),
-                }
+            match rocks
+                .cache_get_outcome(OpToken {
+                    client_id: 9,
+                    op_seq: 1,
+                })
+                .unwrap()
+                .unwrap()
+            {
+                OpOutcome::Allocated { object_id, .. } => assert_eq!(object_id, min + SEG),
+                other => panic!("alloc (9,1) outcome: {:?}", other),
             }
-            // The internal issuer client (id 0) performed exactly two
-            // reserves across the epoch burn.
-            assert_eq!(rocks.cache_client_watermark(0).unwrap(), Some(2));
+            match rocks
+                .cache_get_outcome(OpToken {
+                    client_id: 9,
+                    op_seq: 5,
+                })
+                .unwrap()
+                .unwrap()
+            {
+                OpOutcome::Committed {
+                    incarnation,
+                    generation,
+                    object_id,
+                    load_token,
+                    len,
+                    ufs_mtime,
+                    expire_at,
+                    ..
+                } => {
+                    assert_eq!(incarnation, 1);
+                    assert_eq!(generation, 1);
+                    assert_eq!(object_id, min + SEG);
+                    assert_eq!(
+                        load_token,
+                        OpToken {
+                            client_id: 9,
+                            op_seq: 1
+                        }
+                    );
+                    assert_eq!(len, 128);
+                    assert_eq!(ufs_mtime, 777);
+                    assert_eq!(expire_at, 0);
+                }
+                other => panic!("commit (9,2) outcome: {:?}", other),
+            }
+            match rocks
+                .cache_get_outcome(OpToken {
+                    client_id: 9,
+                    op_seq: 4,
+                })
+                .unwrap()
+                .unwrap()
+            {
+                OpOutcome::Allocated { object_id, .. } => assert_eq!(object_id, min + 2 * SEG),
+                other => panic!("alloc (9,4) outcome: {:?}", other),
+            }
+            // The internal issuer client (id 0) performed exactly three
+            // reserves across the two epoch burns.
+            assert_eq!(rocks.cache_client_watermark(0).unwrap(), Some(3));
         }
 
         let _ = FileUtils::delete_path(&base, true);
     }
 
-    /// The leader lifetime for the allocate barrier test: a REAL
-    /// single-voter raft node (production writer, apply worker) with one
-    /// live worker registered, driving CacheService::allocate through the
-    /// full propose/apply barrier.
+    /// The leader lifetime for the barrier tests: a REAL single-voter
+    /// raft node (production writer, apply worker) with one live worker
+    /// registered, driving CacheService through the full propose/apply
+    /// barrier, with one-shot post-barrier fault injection.
     fn real_raft_allocate_lifetime(meta_dir_env: &str, journal_dir_env: &str) {
         Master::init_test_metrics();
         let meta_dir = std::env::var(meta_dir_env).unwrap();
@@ -1849,8 +1904,15 @@ mod tests {
         let min = BlockIdCodec::CACHE_OBJECT_MIN;
         let epoch_before = epoch_ctl.value();
 
-        // 1. First allocate: reserves [MIN, MIN+SEG) through the real
-        //    barrier and issues MIN.
+        // 1. P0-1 regression: the epoch advances between the FIRST reserve
+        //    barrier's return and the post-barrier epoch check, inside one
+        //    allocate call. The same call must converge: its next loop
+        //    attempt re-reads the epoch, burns the just-reserved segment,
+        //    and reserves [MIN+SEG, MIN+2*SEG) under the NEW epoch. The
+        //    first issued id is therefore MIN+SEG, not MIN. (The old code
+        //    sampled the epoch once outside the loop and never converged.)
+        let hook_ctl = epoch_ctl.clone();
+        cache.set_barrier_hook(Box::new(move || hook_ctl.advance()));
         let a = cache
             .allocate(
                 OpToken {
@@ -1864,7 +1926,11 @@ mod tests {
                 64,
             )
             .unwrap();
-        assert_eq!(a.object_id, min);
+        assert_eq!(
+            a.object_id,
+            min + SEG,
+            "mid-barrier epoch loss must burn the first segment and re-reserve"
+        );
         assert_eq!(a.generation, 1);
         assert_eq!(a.blocks.len(), 2, "128 bytes at block size 64");
         {
@@ -1872,15 +1938,12 @@ mod tests {
             let rocks = store.get_rocks_store();
             assert_eq!(
                 rocks.cache_get_state(state_tags::CACHE_OBJECT_ID).unwrap(),
-                Some(min + SEG - 1),
-                "first reserve must cover [MIN, MIN+SEG)"
+                Some(min + 2 * SEG - 1),
+                "two reserves: the burned [MIN, MIN+SEG) plus [MIN+SEG, MIN+2SEG)"
             );
-            let entry = rocks.cache_get_entry(1, "/a").unwrap().unwrap();
-            assert_eq!(entry.state, CacheEntryState::Reserved);
-            assert_eq!(entry.object_id, min);
         }
 
-        // 2. Second allocate: same segment, next id, still ONE reserve.
+        // 2. Second allocate: same segment, next id, no further reserve.
         let b = cache
             .allocate(
                 OpToken {
@@ -1896,17 +1959,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             b.object_id,
-            min + 1,
-            "second id comes from the same segment"
+            min + SEG + 1,
+            "second id from the same segment"
         );
         {
             let store = fs_dir.read();
             let rocks = store.get_rocks_store();
-            assert_eq!(
-                rocks.cache_client_watermark(0).unwrap(),
-                Some(1),
-                "exactly one issuer reserve so far"
-            );
+            assert_eq!(rocks.cache_client_watermark(0).unwrap(), Some(2));
         }
 
         // 3. Lost-response retry: the same token resolves to the committed
@@ -1924,7 +1983,7 @@ mod tests {
                 64,
             )
             .unwrap();
-        assert_eq!(a_retry.object_id, min);
+        assert_eq!(a_retry.object_id, min + SEG);
         assert_eq!(a_retry.generation, 1);
         assert_eq!(
             a_retry.blocks.len(),
@@ -1932,21 +1991,15 @@ mod tests {
             "re-plan must rebuild the placement"
         );
 
-        // 4. Epoch crossing burns the segment: the next allocate re-reserves
-        //    contiguously under the NEW epoch. This is the exact P0-1
-        //    regression — the loop must re-read the epoch per attempt, not
-        //    keep comparing (and burning) against a stale one forever.
+        // 4. Epoch change between calls burns the segment: the next
+        //    allocate re-reserves contiguously under the new epoch.
         epoch_ctl.advance();
-        assert_ne!(
-            epoch_ctl.value(),
-            epoch_before,
-            "epoch handle must be the one the cache service reads"
-        );
+        assert_ne!(epoch_ctl.value(), epoch_before);
         let c = cache
             .allocate(
                 OpToken {
                     client_id: 9,
-                    op_seq: 3,
+                    op_seq: 4,
                 },
                 11,
                 1,
@@ -1955,25 +2008,83 @@ mod tests {
                 64,
             )
             .unwrap();
-        assert_eq!(
-            c.object_id,
-            min + SEG,
-            "the burned segment's tail is lost; the fresh segment starts at MIN+SEG"
-        );
+        assert_eq!(c.object_id, min + 2 * SEG, "fresh segment after the burn");
         {
             let store = fs_dir.read();
             let rocks = store.get_rocks_store();
             assert_eq!(
                 rocks.cache_get_state(state_tags::CACHE_OBJECT_ID).unwrap(),
-                Some(min + 2 * SEG - 1),
-                "the second reserve must be contiguous: [MIN+SEG, MIN+2*SEG)"
+                Some(min + 3 * SEG - 1)
             );
-            assert_eq!(
-                rocks.cache_client_watermark(0).unwrap(),
-                Some(2),
-                "exactly one further issuer reserve after the burn"
-            );
+            assert_eq!(rocks.cache_client_watermark(0).unwrap(), Some(3));
         }
+
+        // 5. Commit-vs-Invalidate interleave: the seam injects a FULL
+        //    invalidate (its own raft barrier) between the commit propose
+        //    barrier's return and the commit's terminal readback. The
+        //    readback must re-classify to terminal Superseded — never a
+        //    generic retryable error.
+        let inv_cache = cache.clone();
+        cache.set_barrier_hook(Box::new(move || {
+            let status = inv_cache
+                .invalidate(12, 1, "/a", 1, min + SEG)
+                .expect("interleaved invalidate must apply");
+            assert_eq!(status, CacheOpStatus::Applied);
+        }));
+        let commit_status = cache
+            .commit(CacheCommitParams {
+                token: OpToken {
+                    client_id: 9,
+                    op_seq: 5,
+                },
+                load_token: OpToken {
+                    client_id: 9,
+                    op_seq: 1,
+                },
+                rpc_id: 12,
+                incarnation: 1,
+                key: "/a",
+                generation: 1,
+                object_id: min + SEG,
+                len: 128,
+                ufs_mtime: 777,
+                ttl_ms: 0,
+                blocks: a_retry.blocks.clone(),
+            })
+            .unwrap();
+        assert_eq!(
+            commit_status,
+            CacheOpStatus::Superseded {
+                expected: 1,
+                current: 2
+            },
+            "a commit fenced by an interleaved invalidate is terminal Superseded"
+        );
+
+        // 6. Same-token commit retry after the lost Superseded response:
+        //    the recorded Committed outcome resolves it as AlreadyApplied.
+        let retry_status = cache
+            .commit(CacheCommitParams {
+                token: OpToken {
+                    client_id: 9,
+                    op_seq: 5,
+                },
+                load_token: OpToken {
+                    client_id: 9,
+                    op_seq: 1,
+                },
+                rpc_id: 12,
+                incarnation: 1,
+                key: "/a",
+                generation: 1,
+                object_id: min + SEG,
+                len: 128,
+                ufs_mtime: 777,
+                ttl_ms: 0,
+                blocks: a_retry.blocks.clone(),
+            })
+            .unwrap();
+        assert_eq!(retry_status, CacheOpStatus::AlreadyApplied);
 
         std::process::exit(0);
     }
