@@ -1464,6 +1464,11 @@ impl MasterFilesystem {
                     }
                     for id in outcome.deleted_acks {
                         wm.deleted_block(list.worker_id, id);
+                        // 4d.2 RC2: the worker-side delete for this
+                        // identity completed — release its delete-pending
+                        // quarantine so a later Finalized re-report may
+                        // publish again.
+                        self.cache_service.ack_cache_deleted(list.worker_id, id);
                     }
                 }
             }
