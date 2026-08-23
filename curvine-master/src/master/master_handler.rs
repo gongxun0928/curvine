@@ -739,17 +739,27 @@ impl MasterHandler {
         let weight = header.weight.unwrap_or_else(WorkerInfo::default_weight);
         let worker_session_id = header.worker_session_id.unwrap_or_default();
 
-        // 4d R8-1 start_gate: a Start's whole critical section — WM
-        // validation/clear, accumulator reset, volatile session
-        // install — is serialized against every other Start, so dual or
-        // reordered Starts cannot interleave their state transitions.
+        // 4d R8-1 start_gate — RC2-1 (gpt56 `aa41c780` item 1): the
+        // gate is SHARED by Start and End, covering each transition's
+        // WHOLE critical section — WM validation/clear, accumulator
+        // reset, volatile session install (Start) or session-exact
+        // retirement (End). Without End on the gate, an End(B) could
+        // slip into a Start(B)'s WM→cache gap: it would no-op both
+        // domains (WM row already removed by the Start's WM arm; cache
+        // still showing the OLD session the End does not match
+        // exactly), and the Start would then install session B as live
+        // even though its process is gone. Serialized on the gate, an
+        // End either lands fully BEFORE the Start (retires the old
+        // session, Start installs fresh — consistent) or fully AFTER
+        // (Start's new session wins the exact-match, End no-ops —
+        // consistent); the half-state window does not exist.
         // Declared lock order: start_gate → WM write → accumulator
         // control → CacheVolatile. The GC tick below never holds the
         // volatile guard while taking the WM write lock, so no cycle
         // exists between the two orders.
         // Underscore-prefixed: the guard is held for its lifetime
-        // (until end of the Start critical section), not read.
-        let _start_gate = if matches!(status, HeartbeatStatus::Start) {
+        // (until end of the transition critical section), not read.
+        let _start_gate = if matches!(status, HeartbeatStatus::Start | HeartbeatStatus::End) {
             Some(fs.start_gate.lock())
         } else {
             None
@@ -788,6 +798,20 @@ impl MasterHandler {
         )?;
         drop(wm);
 
+        // #[cfg(test)] deterministic interleave seam (4d RC2-1, gpt56
+        // `aa41c780` item 1): fires for a Start EXACTLY between the WM
+        // transition and the cache-domain install, with the shared
+        // transition gate still held — tests pause here to prove an End
+        // arriving in that window blocks on the gate instead of no-oping
+        // against half-installed state. Compiled out outside cfg(test);
+        // never set in production.
+        #[cfg(test)]
+        if matches!(status, HeartbeatStatus::Start) {
+            if let Some(hook) = HEARTBEAT_TRANSITION_SEAM.lock().unwrap().as_ref() {
+                hook();
+            }
+        }
+
         // 4d Start/End cache-domain control (R7-1 order fix, R9-2/R9-3):
         // runs only after the WM accepted the transition. For Start this
         // fixes the pre-4d order where the full-report accumulator was
@@ -795,8 +819,11 @@ impl MasterHandler {
         // retirement is session-exact against the volatile registry.
         match status {
             // The start_gate stays held through begin_worker_session —
-            // the whole critical section is serialized.
-            HeartbeatStatus::Start => fs.begin_worker_session(&address, &worker_session_id),
+            // the whole critical section is serialized. RC2-2: an
+            // install refusal (e.g. tag-issuer exhaustion) propagates
+            // to the heartbeat RPC — by then both domains have already
+            // failed closed atomically.
+            HeartbeatStatus::Start => fs.begin_worker_session(&address, &worker_session_id)?,
             HeartbeatStatus::End => fs.end_worker_session(address.worker_id, &worker_session_id),
             HeartbeatStatus::Running => {}
         }
@@ -1406,12 +1433,26 @@ impl MessageHandler for MasterHandler {
     }
 }
 
+/// #[cfg(test)] seam storage for the 4d RC2-1 interleave proof: the hook
+/// set here (if any) is fired by process_worker_heartbeat for a Start
+/// exactly between the WM transition and the cache-domain install, with
+/// the shared Start/End transition gate held. Never set in production;
+/// compiled out entirely outside cfg(test).
+#[cfg(test)]
+static HEARTBEAT_TRANSITION_SEAM: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
+    std::sync::Mutex::new(None);
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::master::cache::cache_service::CacheFullReportOutcome;
     use crate::master::journal::JournalSystem;
     use curvine_model::WorkerAddress;
     use curvine_runtime::common::Utils;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn process_worker_heartbeat_stores_worker_report_fields() {
@@ -1466,6 +1507,258 @@ mod tests {
         // Structured version metadata survives heartbeat -> WorkerInfo ->
         // WorkerInfoProto (filesystem_info) -> WorkerInfo round trip.
         assert_eq!(worker.component_info, Some(component_info));
+    }
+
+    fn heartbeat_req(
+        conf: &ClusterConf,
+        address: &WorkerAddress,
+        status: HeartbeatStatus,
+        session: &str,
+    ) -> WorkerHeartbeatRequest {
+        WorkerHeartbeatRequest {
+            status: status.into(),
+            cluster_id: conf.cluster_id.clone(),
+            address: ProtoUtils::worker_address_to_pb(address),
+            worker_session_id: Some(session.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn gate_test_conf(prefix: &str) -> ClusterConf {
+        Master::init_test_metrics();
+        let test_name = Utils::rand_str(6);
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.meta_dir = Utils::test_sub_dir(format!("{}/meta-{}", prefix, test_name));
+        conf.journal.journal_dir = Utils::test_sub_dir(format!("{}/journal-{}", prefix, test_name));
+        conf
+    }
+
+    /// 4d RC2-1 (gpt56 `aa41c780` item 1): an End arriving inside a
+    /// Start's WM→cache window BLOCKS on the shared transition gate — it
+    /// cannot run against half-installed state (no-op both domains) and
+    /// leave the dead new session published. Also proves the
+    /// session-exact no-op end-to-end: an End for an older session after
+    /// a fresh Start changes nothing.
+    #[test]
+    fn worker_heartbeat_start_end_share_transition_gate() {
+        let conf = gate_test_conf("master-handler-gate");
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        let address = WorkerAddress {
+            worker_id: 9,
+            hostname: "gate-host".to_string(),
+            ip_addr: "127.0.0.1".to_string(),
+            rpc_port: 1234,
+            web_port: 5678,
+        };
+
+        // Session B live via the production chain, then a Running beat
+        // installs the WM row bound to B.
+        MasterHandler::process_worker_heartbeat(
+            fs.clone(),
+            heartbeat_req(&conf, &address, HeartbeatStatus::Start, "B"),
+        )
+        .unwrap();
+        MasterHandler::process_worker_heartbeat(
+            fs.clone(),
+            heartbeat_req(&conf, &address, HeartbeatStatus::Running, "B"),
+        )
+        .unwrap();
+        let spine = fs.cache_service.session_spine_snapshot(9);
+        assert_eq!(spine.registry.map(|(s, _)| s).as_deref(), Some("B"));
+        assert_eq!(spine.accumulator.map(|(s, _)| s).as_deref(), Some("B"));
+        assert!(fs
+            .worker_manager
+            .read()
+            .worker_map
+            .workers()
+            .get(&9)
+            .is_some());
+
+        // Panic-safe seam reset: whichever way this test exits, the hook
+        // never leaks into other tests.
+        struct SeamReset;
+        impl Drop for SeamReset {
+            fn drop(&mut self) {
+                *HEARTBEAT_TRANSITION_SEAM.lock().unwrap() = None;
+            }
+        }
+        let _seam_reset = SeamReset;
+
+        // The seam parks Start(B2) INSIDE the WM→cache window, holding
+        // the shared transition gate, until released.
+        let parked = Arc::new((Mutex::new(false), Condvar::new()));
+        let seam_pair = parked.clone();
+        *HEARTBEAT_TRANSITION_SEAM.lock().unwrap() = Some(Box::new(move || {
+            let mut g = seam_pair.0.lock().unwrap();
+            while !*g {
+                g = seam_pair.1.wait(g).unwrap();
+            }
+        }));
+
+        let starter_fs = fs.clone();
+        let starter_conf = conf.clone();
+        let starter_addr = address.clone();
+        let starter = thread::spawn(move || {
+            MasterHandler::process_worker_heartbeat(
+                starter_fs,
+                heartbeat_req(&starter_conf, &starter_addr, HeartbeatStatus::Start, "B2"),
+            )
+            .unwrap();
+        });
+
+        // Wait until the starter is parked in the seam: its WM arm has
+        // already removed the worker row (observable) while the cache
+        // registry still shows the OLD session B.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let wm_gone = fs
+                .worker_manager
+                .read()
+                .worker_map
+                .workers()
+                .get(&9)
+                .is_none();
+            let spine = fs.cache_service.session_spine_snapshot(9);
+            let cache_old = spine.registry.map(|(s, _)| s).as_deref() == Some("B");
+            if wm_gone && cache_old {
+                break;
+            }
+            assert!(Instant::now() < deadline, "starter never reached the seam");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // End(B) in the window: it must BLOCK on the shared gate.
+        let end_done = Arc::new(AtomicBool::new(false));
+        let end_fs = fs.clone();
+        let end_conf = conf.clone();
+        let end_addr = address.clone();
+        let end_flag = end_done.clone();
+        let ender = thread::spawn(move || {
+            MasterHandler::process_worker_heartbeat(
+                end_fs,
+                heartbeat_req(&end_conf, &end_addr, HeartbeatStatus::End, "B"),
+            )
+            .unwrap();
+            end_flag.store(true, Ordering::SeqCst);
+        });
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            !end_done.load(Ordering::SeqCst),
+            "End(B) must block while Start(B2) holds the transition gate"
+        );
+
+        // Release the seam; both transitions complete.
+        {
+            let mut g = parked.0.lock().unwrap();
+            *g = true;
+            parked.1.notify_all();
+        }
+        starter.join().unwrap();
+        ender.join().unwrap();
+        assert!(end_done.load(Ordering::SeqCst));
+
+        // Converged final state (either completion order): registry and
+        // accumulator are bound to the NEW session B2; WM holds no row
+        // (Start removed it; only a later Running re-inserts).
+        let spine = fs.cache_service.session_spine_snapshot(9);
+        assert_eq!(spine.registry.map(|(s, _)| s).as_deref(), Some("B2"));
+        assert_eq!(spine.accumulator.map(|(s, _)| s).as_deref(), Some("B2"));
+        assert!(fs
+            .worker_manager
+            .read()
+            .worker_map
+            .workers()
+            .get(&9)
+            .is_none());
+
+        // Stale-End no-op end-to-end: an End for the OLD session after
+        // the fresh Start changes nothing in either domain.
+        MasterHandler::process_worker_heartbeat(
+            fs.clone(),
+            heartbeat_req(&conf, &address, HeartbeatStatus::End, "B-old"),
+        )
+        .unwrap();
+        let spine = fs.cache_service.session_spine_snapshot(9);
+        assert_eq!(spine.registry.map(|(s, _)| s).as_deref(), Some("B2"));
+        assert_eq!(spine.accumulator.map(|(s, _)| s).as_deref(), Some("B2"));
+    }
+
+    /// 4d RC2-2 (gpt56 `aa41c780` item 2): a Start the cache domain
+    /// REFUSES (tag issuer exhausted) is loud at the heartbeat RPC and
+    /// atomic — the old session's accumulator is terminally invalidated,
+    /// nothing is installed, the issuer stays exhausted (no wrap), and
+    /// the WM row stays removed (both domains agree the worker is not
+    /// registered; a later Start retries cleanly).
+    #[test]
+    fn worker_heartbeat_start_refusal_is_loud_and_atomic() {
+        let conf = gate_test_conf("master-handler-exh");
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        let address = WorkerAddress {
+            worker_id: 11,
+            hostname: "exh-host".to_string(),
+            ip_addr: "127.0.0.1".to_string(),
+            rpc_port: 1234,
+            web_port: 5678,
+        };
+
+        // s1 live via the production chain, with a live WM row.
+        MasterHandler::process_worker_heartbeat(
+            fs.clone(),
+            heartbeat_req(&conf, &address, HeartbeatStatus::Start, "s1"),
+        )
+        .unwrap();
+        MasterHandler::process_worker_heartbeat(
+            fs.clone(),
+            heartbeat_req(&conf, &address, HeartbeatStatus::Running, "s1"),
+        )
+        .unwrap();
+        let spine = fs.cache_service.session_spine_snapshot(11);
+        assert_eq!(spine.registry.map(|(s, _)| s).as_deref(), Some("s1"));
+        assert_eq!(spine.accumulator.as_ref().map(|(_, i)| *i), Some(false));
+
+        // Burn the issuer to its exhaustion point.
+        fs.cache_service.set_next_tag_for_test(u64::MAX);
+
+        // Start(s2): loud refusal at the RPC surface.
+        let err = MasterHandler::process_worker_heartbeat(
+            fs.clone(),
+            heartbeat_req(&conf, &address, HeartbeatStatus::Start, "s2"),
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("exhausted"),
+            "refusal must be loud at the RPC, got: {}",
+            err
+        );
+
+        // Atomic refusal: registry EMPTY (install_session retired the s1
+        // row before refusing), the OLD accumulator terminally invalid,
+        // the issuer unchanged, WM row absent.
+        let spine = fs.cache_service.session_spine_snapshot(11);
+        assert!(spine.registry.is_none());
+        assert_eq!(spine.next_tag, u64::MAX);
+        assert_eq!(
+            spine.accumulator,
+            Some(("s1".to_string(), true)),
+            "the old accumulator must be terminally invalidated by the refusal"
+        );
+        assert!(fs
+            .worker_manager
+            .read()
+            .worker_map
+            .workers()
+            .get(&11)
+            .is_none());
+
+        // The old session's later pages stay Skipped (terminal, per
+        // `0b900a2f` — only a new successful Start reopens).
+        assert!(matches!(
+            fs.cache_service.cache_full_report_page(11, "s1", 5, &[]),
+            CacheFullReportOutcome::Skipped
+        ));
     }
 
     #[test]

@@ -2128,7 +2128,9 @@ mod tests {
         // cold clear wipes the registry with the epoch advance). This
         // must run AFTER leadership settles: an earlier registration is
         // cold-cleared by the epoch advance of the role transition.
-        hook_fs.begin_worker_session(&worker_addr, "raft-test-w1");
+        hook_fs
+            .begin_worker_session(&worker_addr, "raft-test-w1")
+            .unwrap();
 
         const SEG: i64 = 4096; // cache_service::CACHE_RESERVE_SEGMENT
         let min = BlockIdCodec::CACHE_OBJECT_MIN;
@@ -2149,7 +2151,9 @@ mod tests {
             // Leadership changed: production re-solicits the worker's
             // Start (the cold clear wiped the registry); replay it so
             // the retry's fresh plan captures a live session fence.
-            hook_fs_seam.begin_worker_session(&hook_addr, "raft-test-w1");
+            hook_fs_seam
+                .begin_worker_session(&hook_addr, "raft-test-w1")
+                .unwrap();
         }));
         let a = cache
             .allocate(
@@ -2233,7 +2237,9 @@ mod tests {
         //    allocate re-reserves contiguously under the new epoch.
         epoch_ctl.advance();
         assert_ne!(epoch_ctl.value(), epoch_before);
-        hook_fs.begin_worker_session(&worker_addr, "raft-test-w1");
+        hook_fs
+            .begin_worker_session(&worker_addr, "raft-test-w1")
+            .unwrap();
         let c = cache
             .allocate(
                 OpToken {
@@ -2506,7 +2512,9 @@ mod tests {
         // production Start heartbeat); registered AFTER leadership
         // settles so the role-transition epoch advance cannot
         // cold-clear it.
-        session_fs.begin_worker_session(&worker_addr, "raft-revoke-w1");
+        session_fs
+            .begin_worker_session(&worker_addr, "raft-revoke-w1")
+            .unwrap();
 
         // The caller's persistent issuance token for mount 5.
         let issue = OpToken {

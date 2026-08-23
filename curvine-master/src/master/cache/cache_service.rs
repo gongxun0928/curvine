@@ -590,6 +590,20 @@ impl CacheVolatile {
     }
 }
 
+/// #[cfg(test)] observable session-spine snapshot for one worker (see
+/// `CacheService::session_spine_snapshot`). Compiled out outside
+/// cfg(test).
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct SessionSpine {
+    /// Registry row: (wire session, live tag).
+    pub(crate) registry: Option<(String, u64)>,
+    /// Tag-issuer cursor.
+    pub(crate) next_tag: u64,
+    /// Accumulator row: (session, terminal flag).
+    pub(crate) accumulator: Option<(String, bool)>,
+}
+
 /// 4d (R7-5): the strict single-key full-report accumulator for the
 /// CACHE domain — one entry per block id carrying the reported
 /// `(status, len, storage_type)`. Terminal semantics (`0b900a2f`):
@@ -2694,9 +2708,22 @@ impl CacheService {
     ) -> CommonResult<()> {
         let mut sessions = self.report_sessions.lock().unwrap();
         let mut volatile = self.lock_volatile();
-        // RC5: a tag-issuer exhaustion propagates loud — no session, no
-        // accumulator, nothing installed.
-        volatile.install_session(worker_id, session.to_string(), address.clone())?;
+        // RC5 + RC2-2 (gpt56 `aa41c780` item 2): a refusal — e.g. tag
+        // issuer exhaustion — fails ATOMICALLY. install_session's own
+        // ordering already retired the previous registry row and live
+        // set BEFORE the refusal, so the OLD accumulator must not
+        // survive it either: terminally invalidate it here (per
+        // `0b900a2f`, later pages of the old session stay Skipped and
+        // only a new successful Start creates a fresh accumulator), and
+        // propagate the error loud to the heartbeat RPC.
+        if let Err(e) = volatile.install_session(worker_id, session.to_string(), address.clone()) {
+            if let Some(old) = sessions.get_mut(&worker_id) {
+                old.invalid = true;
+                old.entries.clear();
+                old.update_time_ms = LocalTime::mills();
+            }
+            return Err(e);
+        }
         sessions.insert(
             worker_id,
             CacheReportSession {
@@ -2708,6 +2735,41 @@ impl CacheService {
             },
         );
         Ok(())
+    }
+
+    /// #[cfg(test)] 4d RC2 handler-test support: an observable snapshot
+    /// of one worker's session spine — registry row (wire session, live
+    /// tag), tag-issuer cursor, and accumulator
+    /// row (session, terminal flag) — so handler-level tests assert the
+    /// exact install/retire/refuse effects without reaching into the
+    /// private leaf locks. Locks taken in the declared order
+    /// (accumulator → volatile). Compiled out outside cfg(test).
+    #[cfg(test)]
+    pub(crate) fn session_spine_snapshot(&self, worker_id: u32) -> SessionSpine {
+        let accumulator = self
+            .report_sessions
+            .lock()
+            .unwrap()
+            .get(&worker_id)
+            .map(|s| (s.session.clone(), s.invalid));
+        let volatile = self.state.lock().unwrap();
+        let registry = volatile
+            .worker_sessions
+            .get(&worker_id)
+            .map(|s| (s.session.clone(), s.tag));
+        SessionSpine {
+            registry,
+            next_tag: volatile.next_tag,
+            accumulator,
+        }
+    }
+
+    /// #[cfg(test)] 4d RC2 handler-test support: burn the tag issuer to
+    /// its exhaustion point so a handler-level Start refusal is
+    /// deterministic. Compiled out outside cfg(test).
+    #[cfg(test)]
+    pub(crate) fn set_next_tag_for_test(&self, tag: u64) {
+        self.state.lock().unwrap().next_tag = tag;
     }
 
     /// 4d RC3 (gpt56 `7ceef2ff` item 3): a Start with an EMPTY wire

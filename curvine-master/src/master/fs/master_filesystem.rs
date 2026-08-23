@@ -1336,30 +1336,28 @@ impl MasterFilesystem {
     /// so a legacy Start can never inherit or revive a predecessor's
     /// cache session, and no cache plan/location can reference the
     /// worker until a non-empty Start reopens.
-    pub fn begin_worker_session(&self, address: &WorkerAddress, session: &str) {
+    /// RC2-2 (gpt56 `aa41c780` item 2): an install refusal is RETURNED
+    /// (the handler propagates it to the heartbeat RPC) — by then both
+    /// domains have already failed closed atomically.
+    pub fn begin_worker_session(&self, address: &WorkerAddress, session: &str) -> CommonResult<()> {
         // Accumulator domain first (FS full-report accumulation + any
         // running reconcile for this worker).
         self.reset_full_block_report(address.worker_id);
         if session.is_empty() {
             self.cache_service
                 .purge_worker_cache_session(address.worker_id);
-            return;
+            return Ok(());
         }
         // 4d R9-3: atomic cache-session install — accumulator guard and
         // volatile guard held simultaneously (accumulator first): fresh
         // registry row + fresh accumulator bound to the new session.
-        // RC5: a tag-issuer exhaustion is a loud refusal — nothing is
-        // installed and the failure is surfaced (never silently
-        // continued past).
-        if let Err(e) = self
-            .cache_service
+        // RC5/RC2-2 (gpt56 `aa41c780` item 2): a tag-issuer exhaustion
+        // is a loud refusal — nothing is installed, the OLD accumulator
+        // is terminally invalidated inside begin_cache_session, and the
+        // error propagates to the heartbeat RPC instead of being
+        // logged and swallowed.
+        self.cache_service
             .begin_cache_session(address.worker_id, session, address)
-        {
-            error!(
-                "cache session install refused for worker {} ({}): {}",
-                address.worker_id, address, e
-            );
-        }
     }
 
     /// 4d (R9-2): an End heartbeat's cache-domain retirement —
