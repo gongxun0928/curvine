@@ -1013,6 +1013,8 @@ where
             report_target: report_endpoints.first().cloned().unwrap_or_default(),
             report_endpoints,
         }),
+        // Transfer-scheduled tasks are fs-mode loads by construction.
+        cache: None,
     };
 
     match client.submit_load_task_response(load_task).await {

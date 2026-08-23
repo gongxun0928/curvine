@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::common::UfsFactory;
+use crate::worker::task::cache_load_task_runner::CacheLoadTaskRunner;
 use crate::worker::task::load_task_runner::LoadTaskRunner;
 use crate::worker::task::{TaskContext, TaskStore};
 use curvine_client_core::file::{CurvineFileSystem, FsContext};
@@ -272,6 +273,84 @@ impl TaskManager {
                 }
                 Err(e) => {
                     log::error!("task {} failed to acquire permit: {}", task_id, e);
+                }
+            }
+
+            if remove_task {
+                let _ = tasks.remove_if(&task_id, |_, ctx| Arc::ptr_eq(ctx, &context_this));
+            }
+        });
+
+        Ok(TaskSubmitResult::accepted())
+    }
+
+    /// Phase 3 (dual-mode metadata split): submit a cache-mode load task.
+    ///
+    /// Mirrors `submit_task` (entry dedup/supersede + semaphore +
+    /// remove-if-own-context) but dispatches to `CacheLoadTaskRunner`,
+    /// which runs the CacheAllocate → planned-worker writes → CacheCommit
+    /// loop against the cache index and never touches the inode tree.
+    /// A task without a master-injected `CacheLoadSpec` is rejected
+    /// fail-closed — the worker must never self-issue an incarnation or
+    /// op tokens.
+    pub fn submit_cache_task(&self, task: LoadTaskInfo) -> FsResult<TaskSubmitResult> {
+        if task.cache.is_none() {
+            return Ok(TaskSubmitResult::rejected(format!(
+                "Reject cache load task {} because it has no CacheLoadSpec",
+                task.task_id
+            )));
+        }
+
+        let task_id = task.task_id.clone();
+        let context = Arc::new(TaskContext::new(task));
+
+        match self.tasks.entry(task_id.clone()) {
+            Entry::Occupied(mut occ) => {
+                let old = occ.insert(context.clone());
+                old.set_canceled("superseded by new cache load submit");
+                warn!(
+                    "cancel duplicate cache load task {} (source_path={})",
+                    old.info.task_id, old.info.source_path
+                );
+            }
+            Entry::Vacant(vac) => {
+                vac.insert(context.clone());
+            }
+        }
+        info!(
+            "submit cache load task {} {}",
+            context.info.task_id, context.info.source_path
+        );
+
+        // The scheduler treats an accepted task as running while it waits
+        // for this worker's local concurrency permit.
+        context.update_state(JobTaskState::Loading, "cache load task accepted and queued");
+
+        let runner = CacheLoadTaskRunner::new(
+            context.clone(),
+            self.fs.clone(),
+            self.factory.clone(),
+            self.progress_interval_ms,
+            self.task_timeout_ms,
+        );
+
+        let tasks = self.tasks.clone();
+        let semaphore = self.worker_task_semaphore.clone();
+        let context_this = context.clone();
+
+        self.rt.spawn(async move {
+            let mut remove_task = true;
+            match semaphore.acquire().await {
+                Ok(permit) => {
+                    remove_task = runner.run().await;
+                    drop(permit);
+                }
+                Err(e) => {
+                    log::error!(
+                        "cache load task {} failed to acquire permit: {}",
+                        task_id,
+                        e
+                    );
                 }
             }
 

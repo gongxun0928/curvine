@@ -113,6 +113,7 @@ mod supersede_tests {
             create_time: 0,
             source_read_plan_json: String::new(),
             transfer_report: None,
+            cache: None,
         }
     }
 

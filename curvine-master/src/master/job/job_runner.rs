@@ -22,8 +22,8 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path};
 use curvine_model::{
-    JobTaskState, LoadJobCommand, LoadJobInfo, LoadJobResult, LoadTaskInfo, MountInfo,
-    WorkerAddress,
+    CacheLoadSpec, CacheOpTokenId, JobTaskState, LoadJobCommand, LoadJobInfo, LoadJobResult,
+    LoadTaskInfo, MountInfo, WorkerAddress,
 };
 use curvine_runtime::common::CommonUtils;
 use curvine_runtime::common::{ByteUnit, FastHashMap, FastHashSet, LocalTime};
@@ -62,6 +62,12 @@ enum CvSourceMode {
 
 impl LoadJobRunner {
     const RUN_ID_SEQ_MOD: u64 = 1_000_000;
+
+    /// Phase 3: reserved non-zero issuer client id for master-minted
+    /// cache load/commit op tokens (`validate_client_token` rejects
+    /// client_id 0 = CACHE_ISSUER_CLIENT_ID for RPC tokens, and these
+    /// tokens are replayed by workers as ordinary client tokens).
+    const CACHE_LOAD_ISSUER_CLIENT_ID: u64 = 0x6361_6368_656c_6f61;
 
     pub fn new(
         jobs: JobStore,
@@ -186,6 +192,36 @@ impl LoadJobRunner {
             .saturating_add(self.run_seq.next() % Self::RUN_ID_SEQ_MOD)
     }
 
+    /// Master-minted retry-stable cache op token (gpt56 `f7788b98` point
+    /// 2): a fixed non-zero issuer client id plus an op_seq from the same
+    /// `mills * MOD + seq` scheme as `next_run_id`, so a master restart
+    /// never regresses below the token outcome watermark.
+    fn mint_cache_op_token(&self) -> CacheOpTokenId {
+        CacheOpTokenId {
+            client_id: Self::CACHE_LOAD_ISSUER_CLIENT_ID,
+            op_seq: self.next_run_id(),
+        }
+    }
+
+    /// Phase 3: resolves the AUTHORITATIVE current incarnation for a
+    /// write-cache-enabled mount. A mount without an installed
+    /// incarnation fails closed — the worker must never self-issue one
+    /// (gpt56 `f7788b98` point 4).
+    fn require_current_incarnation(&self, mnt: &MountInfo) -> FsResult<u64> {
+        match self
+            .master_fs
+            .cache_service
+            .current_incarnation_for_mount(mnt.mount_id)?
+        {
+            Some(incarnation) => Ok(incarnation),
+            None => err_box!(
+                "mount {} (ufs {}) is write-cache-enabled but has no installed cache incarnation; refusing cache-mode load",
+                mnt.mount_id,
+                mnt.ufs_path
+            ),
+        }
+    }
+
     fn running_job_result(&self, job_id: &str) -> Option<LoadJobResult> {
         self.jobs.get(job_id).and_then(|exist_job| {
             let state: JobTaskState = exist_job.state.state();
@@ -211,6 +247,29 @@ impl LoadJobRunner {
         // need an explicit export task.
         if source_path.is_cv() {
             return Ok(false);
+        }
+
+        // Phase 3: cache-mode mounts have no inode — "already loaded" is
+        // a cache-index hit whose recorded (len, ufs_mtime) still matches
+        // the live UFS source.
+        if mnt.info.write_cache_enabled() {
+            let source_status = mnt.ufs()?.get_status(source_path).await?;
+            let key = mnt.info.get_cache_key(source_path)?;
+            let incarnation = match self
+                .master_fs
+                .cache_service
+                .current_incarnation_for_mount(mnt.info.mount_id)?
+            {
+                Some(incarnation) => incarnation,
+                // No namespace installed: nothing can be loaded yet.
+                None => return Ok(false),
+            };
+            return match self.master_fs.cache_service.get(incarnation, &key, false)? {
+                Some(hit) => {
+                    Ok(hit.len == source_status.len && hit.ufs_mtime == source_status.mtime)
+                }
+                None => Ok(false),
+            };
         }
 
         // Target not present in Curvine yet — must load.
@@ -609,7 +668,13 @@ impl LoadJobRunner {
             .map(|(id, task)| async move {
                 let worker = task.task.worker.clone();
                 let client = self.factory.get_worker_client(&worker).await?;
-                client.submit_load_task(task.task).await?;
+                // Phase 3: tasks carrying a CacheLoadSpec dispatch as
+                // JobTaskType::CacheLoad (cache runner, no inode).
+                if task.task.cache.is_some() {
+                    client.submit_cache_load_task(task.task).await?;
+                } else {
+                    client.submit_load_task(task.task).await?;
+                }
                 debug!("dispatched sub-task {} to worker {}", id, worker);
                 Ok::<(), FsError>(())
             })
@@ -634,6 +699,19 @@ impl LoadJobRunner {
         };
 
         let block_size = job.block_size;
+
+        // Phase 3 (dual-mode metadata split): on write-cache-enabled
+        // mounts the whole job runs in cache mode — each task carries a
+        // master-minted CacheLoadSpec (authoritative incarnation +
+        // mount-relative key + retry-stable dual op tokens) and the
+        // worker executes CacheAllocate → planned writes → CacheCommit
+        // against the cache index only. The incarnation is resolved once
+        // per job and fails closed when absent.
+        let cache_incarnation = if mnt.write_cache_enabled() {
+            Some(self.require_current_incarnation(mnt)?)
+        } else {
+            None
+        };
 
         let mut total_size = 0;
         let mut tasks = FastHashMap::new();
@@ -685,6 +763,18 @@ impl LoadJobRunner {
                 task_index += 1;
                 total_size += status.len;
 
+                // Cache-mode spec: minted per task (both op tokens must be
+                // task-scoped and distinct); the key is mount-relative.
+                let cache = match cache_incarnation {
+                    Some(incarnation) => Some(CacheLoadSpec {
+                        incarnation,
+                        key: mnt.get_cache_key(&source_path)?,
+                        load_token: self.mint_cache_op_token(),
+                        commit_token: self.mint_cache_op_token(),
+                    }),
+                    None => None,
+                };
+
                 let task = LoadTaskInfo {
                     job: job.clone(),
                     task_id: task_id.clone(),
@@ -694,6 +784,7 @@ impl LoadJobRunner {
                     create_time: LocalTime::mills() as i64,
                     source_read_plan_json: String::new(),
                     transfer_report: None,
+                    cache,
                 };
                 tasks.insert(task_id.clone(), TaskDetail::new(task));
 

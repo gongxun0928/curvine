@@ -112,6 +112,18 @@ pub enum JobTaskType {
     #[num_enum(default)]
     Load = 1,
     Export = 2,
+    /// Phase 3: cache-mode load — CacheAllocate → write planned workers →
+    /// CacheCommit against the object index (no inode involvement).
+    CacheLoad = 3,
+}
+
+impl JobTaskType {
+    /// Wire discriminator decode for handlers routing `SubmitTaskRequest`
+    /// (callers outside this crate cannot reach `num_enum`'s trait).
+    /// Unknown discriminators decode to the `#[num_enum(default)]` Load.
+    pub fn from_i32(v: i32) -> Self {
+        num_enum::FromPrimitive::from_primitive(v)
+    }
 }
 
 #[derive(Default)]
@@ -244,6 +256,46 @@ pub struct LoadTaskInfo {
     pub source_read_plan_json: String,
     #[serde(default)]
     pub transfer_report: Option<TransferTaskReportInfo>,
+    /// Phase 3 (dual-mode metadata split): when present, this task is a
+    /// CACHE-mode load — the worker executes the CacheAllocate → write
+    /// planned workers → CacheCommit chain against the object index and
+    /// must NOT touch the inode tree (no create/rename/set_attr). The
+    /// incumbent fields above keep their meaning for job bookkeeping and
+    /// progress reporting (`source_path` = UFS path, `target_path` =
+    /// display-only cache identity). `#[serde(default)]` keeps the wire
+    /// compatible with in-flight fs-mode tasks across a rolling upgrade.
+    #[serde(default)]
+    pub cache: Option<CacheLoadSpec>,
+}
+
+/// Retry-stable op identity for the cache RPCs issued by one cache-mode
+/// load task. The master mints BOTH tokens once at task creation and
+/// serializes them into the task; a worker retry or RPC response loss
+/// replays the exact same tokens, never re-deriving them from a
+/// transient rpc req_id (gpt56 `f7788b98` point 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheOpTokenId {
+    pub client_id: u64,
+    pub op_seq: u64,
+}
+
+/// Master-injected cache-domain identity for one cache-mode load task.
+///
+/// `incarnation` is the AUTHORITATIVE current incarnation of the mount at
+/// task-creation time — the worker never derives it from the mount id and
+/// never self-issues one (gpt56 `f7788b98` point 4: provenance is the
+/// master's alone; a mount without an installed incarnation fails closed
+/// at routing time).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheLoadSpec {
+    pub incarnation: u64,
+    /// Object key in the cache index (mount-relative UFS key).
+    pub key: String,
+    /// The load identity token handed to CacheAllocate (and echoed by
+    /// CacheCommit as `load_token`).
+    pub load_token: CacheOpTokenId,
+    /// The independent commit op token for CacheCommit idempotency.
+    pub commit_token: CacheOpTokenId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -335,7 +387,6 @@ impl JobTaskProgress {
 mod tests {
     use super::JobTaskProgress;
     use curvine_runtime::common::ByteUnit;
-
     #[test]
     fn progress_string_caps_loaded_bytes_at_total() {
         let progress = JobTaskProgress {
@@ -351,5 +402,63 @@ mod tests {
 
         assert!(progress.progress_string(false).contains(&expected_counts));
         assert!(progress.progress_string(true).contains(&expected_counts));
+    }
+
+    // Phase 3: `LoadTaskInfo.cache` must stay wire compatible with
+    // in-flight fs-mode tasks across a rolling upgrade — an old payload
+    // (no `cache` field) decodes with `cache: None`, and a cache-mode
+    // payload round-trips its spec (incarnation + dual op tokens)
+    // losslessly.
+    #[test]
+    fn load_task_info_cache_field_is_wire_compatible() {
+        let task = super::LoadTaskInfo {
+            job: super::LoadJobInfo {
+                job_id: "j1".to_string(),
+                source_path: "s3://b/k".to_string(),
+                target_path: "cv:/m/k".to_string(),
+                block_size: 1,
+                replicas: 1,
+                storage_type: Default::default(),
+                ttl_ms: 0,
+                ttl_action: Default::default(),
+                mount_info: Default::default(),
+                create_time: 0,
+                overwrite: None,
+            },
+            task_id: "t1".to_string(),
+            worker: Default::default(),
+            source_path: "s3://b/k".to_string(),
+            target_path: "cv:/m/k".to_string(),
+            create_time: 1,
+            source_read_plan_json: String::new(),
+            transfer_report: None,
+            cache: None,
+        };
+
+        // Old (pre-Phase-3) payload: the `cache` key is absent entirely.
+        let mut value = serde_json::to_value(&task).unwrap();
+        value.as_object_mut().unwrap().remove("cache");
+        let decoded: super::LoadTaskInfo = serde_json::from_value(value).unwrap();
+        assert!(decoded.cache.is_none());
+
+        let spec = super::CacheLoadSpec {
+            incarnation: 42,
+            key: "dir/file".to_string(),
+            load_token: super::CacheOpTokenId {
+                client_id: 7,
+                op_seq: 8,
+            },
+            commit_token: super::CacheOpTokenId {
+                client_id: 7,
+                op_seq: 9,
+            },
+        };
+        let with_cache = super::LoadTaskInfo {
+            cache: Some(spec.clone()),
+            ..decoded
+        };
+        let round: super::LoadTaskInfo =
+            serde_json::from_value(serde_json::to_value(&with_cache).unwrap()).unwrap();
+        assert_eq!(round.cache.as_ref().unwrap(), &spec);
     }
 }

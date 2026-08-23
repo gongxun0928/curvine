@@ -1510,6 +1510,17 @@ impl CacheService {
         }
     }
 
+    /// Phase 3 (dual-mode metadata split): the AUTHORITATIVE current
+    /// incarnation of a mount, read by the job runner when it mints a
+    /// `CacheLoadSpec`. `None` = no installed incarnation: the load fails
+    /// closed — the worker must never self-issue one (gpt56 `f7788b98`
+    /// point 4: provenance is the master's alone).
+    pub fn current_incarnation_for_mount(&self, mount_id: u32) -> CommonResult<Option<u64>> {
+        let store = self.fs_dir.read();
+        let rocks = store.get_rocks_store();
+        rocks.cache_current_incarnation(mount_id).map_err(fs_err)
+    }
+
     /// Terminal revoked/stale diagnostic shared by every fenced path
     /// (get/allocate/commit/invalidate). TYPED: a boxed
     /// FsError::CacheIncarnationFenced, so the handler `?` (From<

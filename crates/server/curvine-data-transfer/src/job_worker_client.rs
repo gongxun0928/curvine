@@ -54,6 +54,36 @@ impl JobWorkerClient {
         self.rpc(RpcCode::SubmitTask, request).await
     }
 
+    /// Phase 3 (dual-mode metadata split): submit a cache-mode load task.
+    /// Same `LoadTaskInfo` wire struct (with `cache: Some(CacheLoadSpec)`),
+    /// different task type so the worker dispatches to the cache runner
+    /// which never touches the inode tree.
+    pub async fn submit_cache_load_task_response(
+        &self,
+        task: LoadTaskInfo,
+    ) -> FsResult<SubmitTaskResponse> {
+        let request = SubmitTaskRequest {
+            task_type: JobTaskType::CacheLoad.into(),
+            task_command: SerdeUtils::serialize(&task)?,
+        };
+
+        self.rpc(RpcCode::SubmitTask, request).await
+    }
+
+    pub async fn submit_cache_load_task(&self, task: LoadTaskInfo) -> FsResult<()> {
+        let response = self.submit_cache_load_task_response(task).await?;
+        if !response.accepted.unwrap_or(true) {
+            return Err(curvine_error::FsError::common(format!(
+                "Worker rejected cache load task {}: {}",
+                response.task_id,
+                response
+                    .reject_reason
+                    .unwrap_or_else(|| "no reason provided".to_string())
+            )));
+        }
+        Ok(())
+    }
+
     pub async fn submit_load_task(&self, task: LoadTaskInfo) -> FsResult<()> {
         let response = self.submit_load_task_response(task).await?;
         if !response.accepted.unwrap_or(true) {

@@ -20,7 +20,7 @@ use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::RpcCode;
-use curvine_model::{CompatibilityPolicy, CompatibilityVerdict, LoadTaskInfo};
+use curvine_model::{CompatibilityPolicy, CompatibilityVerdict, JobTaskType, LoadTaskInfo};
 use curvine_proto::*;
 use curvine_rpc::handler::MessageHandler;
 use curvine_rpc::message::{Builder, Message, RequestStatus, ResponseStatus};
@@ -365,7 +365,14 @@ impl WorkerHandler {
         let task: LoadTaskInfo = SerdeUtils::deserialize(&req.task_command)?;
         let task_id = task.task_id.clone();
 
-        let submit = self.task_manager.submit_task(task)?;
+        // Phase 3 (dual-mode metadata split): cache-mode load tasks run
+        // the CacheAllocate → planned-worker writes → CacheCommit loop
+        // against the cache index only. Unknown task types fall back to
+        // the incumbent fs-mode Load runner (proto2 wire compat).
+        let submit = match JobTaskType::from_i32(req.task_type) {
+            JobTaskType::CacheLoad => self.task_manager.submit_cache_task(task)?,
+            _ => self.task_manager.submit_task(task)?,
+        };
         let response = SubmitTaskResponse {
             task_id,
             accepted: Some(submit.accepted),

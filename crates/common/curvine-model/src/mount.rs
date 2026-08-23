@@ -273,6 +273,20 @@ impl MountInfo {
         }
     }
 
+    /// Phase 3 (dual-mode metadata split): the cache-index key for a UFS
+    /// path — the path relative to the mount's UFS root (prefix stripped,
+    /// no leading slash). The same derivation must be used by every
+    /// cache-mode participant (load tasks now; client read routing in
+    /// task #6), so it lives here rather than in any single caller.
+    pub fn get_cache_key<P: CurvinePath>(&self, path: &P) -> CommonResult<String> {
+        if path.is_cv() {
+            return err_box!("cache key path {} is not ufs path", path);
+        }
+
+        let sub_path = path.full_path().replacen(&self.ufs_path, "", 1);
+        Ok(sub_path.trim_start_matches('/').to_string())
+    }
+
     pub fn get_create_opts(&self, conf: &impl ClientConfDefaults) -> CreateFileOpts {
         let opts = CreateFileOptsBuilder::with_conf(conf).build();
         self.merge_create_opts(opts)
@@ -734,6 +748,31 @@ mod tests {
         };
         assert!(!cache_mode_mount.is_fs_mode());
         assert!(cache_mode_mount.is_cache_mode());
+    }
+
+    #[test]
+    fn test_get_cache_key_is_mount_relative_without_leading_slash() {
+        let info = MountInfo {
+            ufs_path: "s3://spark/test1".to_string(),
+            cv_path: "/spark/test1".to_string(),
+            ..Default::default()
+        };
+
+        // Deep file: prefix stripped, no leading slash.
+        let file = TestPath::from_str("s3://spark/test1/1.csv").unwrap();
+        assert_eq!(info.get_cache_key(&file).unwrap(), "1.csv");
+
+        // Nested directory component is preserved.
+        let nested = TestPath::from_str("s3://spark/test1/a/b/c.parquet").unwrap();
+        assert_eq!(info.get_cache_key(&nested).unwrap(), "a/b/c.parquet");
+
+        // Mount root itself maps to the empty key.
+        let root = TestPath::from_str("s3://spark/test1").unwrap();
+        assert_eq!(info.get_cache_key(&root).unwrap(), "");
+
+        // CV paths are rejected: cache keys are UFS-derived only.
+        let cv = TestPath::from_str("cv:/spark/test1/1.csv").unwrap();
+        assert!(info.get_cache_key(&cv).is_err());
     }
 
     #[test]

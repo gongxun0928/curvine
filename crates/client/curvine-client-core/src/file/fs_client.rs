@@ -747,6 +747,71 @@ impl FsClient {
         Ok(())
     }
 
+    /// Phase 3 (dual-mode metadata split): CacheAllocate over the wire.
+    ///
+    /// `token` must be a retry-stable op token minted once per load task by
+    /// the master and replayed verbatim across worker task retries and RPC
+    /// response losses — never re-derived from a transient rpc req_id.
+    pub async fn cache_allocate(
+        &self,
+        token: CacheOpTokenId,
+        incarnation: u64,
+        key: &str,
+        file_len: i64,
+        block_size: i64,
+    ) -> FsResult<CacheAllocateResponse> {
+        let req = CacheAllocateRequest {
+            token: CacheOpTokenProto {
+                client_id: token.client_id,
+                op_seq: token.op_seq,
+            },
+            incarnation,
+            key: key.to_string(),
+            block_size,
+            ttl_ms: Some(0),
+            file_len,
+        };
+        self.rpc(RpcCode::CacheAllocate, req).await
+    }
+
+    /// Phase 3: CacheCommit over the wire. Self-contained: the locations
+    /// that ACTUALLY succeeded, the UFS mtime observed at read time, and
+    /// the allocate's load token — enough to close the load after a crash
+    /// without any worker-resident state.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn cache_commit(
+        &self,
+        commit_token: CacheOpTokenId,
+        load_token: CacheOpTokenId,
+        incarnation: u64,
+        key: &str,
+        generation: u64,
+        object_id: i64,
+        file_len: i64,
+        ufs_mtime: i64,
+        blocks: Vec<CacheBlockLocationProto>,
+    ) -> FsResult<CacheCommitResponse> {
+        let req = CacheCommitRequest {
+            incarnation,
+            key: key.to_string(),
+            generation,
+            object_id,
+            file_len,
+            ufs_mtime,
+            ttl_ms: Some(0),
+            blocks,
+            token: CacheOpTokenProto {
+                client_id: commit_token.client_id,
+                op_seq: commit_token.op_seq,
+            },
+            load_token: CacheOpTokenProto {
+                client_id: load_token.client_id,
+                op_seq: load_token.op_seq,
+            },
+        };
+        self.rpc(RpcCode::CacheCommit, req).await
+    }
+
     pub async fn metrics_report(&self, metrics: Vec<MetricValue>) -> FsResult<()> {
         if metrics.is_empty() {
             return Ok(());
