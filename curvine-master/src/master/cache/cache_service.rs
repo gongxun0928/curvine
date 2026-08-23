@@ -1499,6 +1499,23 @@ impl CacheService {
     // re-invokes with the returned cursor until `done`; per-call work is
     // bounded by `max_pages`. ----
 
+    /// Shared external-cursor byte gate (review `cbd434bd`): every
+    /// driver that resumes from a caller-supplied cache-key cursor applies
+    /// the same `MAX_KEY_BYTES` bound as keys and scopes themselves, so no
+    /// unbounded string reaches a Rocks seek or the echoed progress.
+    fn validate_key_cursor(after: Option<&str>) -> CommonResult<()> {
+        if let Some(a) = after {
+            if a.len() > MAX_KEY_BYTES {
+                return err_box!(
+                    "cache mutation cursor exceeds {} bytes: {}",
+                    MAX_KEY_BYTES,
+                    a.len()
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Derive the journaled victims of one raw scope-scan page. Only rows
     /// that are NOT already Tombstoned produce victims (review
     /// `303fb807` P0-1): a committed scope-remove leaves `Tombstoned@g+1`
@@ -1549,6 +1566,7 @@ impl CacheService {
             );
         }
         let max_pages = max_pages.clamp(1, MUTATION_MAX_PAGES_PER_CALL);
+        Self::validate_key_cursor(after)?;
         if let Some(a) = after {
             if !crate::master::meta::cache::key_in_scope(a, scope) {
                 return err_box!("cache scope remove cursor {} is outside scope {}", a, scope);
@@ -1687,6 +1705,7 @@ impl CacheService {
         self.require_enabled()?;
         self.require_leader()?;
         let max_pages = max_pages.clamp(1, MUTATION_MAX_PAGES_PER_CALL);
+        Self::validate_key_cursor(after)?;
         {
             let store = self.fs_dir.read();
             let rocks = store.get_rocks_store();
@@ -4369,6 +4388,62 @@ mod tests {
         assert!(disabled.sweep_ttl(7, 1000, None, 4).is_err());
         assert!(disabled.vacuum_incarnation(7, 5, 1, None, 4).is_err());
         assert!(disabled.gc_outcomes(7, None, 4).is_err());
+    }
+
+    /// Review `cbd434bd`: the scope-remove driver's external String
+    /// cursor shares the 4096-byte key cap. A cap-sized in-scope cursor
+    /// is accepted (empty namespace: done with nothing journaled); one
+    /// byte over fails loud BEFORE any scan or scope-membership
+    /// reasoning.
+    #[test]
+    fn test_scope_remove_cursor_byte_cap() {
+        let service = build_service("scope-cursor-cap", chooser(vec![worker(1)]));
+        let at_cap = format!("/a/{}", "k".repeat(MAX_KEY_BYTES - 3));
+        assert_eq!(at_cap.len(), MAX_KEY_BYTES);
+        let p = service
+            .remove_scope(7, 1, "/a", Some(at_cap.as_str()), 4)
+            .unwrap();
+        assert!(p.done && p.processed == 0);
+
+        let over_cap = format!("/a/{}", "k".repeat(MAX_KEY_BYTES - 2));
+        assert_eq!(over_cap.len(), MAX_KEY_BYTES + 1);
+        let err = service
+            .remove_scope(7, 1, "/a", Some(over_cap.as_str()), 4)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cursor exceeds"),
+            "expected cursor byte-cap error, got: {}",
+            err
+        );
+    }
+
+    /// Review `cbd434bd`: the vacuum driver's external String cursor is
+    /// byte-gated before the incarnation-row verification — at-cap
+    /// passes the cursor gate and then fails on the missing gate-3 row;
+    /// over-cap fails on the byte cap itself.
+    #[test]
+    fn test_vacuum_cursor_byte_cap() {
+        let service = build_service("vacuum-cursor-cap", chooser(vec![worker(1)]));
+        let at_cap = format!("/a/{}", "k".repeat(MAX_KEY_BYTES - 3));
+        assert_eq!(at_cap.len(), MAX_KEY_BYTES);
+        let err = service
+            .vacuum_incarnation(7, 5, 1, Some(at_cap.as_str()), 4)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no incarnation row"),
+            "at-cap cursor must reach the incarnation gate, got: {}",
+            err
+        );
+
+        let over_cap = format!("/a/{}", "k".repeat(MAX_KEY_BYTES - 2));
+        let err = service
+            .vacuum_incarnation(7, 5, 1, Some(over_cap.as_str()), 4)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cursor exceeds"),
+            "expected cursor byte-cap error, got: {}",
+            err
+        );
     }
 
     /// Review `303fb807` P0-1: after a committed scope-remove page whose
