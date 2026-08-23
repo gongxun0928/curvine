@@ -1535,12 +1535,17 @@ mod tests {
         conf
     }
 
-    /// 4d RC2-1 (gpt56 `aa41c780` item 1): an End arriving inside a
-    /// Start's WM→cache window BLOCKS on the shared transition gate — it
-    /// cannot run against half-installed state (no-op both domains) and
-    /// leave the dead new session published. Also proves the
-    /// session-exact no-op end-to-end: an End for an older session after
-    /// a fresh Start changes nothing.
+    /// 4d RC2-1 (gpt56 `aa41c780` item 1 + final review `f14fa328`): an
+    /// End for the SAME NEW session arriving inside a Start's WM→cache
+    /// window BLOCKS on the shared transition gate — it cannot run
+    /// against half-installed state and let the Start re-publish the
+    /// dead session. After release, the End is EFFECTIVE in both
+    /// domains: WM row gone, registry row gone, and the ended
+    /// session's accumulator terminally invalidated (late full pages
+    /// Skipped — an ended session never Completes). A subsequent fresh
+    /// Start reopens, and stale Ends for every older session leave the
+    /// new registry/accumulator untouched (the lost-worker callback
+    /// rides the same exact primitive).
     #[test]
     fn worker_heartbeat_start_end_share_transition_gate() {
         let conf = gate_test_conf("master-handler-gate");
@@ -1629,7 +1634,10 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
 
-        // End(B) in the window: it must BLOCK on the shared gate.
+        // The B2 process's OWN End — for the SAME NEW session the
+        // starter is installing — arrives in the window: it must BLOCK
+        // on the shared gate (it cannot no-op against the still-old
+        // registry and let the Start publish dead B2 as live).
         let end_done = Arc::new(AtomicBool::new(false));
         let end_fs = fs.clone();
         let end_conf = conf.clone();
@@ -1638,7 +1646,7 @@ mod tests {
         let ender = thread::spawn(move || {
             MasterHandler::process_worker_heartbeat(
                 end_fs,
-                heartbeat_req(&end_conf, &end_addr, HeartbeatStatus::End, "B"),
+                heartbeat_req(&end_conf, &end_addr, HeartbeatStatus::End, "B2"),
             )
             .unwrap();
             end_flag.store(true, Ordering::SeqCst);
@@ -1646,10 +1654,13 @@ mod tests {
         thread::sleep(Duration::from_millis(300));
         assert!(
             !end_done.load(Ordering::SeqCst),
-            "End(B) must block while Start(B2) holds the transition gate"
+            "End(B2) must block while Start(B2) holds the transition gate"
         );
 
-        // Release the seam; both transitions complete.
+        // Release the seam; the starter finishes installing B2 and only
+        // then releases the gate, so the End is ordered strictly AFTER
+        // the Start and is EFFECTIVE (the original race: without the
+        // shared gate the End could no-op first and leave dead B2 live).
         {
             let mut g = parked.0.lock().unwrap();
             *g = true;
@@ -1659,12 +1670,21 @@ mod tests {
         ender.join().unwrap();
         assert!(end_done.load(Ordering::SeqCst));
 
-        // Converged final state (either completion order): registry and
-        // accumulator are bound to the NEW session B2; WM holds no row
-        // (Start removed it; only a later Running re-inserts).
+        // Final state: WM holds no row (Start removed it, End found
+        // nothing to remove, nothing re-inserted); the registry row is
+        // gone; the ended session's accumulator is TERMINALLY invalid —
+        // its late full pages are Skipped, so an ended session can
+        // never accumulate to Complete.
         let spine = fs.cache_service.session_spine_snapshot(9);
-        assert_eq!(spine.registry.map(|(s, _)| s).as_deref(), Some("B2"));
-        assert_eq!(spine.accumulator.map(|(s, _)| s).as_deref(), Some("B2"));
+        assert!(
+            spine.registry.is_none(),
+            "End(B2) must retire the registry row"
+        );
+        assert_eq!(
+            spine.accumulator,
+            Some(("B2".to_string(), true)),
+            "End(B2) must terminalize the B2 accumulator"
+        );
         assert!(fs
             .worker_manager
             .read()
@@ -1672,17 +1692,39 @@ mod tests {
             .workers()
             .get(&9)
             .is_none());
+        assert!(matches!(
+            fs.cache_service.cache_full_report_page(9, "B2", 5, &[]),
+            CacheFullReportOutcome::Skipped
+        ));
 
-        // Stale-End no-op end-to-end: an End for the OLD session after
-        // the fresh Start changes nothing in either domain.
+        // A fresh Start reopens cleanly after the exact End.
         MasterHandler::process_worker_heartbeat(
             fs.clone(),
-            heartbeat_req(&conf, &address, HeartbeatStatus::End, "B-old"),
+            heartbeat_req(&conf, &address, HeartbeatStatus::Start, "B3"),
         )
         .unwrap();
         let spine = fs.cache_service.session_spine_snapshot(9);
-        assert_eq!(spine.registry.map(|(s, _)| s).as_deref(), Some("B2"));
-        assert_eq!(spine.accumulator.map(|(s, _)| s).as_deref(), Some("B2"));
+        assert_eq!(spine.registry.map(|(s, _)| s).as_deref(), Some("B3"));
+        assert_eq!(
+            spine.accumulator,
+            Some(("B3".to_string(), false)),
+            "a fresh Start installs a fresh, non-terminal accumulator"
+        );
+
+        // Stale Ends for every older session (B and the ended B2) leave
+        // the new registry/accumulator untouched in both domains — the
+        // lost-worker callback rides this same exact primitive, so an
+        // exact-old lost callback after a new Start no-ops identically.
+        for stale in ["B", "B2"] {
+            MasterHandler::process_worker_heartbeat(
+                fs.clone(),
+                heartbeat_req(&conf, &address, HeartbeatStatus::End, stale),
+            )
+            .unwrap();
+        }
+        let spine = fs.cache_service.session_spine_snapshot(9);
+        assert_eq!(spine.registry.map(|(s, _)| s).as_deref(), Some("B3"));
+        assert_eq!(spine.accumulator, Some(("B3".to_string(), false)));
     }
 
     /// 4d RC2-2 (gpt56 `aa41c780` item 2): a Start the cache domain

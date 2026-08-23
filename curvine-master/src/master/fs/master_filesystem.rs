@@ -1360,9 +1360,12 @@ impl MasterFilesystem {
             .begin_cache_session(address.worker_id, session, address)
     }
 
-    /// 4d (R9-2): an End heartbeat's cache-domain retirement —
-    /// session-exact against the volatile registry; a no-op when a
-    /// newer Start already replaced the session.
+    /// 4d (R9-2 + final-review `f14fa328`): an End heartbeat's — and the
+    /// lost-worker callback's, via the SAME exact primitive — cache-domain
+    /// retirement: session-exact against the volatile registry AND the
+    /// accumulator (a hit retires registry/live and terminalizes the
+    /// same-session accumulator); a no-op with zero side effects on both
+    /// domains when a newer Start already replaced the session.
     pub fn end_worker_session(&self, worker_id: u32, session: &str) {
         if session.is_empty() {
             return;

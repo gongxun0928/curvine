@@ -2682,12 +2682,38 @@ impl CacheService {
         Ok(())
     }
 
-    /// 4d (R9-2): retire the worker's session EXACTLY (End heartbeat or
-    /// lost-worker callback). No-op unless the registry still records
-    /// this exact wire session id — a newer Start in between wins.
+    /// 4d (R9-2 + final-review `f14fa328`): retire the worker's session
+    /// EXACTLY (End heartbeat or lost-worker callback), under the
+    /// declared `accumulator → volatile` lock order with BOTH guards
+    /// held. Only when the registry's CURRENT wire session equals the
+    /// retiring session: retire the registry row and live set, bump the
+    /// reconcile generation, AND terminally invalidate the SAME-session
+    /// accumulator (per `0b900a2f`, its late full pages stay Skipped —
+    /// an ended session must never accumulate to Complete). A stale
+    /// End/lost callback (registry holds a different session, or none)
+    /// has ZERO side effects on both domains.
     pub fn retire_worker_session(&self, worker_id: u32, session: &str) -> bool {
+        if session.is_empty() {
+            return false;
+        }
+        let mut sessions = self.report_sessions.lock().unwrap();
         let mut volatile = self.lock_volatile();
-        volatile.retire_session(worker_id, session)
+        if !volatile.retire_session(worker_id, session) {
+            return false;
+        }
+        // Exact registry hit: terminalize the matching accumulator row.
+        // The guard on the row's own session is defensive parity — the
+        // accumulator is only ever installed bound to the registry's
+        // current session, so this is the same session by construction;
+        // if they ever diverge, only the exact match dies.
+        if let Some(sess) = sessions.get_mut(&worker_id) {
+            if sess.session == session {
+                sess.invalid = true;
+                sess.entries.clear();
+                sess.update_time_ms = LocalTime::mills();
+            }
+        }
+        true
     }
 
     /// 4d (R9-3): the Start acceptance for the cache domain — holds the
@@ -6443,6 +6469,56 @@ mod tests {
         assert_eq!(rev.retired.len(), 2, "second retire session recorded");
         assert_eq!(rev.retired[1].tag, 2);
         assert!(rev.retired[1].entries.contains(&(200, 2)));
+    }
+
+    /// Final review `f14fa328`: the service-level cache End/lost retire
+    /// is EXACT in BOTH domains — a hit retires registry/live AND
+    /// terminally invalidates the same-session accumulator (an ended
+    /// session can never accumulate to Complete); a stale retire has
+    /// zero side effects on either domain.
+    #[test]
+    fn test_4d_service_retire_exact_terminalizes_accumulator() {
+        let service = build_service("retire-terminal", chooser(vec![worker(1)]));
+        service.begin_cache_session(1, "s1", &worker(1)).unwrap();
+
+        // Partial accumulation for s1.
+        assert!(matches!(
+            service.cache_full_report_page(1, "s1", 3, &[report(1, 64)]),
+            CacheFullReportOutcome::Partial
+        ));
+
+        // Stale retire: registry keeps s1, the accumulator keeps
+        // accepting pages of s1.
+        assert!(!service.retire_worker_session(1, "other"));
+        let spine = service.session_spine_snapshot(1);
+        assert_eq!(spine.registry.map(|(s, _)| s).as_deref(), Some("s1"));
+        assert_eq!(spine.accumulator, Some(("s1".to_string(), false)));
+        assert!(matches!(
+            service.cache_full_report_page(1, "s1", 3, &[report(2, 64)]),
+            CacheFullReportOutcome::Partial
+        ));
+
+        // Exact retire: registry gone AND accumulator terminal; late
+        // pages of the ended session are Skipped forever.
+        assert!(service.retire_worker_session(1, "s1"));
+        let spine = service.session_spine_snapshot(1);
+        assert!(spine.registry.is_none());
+        assert_eq!(spine.accumulator, Some(("s1".to_string(), true)));
+        assert!(matches!(
+            service.cache_full_report_page(1, "s1", 3, &[report(3, 64)]),
+            CacheFullReportOutcome::Skipped
+        ));
+
+        // A fresh Start reopens with a fresh accumulator; the ended
+        // session's pages stay foreign (Skipped).
+        service.begin_cache_session(1, "s2", &worker(1)).unwrap();
+        let spine = service.session_spine_snapshot(1);
+        assert_eq!(spine.registry.map(|(s, _)| s).as_deref(), Some("s2"));
+        assert_eq!(spine.accumulator, Some(("s2".to_string(), false)));
+        assert!(matches!(
+            service.cache_full_report_page(1, "s1", 3, &[report(4, 64)]),
+            CacheFullReportOutcome::Skipped
+        ));
     }
 
     /// 4d R7-5: strict single-key accumulator lifecycle — partial pages
