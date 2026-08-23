@@ -361,7 +361,9 @@ struct RetiredSession {
 }
 
 impl RetiredSession {
-    /// Total identities queued in this record (diagnostics/tests).
+    /// Total identities queued in this record (tests only — the
+    /// production drain never pre-counts, round-3 P0-2).
+    #[cfg(test)]
     fn entries_total(&self) -> usize {
         self.entries.values().map(|s| s.len()).sum()
     }
@@ -381,12 +383,12 @@ struct WorkerRev {
 }
 
 impl WorkerRev {
+    #[cfg(test)]
     fn live_contains(&self, object_id: i64, seq: i64) -> bool {
-        self.live
-            .get(&object_id)
-            .is_some_and(|s| s.contains(&seq))
+        self.live.get(&object_id).is_some_and(|s| s.contains(&seq))
     }
 
+    #[cfg(test)]
     fn live_len(&self) -> usize {
         self.live.values().map(|s| s.len()).sum()
     }
@@ -739,16 +741,23 @@ impl CacheVolatile {
         }
     }
 
-    /// Object-level volatile drop, RC2-round2 bounded form (gpt56
-    /// `25d4b51e` P0-2): remove the retained locations entry, the
-    /// quarantine row (+ its directed-index traces), and each holder's
-    /// live/retired OBJECT rows. With object-keyed live/retired sets and
-    /// the additive `location_holders` index the whole drop is
-    /// O(#holders + #quarantine-reporters) map removals — no seq
-    /// materialization, no holders×seqs nesting, and it works when the
-    /// locations row never existed (quarantine-only objects MUST clear
-    /// their row too). Same-guard callers (GC completion /
-    /// no-geometry retire) make it atomic.
+    /// Object-level volatile drop, round-3 bounded form (gpt56
+    /// `f5980e03` P0-3): remove the retained locations entry, the
+    /// quarantine row (+ its directed-index traces), the holders-index
+    /// row, and each holder's LIVE object row only. Retired-session
+    /// records are deliberately NOT scanned — a worker's retired deque
+    /// holds one record per past session and rapid restarts make that
+    /// generation count unbounded, so a synchronous sweep here would
+    /// reintroduce unbounded work at GC completion. Stale identities in
+    /// retired records self-heal through the bounded RR drain instead:
+    /// the locations row is already gone, so the drain's replica strip
+    /// is a no-op map miss and only the record entry goes. With
+    /// object-keyed live sets and the additive `location_holders` index
+    /// the synchronous part is O(#holders + #quarantine-reporters) map
+    /// removals — no seq materialization, no holders×seqs nesting, and
+    /// it works when the locations row never existed (quarantine-only
+    /// objects MUST clear their row too). Same-guard callers (GC
+    /// completion / no-geometry retire) make it atomic.
     fn drop_object_state(&mut self, object_id: i64) {
         self.locations.remove(&object_id);
         if let Some(row) = self.quarantine.remove(&object_id) {
@@ -761,43 +770,41 @@ impl CacheVolatile {
                         tags.remove(&t);
                     }
                 }
-                if self
-                    .quarantine_index
-                    .get(&w)
-                    .is_none_or(|m| m.is_empty())
-                {
+                if self.quarantine_index.get(&w).is_none_or(|m| m.is_empty()) {
                     self.quarantine_index.remove(&w);
                 }
             }
         }
-        let holders = self
-            .location_holders
-            .remove(&object_id)
-            .unwrap_or_default();
+        let holders = self.location_holders.remove(&object_id).unwrap_or_default();
         for worker_id in holders {
             if let Some(rev) = self.by_worker.get_mut(&worker_id) {
+                // LIVE row only (round-3 P0-3): retired records are left
+                // for the bounded RR drain's no-op self-heal.
                 rev.live.remove(&object_id);
-                for record in rev.retired.iter_mut() {
-                    record.entries.remove(&object_id);
-                }
             }
         }
     }
 
-    /// 4d.2 (R8-2/R9-1, RC3 fairness): bounded METADATA-ONLY drain of
-    /// retired-session reverse entries. For each retired
-    /// `(object_id, seq)` identity the holding worker's replica row is
-    /// removed from the published locations — the current-tag read
-    /// filter would already exclude it, so this reclaims the row space
-    /// and stops the stale replica from surviving forever. No physical
-    /// delete is enqueued (the 4d.3 full-report reconcile owns physical
-    /// reclamation for retired sessions). Bounded per call by
+    /// 4d.2 (R8-2/R9-1, RC3 fairness, round-3 bounded form): bounded
+    /// METADATA-ONLY drain of retired-session reverse entries. For each
+    /// retired `(object_id, seq)` identity the holding worker's replica
+    /// row is removed from the published locations — the current-tag
+    /// read filter would already exclude it, so this reclaims the row
+    /// space and stops the stale replica from surviving forever. No
+    /// physical delete is enqueued (the 4d.3 full-report reconcile owns
+    /// physical reclamation for retired sessions). Bounded per call by
     /// `RETIRED_DRAIN_PER_TICK` identities AND per worker visit by
     /// `RETIRED_DRAIN_QUANTUM`; traversal covers only the pending-retired
     /// round-robin (`retired_rr`), and each visited worker is rotated to
     /// the back while unfinished, so one worker's large queue can never
     /// starve another's. A record stays at the front of its deque until
-    /// fully visited.
+    /// fully visited. Round-3 (gpt56 `f5980e03` P0-2): the visit NEVER
+    /// pre-counts the front record (`entries_total()` walked every
+    /// object row — a million single-seq objects made one 256-identity
+    /// tick O(million)); `take` is now `min(budget, quantum)` consumed
+    /// lazily through the flat-map iterator, and popping a degenerate
+    /// EMPTY record costs one budget unit so a long empty history
+    /// cannot be walked for free in a single tick.
     fn drain_retired(&mut self) -> usize {
         let mut budget = RETIRED_DRAIN_PER_TICK;
         let mut removed = 0usize;
@@ -807,30 +814,55 @@ impl CacheVolatile {
             };
             // Snapshot what this visit drains (tag + identities) without
             // holding the WorkerRev borrow across the locations mutation.
-            let (front_tag, drained): (u64, Vec<(i64, i64)>) = {
+            // Leading empty records (which the live-only object drop can
+            // leave behind) are popped at one budget unit each — bounded
+            // deque traversal even for degenerate histories.
+            let snapshot: Option<(u64, Vec<(i64, i64)>)> = {
                 let Some(rev) = self.by_worker.get_mut(&worker_id) else {
                     self.retired_rr.pop_front();
                     self.retired_rr_set.remove(&worker_id);
                     continue;
                 };
-                let Some(front) = rev.retired.front_mut() else {
-                    self.retired_rr.pop_front();
-                    self.retired_rr_set.remove(&worker_id);
-                    continue;
-                };
-                let take = front
-                    .entries_total()
-                    .min(budget)
-                    .min(RETIRED_DRAIN_QUANTUM);
-                (
-                    front.tag,
-                    front
-                        .entries
-                        .iter()
-                        .flat_map(|(obj, seqs)| seqs.iter().map(move |s| (*obj, *s)))
-                        .take(take)
-                        .collect(),
-                )
+                loop {
+                    match rev.retired.front_mut() {
+                        None => break None,
+                        Some(front) if front.entries.is_empty() => {
+                            rev.retired.pop_front();
+                            budget -= 1;
+                            if budget == 0 {
+                                break None;
+                            }
+                        }
+                        Some(front) => {
+                            let take = budget.min(RETIRED_DRAIN_QUANTUM);
+                            let tag = front.tag;
+                            let drained: Vec<(i64, i64)> = front
+                                .entries
+                                .iter()
+                                .flat_map(|(obj, seqs)| seqs.iter().map(move |s| (*obj, *s)))
+                                .take(take)
+                                .collect();
+                            break Some((tag, drained));
+                        }
+                    }
+                }
+            };
+            let Some((front_tag, drained)) = snapshot else {
+                // No non-empty record was reachable within this tick's
+                // budget. Dequeue the worker when its retired deque is
+                // fully empty; otherwise rotate it so the remainder is
+                // visited on a later tick.
+                let still_pending = self
+                    .by_worker
+                    .get(&worker_id)
+                    .is_some_and(|rev| !rev.retired.is_empty());
+                let front_worker = self.retired_rr.pop_front().unwrap();
+                if still_pending {
+                    self.retired_rr.push_back(front_worker);
+                } else {
+                    self.retired_rr_set.remove(&front_worker);
+                }
+                continue;
             };
             let take = drained.len();
             for (object_id, seq) in drained {
@@ -3454,13 +3486,15 @@ impl CacheService {
         // Apply under the same volatile guard (R7-4: classification and
         // location mutation share one serialized domain — no TOCTOU
         // window for a concurrent Start/publish).
-        let mut outcome = CacheIncrOutcome::default();
         // P0-1 (gpt56 `25d4b51e` item 1): the decision is bound to THIS
         // registry tag; the handler's WorkerManager side effects recheck
         // it under the transition gate before applying, so an outcome
         // computed before a Start/lost swap can never act on the new
         // session.
-        outcome.session_tag = reg_tag;
+        let mut outcome = CacheIncrOutcome {
+            session_tag: reg_tag,
+            ..Default::default()
+        };
         for (block_id, decision) in decisions {
             match decision {
                 Dec::Defer => {}
@@ -3492,9 +3526,8 @@ impl CacheService {
                             .get(&object_id)
                             .and_then(|l| l.blocks.get(&seq))
                             .is_some_and(|rs| {
-                                rs.iter().any(|r| {
-                                    r.worker.worker_id == worker_id && r.tag == reg_tag
-                                })
+                                rs.iter()
+                                    .any(|r| r.worker.worker_id == worker_id && r.tag == reg_tag)
                             });
                         if !still_holds {
                             if let Some(rev) = volatile.by_worker.get_mut(&worker_id) {
@@ -3621,21 +3654,34 @@ impl CacheService {
         let seq = BlockIdCodec::get_seq(block_id);
         let mut volatile = self.lock_volatile();
         let key = (worker_id, session_tag);
-        let row_empty = {
+        // Round-3 P1 (gpt56 `f5980e03` item 4): the directed index is
+        // pruned as soon as THIS exact `(worker, tag)` subrow for the
+        // object is empty — independently of the object row's other
+        // reporters. Waiting for the whole object row to empty leaks a
+        // stale object reference in `quarantine_index[worker][tag]`
+        // whenever another reporter still holds quarantine for the
+        // object.
+        let mut index_prune = false;
+        let row_now_empty = {
             let Some(row) = volatile.quarantine.get_mut(&object_id) else {
                 return;
             };
-            if let Some(seqs) = row.get_mut(&key) {
+            let key_empty = if let Some(seqs) = row.get_mut(&key) {
                 seqs.remove(&seq);
-            }
-            let key_empty = row.get(&key).is_some_and(|s| s.is_empty());
+                seqs.is_empty()
+            } else {
+                false
+            };
             if key_empty {
                 row.remove(&key);
+                index_prune = true;
             }
             row.is_empty()
         };
-        if row_empty {
+        if row_now_empty {
             volatile.quarantine.remove(&object_id);
+        }
+        if index_prune {
             if let Some(tags) = volatile.quarantine_index.get_mut(&worker_id) {
                 if let Some(objs) = tags.get_mut(&session_tag) {
                     objs.remove(&object_id);
@@ -7219,11 +7265,7 @@ mod tests {
                 fences: vec![],
             },
         );
-        volatile
-            .by_worker
-            .entry(7)
-            .or_default()
-            .live_insert(42, 1);
+        volatile.by_worker.entry(7).or_default().live_insert(42, 1);
         volatile
             .gc
             .enqueue(CacheGcWork {
@@ -7272,11 +7314,7 @@ mod tests {
         volatile
             .install_session(7, "s1".to_string(), worker(7))
             .unwrap();
-        volatile
-            .by_worker
-            .entry(7)
-            .or_default()
-            .live_insert(100, 1);
+        volatile.by_worker.entry(7).or_default().live_insert(100, 1);
         assert_eq!(
             volatile.reconcile_gens.get(&7).copied().unwrap_or(0),
             1,
@@ -7298,7 +7336,10 @@ mod tests {
         assert!(rev.live.is_empty());
         assert_eq!(rev.retired.len(), 1);
         assert_eq!(rev.retired[0].tag, 1);
-        assert!(rev.retired[0].entries.get(&100).is_some_and(|s| s.contains(&1)));
+        assert!(rev.retired[0]
+            .entries
+            .get(&100)
+            .is_some_and(|s| s.contains(&1)));
         assert_eq!(volatile.reconcile_gens.get(&7).copied().unwrap_or(0), 2);
 
         // Retiring an already-retired session is a no-op (registry row
@@ -7311,11 +7352,7 @@ mod tests {
         volatile
             .install_session(7, "s1-again".to_string(), worker(7))
             .unwrap();
-        volatile
-            .by_worker
-            .get_mut(&7)
-            .unwrap()
-            .live_insert(200, 2);
+        volatile.by_worker.get_mut(&7).unwrap().live_insert(200, 2);
         let tag = volatile
             .install_session(7, "s2".to_string(), worker(7))
             .unwrap();
@@ -7324,7 +7361,10 @@ mod tests {
         assert!(rev.live.is_empty());
         assert_eq!(rev.retired.len(), 2, "second retire session recorded");
         assert_eq!(rev.retired[1].tag, 2);
-        assert!(rev.retired[1].entries.get(&200).is_some_and(|s| s.contains(&2)));
+        assert!(rev.retired[1]
+            .entries
+            .get(&200)
+            .is_some_and(|s| s.contains(&2)));
     }
 
     /// Final review `f14fa328`: the service-level cache End/lost retire
@@ -8421,7 +8461,9 @@ mod tests {
             }
             let live = &volatile.by_worker[&1].live;
             assert!(
-                (live.get(&OBJ).is_some_and(|s| s.contains(&1) && s.contains(&3)))
+                (live
+                    .get(&OBJ)
+                    .is_some_and(|s| s.contains(&1) && s.contains(&3)))
             );
             assert!(!live.get(&OBJ).is_some_and(|s| s.contains(&2)));
             // Reconcile generation bumped past the install bump.
@@ -8471,9 +8513,7 @@ mod tests {
             let tag = volatile.worker_sessions[&1].tag;
             let quarantined = volatile.quarantine.get(&OBJ).unwrap();
             for seq in [1i64, 2, 3] {
-                assert!(quarantined
-                    .get(&(1, tag))
-                    .is_some_and(|s| s.contains(&seq)));
+                assert!(quarantined.get(&(1, tag)).is_some_and(|s| s.contains(&seq)));
             }
         }
 
@@ -9271,7 +9311,9 @@ mod tests {
 
         // Worker 1's Start purges only ITS old-tag entries — worker 2's
         // quarantine (different worker, different object) is untouched.
-        service.begin_cache_session(1, "fresh-1", &worker(1)).unwrap();
+        service
+            .begin_cache_session(1, "fresh-1", &worker(1))
+            .unwrap();
         assert!(!service.quarantine_contains(OBJ, 1, t1, 1));
         assert!(service.quarantine_contains(OBJ + 1, 2, t2, 1));
         {
@@ -9280,6 +9322,195 @@ mod tests {
             assert!(volatile.quarantine.contains_key(&(OBJ + 1)));
             assert!(!volatile.quarantine_index.contains_key(&1));
             assert!(volatile.quarantine_index.contains_key(&2));
+        }
+    }
+
+    /// Round-3 P0-2 (gpt56 `f5980e03` item 2): a drain tick must be
+    /// bounded in TRAVERSAL, not just in returned identities. Degenerate
+    /// EMPTY leading records (which the live-only object drop can leave
+    /// behind) each cost one budget unit, so one tick cannot walk an
+    /// arbitrarily long empty history for free; and a many-object /
+    /// single-seq front record drains exactly `min(budget, quantum)`
+    /// identities per visit with no full pre-count.
+    #[test]
+    fn test_4d2_r3_bounded_drain_traversal() {
+        // -- Part 1: empty-record popping consumes budget. --
+        let mut volatile = CacheVolatile::default();
+        const EMPTY_RECORDS: usize = 5000;
+        {
+            let rev = volatile.by_worker.entry(9).or_default();
+            for _ in 0..EMPTY_RECORDS {
+                rev.retired.push_back(RetiredSession {
+                    tag: 1,
+                    entries: HashMap::new(),
+                });
+            }
+            let mut tail: HashMap<i64, HashSet<i64>> = HashMap::new();
+            tail.entry(OBJ).or_default().insert(1);
+            rev.retired.push_back(RetiredSession {
+                tag: 1,
+                entries: tail,
+            });
+        }
+        volatile.retired_rr.push_back(9);
+        volatile.retired_rr_set.insert(9);
+
+        // One tick: at most RETIRED_DRAIN_PER_TICK budget units are
+        // spent. The pre-fix shape popped every empty record without
+        // deducting budget (a single tick could scan the entire
+        // history); now the walk stops when the budget does.
+        let removed = volatile.drain_retired();
+        assert_eq!(removed, 0, "identity drain only reached after pops");
+        let records_left = volatile.by_worker[&9].retired.len();
+        assert_eq!(
+            records_left,
+            EMPTY_RECORDS + 1 - RETIRED_DRAIN_PER_TICK,
+            "empty-record traversal is budget-capped per tick"
+        );
+        // Repeated ticks eventually clear the history and dequeue the
+        // worker (bounded self-heal, never an unbounded single pass).
+        for _ in 0..10 {
+            volatile.drain_retired();
+        }
+        assert!(volatile.by_worker[&9].retired.is_empty());
+        assert!(!volatile.retired_rr.contains(&9));
+        assert!(!volatile.retired_rr_set.contains(&9));
+
+        // -- Part 2: many-object single-seq front record — the visit
+        // takes min(budget, quantum) identities per worker turn without
+        // counting the whole record first. --
+        let mut volatile = CacheVolatile::default();
+        const OBJS: i64 = 3000;
+        {
+            let rev = volatile.by_worker.entry(9).or_default();
+            let mut entries = HashMap::new();
+            for o in 0..OBJS {
+                entries
+                    .entry(OBJ + o)
+                    .or_insert_with(HashSet::new)
+                    .insert(1);
+            }
+            rev.retired.push_back(RetiredSession { tag: 1, entries });
+        }
+        volatile.retired_rr.push_back(9);
+        volatile.retired_rr_set.insert(9);
+        let removed = volatile.drain_retired();
+        assert_eq!(removed, RETIRED_DRAIN_PER_TICK);
+        let left = volatile.by_worker[&9].retired[0].entries_total();
+        assert_eq!(left, (OBJS as usize) - RETIRED_DRAIN_PER_TICK);
+    }
+
+    /// Round-3 P0-3 (gpt56 `f5980e03` item 3): `drop_object_state` is
+    /// LIVE-ONLY for the reverse view — it never scans the worker's
+    /// retired generations (unbounded under rapid restarts). The stale
+    /// identities left in retired records self-heal through the bounded
+    /// RR drain: the locations row is already gone, so the drain's
+    /// replica strip is a no-op map miss and only the record entries go.
+    #[test]
+    fn test_4d2_r3_drop_live_only_and_retired_self_heal() {
+        const GENERATIONS: usize = 100;
+        let mut volatile = CacheVolatile::default();
+        volatile.location_holders.insert(OBJ, HashSet::from([1]));
+        {
+            let rev = volatile.by_worker.entry(1).or_default();
+            rev.live.insert(OBJ, HashSet::from([1, 2, 3]));
+            for gen in 0..GENERATIONS {
+                let mut entries = HashMap::new();
+                entries.insert(OBJ, HashSet::from([1, 2, 3]));
+                rev.retired.push_back(RetiredSession {
+                    tag: 10 + gen as u64,
+                    entries,
+                });
+            }
+        }
+        volatile.retired_rr.push_back(1);
+        volatile.retired_rr_set.insert(1);
+
+        // The drop clears the synchronous traces only: live row +
+        // holders index (plus locations/quarantine, empty here).
+        volatile.drop_object_state(OBJ);
+        assert!(!volatile.location_holders.contains_key(&OBJ));
+        assert!(
+            volatile.by_worker[&1].live.is_empty(),
+            "live object row drops synchronously"
+        );
+        // ...and deliberately does NOT touch the retired generations.
+        assert_eq!(volatile.by_worker[&1].retired.len(), GENERATIONS);
+        assert_eq!(volatile.by_worker[&1].retired[0].entries_total(), 3);
+
+        // Bounded self-heal: every drain tick stays under the per-tick
+        // cap, the (already-dropped) locations strip is a no-op, and
+        // the stale identities clear record by record until the worker
+        // leaves the round-robin.
+        let mut total = 0usize;
+        loop {
+            let removed = volatile.drain_retired();
+            assert!(removed <= RETIRED_DRAIN_PER_TICK);
+            total += removed;
+            if removed == 0 && volatile.by_worker[&1].retired.is_empty() {
+                break;
+            }
+            if total > GENERATIONS * 3 + RETIRED_DRAIN_PER_TICK {
+                panic!("self-heal drain did not converge");
+            }
+        }
+        assert_eq!(total, GENERATIONS * 3);
+        assert!(volatile.by_worker[&1].retired.is_empty());
+        assert!(!volatile.retired_rr_set.contains(&1));
+    }
+
+    /// Round-3 P1 (gpt56 `f5980e03` item 4): the directed quarantine
+    /// index is pruned as soon as THIS reporter's exact `(worker, tag)`
+    /// subrow for the object empties — independently of other reporters
+    /// still holding quarantine rows for the same object. Waiting for
+    /// the whole object row leaks a stale `quarantine_index` entry.
+    #[test]
+    fn test_4d2_r3_ack_prunes_directed_index_per_reporter() {
+        let service = build_service("4d2-r3p1", chooser(vec![worker(1), worker(2)]));
+        seed_sessions(&service, &[worker(1), worker(2)]);
+        let b1 = layout(OBJ, 130).block_id(1).unwrap();
+
+        // Both workers orphan-report the same block: two exact
+        // quarantine identities on ONE object row.
+        service
+            .incr_block_report(1, "seed-1", &[report(b1, 64)])
+            .unwrap();
+        service
+            .incr_block_report(2, "seed-2", &[report(b1, 64)])
+            .unwrap();
+        let t1 = service.cache_session_tag(1).unwrap();
+        let t2 = service.cache_session_tag(2).unwrap();
+        {
+            let volatile = service.state.lock().unwrap();
+            assert!(volatile.quarantine[&OBJ].contains_key(&(1, t1)));
+            assert!(volatile.quarantine[&OBJ].contains_key(&(2, t2)));
+            assert!(volatile.quarantine_index.contains_key(&1));
+            assert!(volatile.quarantine_index.contains_key(&2));
+        }
+
+        // Ack worker 1's identity: the object row survives (worker 2
+        // still quarantined) but worker 1's directed-index trace MUST
+        // go now — the subrow `(1, t1)` is empty.
+        service.ack_cache_deleted(1, t1, b1);
+        {
+            let volatile = service.state.lock().unwrap();
+            assert!(
+                volatile.quarantine.contains_key(&OBJ),
+                "worker 2's quarantine row survives"
+            );
+            assert!(
+                !volatile.quarantine_index.contains_key(&1),
+                "reporter-empty subrow prunes the directed index immediately"
+            );
+            assert!(volatile.quarantine_index.contains_key(&2));
+        }
+
+        // Acking worker 2 clears the last row and the last trace.
+        service.ack_cache_deleted(2, t2, b1);
+        {
+            let volatile = service.state.lock().unwrap();
+            assert!(!volatile.quarantine.contains_key(&OBJ));
+            assert!(!volatile.quarantine_index.contains_key(&2));
         }
     }
 }

@@ -1433,6 +1433,21 @@ impl MasterFilesystem {
             );
             return;
         }
+        // #[cfg(test)] deterministic seam (4d.2 round-3, gpt56 `f5980e03`
+        // P0-1 / `48dec504` outcome-wins branch): fires AFTER the recheck
+        // passed, with the transition gate held and the WM guard held.
+        // The lost-worker transition also takes `start_gate`, so a lost
+        // retire arriving in this window must BLOCK — tests prove it via
+        // `start_gate.try_lock()` failing here. Compiled out outside
+        // cfg(test); never set in production.
+        #[cfg(test)]
+        if let Some(hook) = crate::master::master_handler::INCR_OUTCOME_SEAM
+            .lock()
+            .unwrap()
+            .as_ref()
+        {
+            hook();
+        }
         for id in outcome.remove_blocks {
             wm.remove_block(worker_id, id);
         }
@@ -2496,8 +2511,7 @@ mod tests {
         let tag2 = fs.cache_service.cache_session_tag(1).unwrap();
         assert_eq!(tag2, fresh_tag);
         assert!(
-            fs.cache_service
-                .quarantine_contains(obj, 1, fresh_tag, 2),
+            fs.cache_service.quarantine_contains(obj, 1, fresh_tag, 2),
             "new-session quarantine survives the stale outcome release"
         );
 
@@ -2505,17 +2519,12 @@ mod tests {
         // quarantine and a same-tag Finalized re-report publishes again.
         let acked = fs
             .cache_service
-            .incr_block_report(
-                1,
-                "s2",
-                &[BlockReportInfo::with_deleted(b2, 64)],
-            )
+            .incr_block_report(1, "s2", &[BlockReportInfo::with_deleted(b2, 64)])
             .unwrap();
         assert_eq!(acked.deleted_acks, vec![b2]);
         fs.apply_cache_incr_outcome(1, acked);
         assert!(
-            !fs.cache_service
-                .quarantine_contains(obj, 1, fresh_tag, 2),
+            !fs.cache_service.quarantine_contains(obj, 1, fresh_tag, 2),
             "exact-tag ack releases the quarantine identity"
         );
         let republish = fs
@@ -2533,5 +2542,228 @@ mod tests {
             .unwrap();
         assert!(republish.remove_blocks.is_empty());
         assert!(fs.cache_service.live_contains(1, obj, 2));
+    }
+
+    /// Round-3 P0-1 (gpt56 `f5980e03` + `48dec504`): the lost-worker
+    /// transition (WM removal + exact cache retire) and the fenced
+    /// outcome apply share one `start_gate`, so they are LINEARIZED —
+    /// dual-branch deterministic matrix:
+    ///
+    /// - lost-wins: the outcome's decision exists but has not taken the
+    ///   gate; lost completes the exact retire first; the apply's tag
+    ///   recheck then sees the registry gone and drops the outcome with
+    ///   zero WM/ack side effects.
+    /// - outcome-wins: the apply holds the gate and has passed the
+    ///   recheck; a lost transition arriving in that window must BLOCK
+    ///   on the gate (proved via `try_lock` failing at the seam); the
+    ///   side effects land; only then can the retire proceed.
+    #[test]
+    fn test_4d2_r3_lost_fence_dual_branch() {
+        use curvine_model::{HeartbeatStatus, WorkerCommand};
+
+        // Shared scaffold: fs with a Leader monitor, worker 1 session
+        // "s1", and a committed Valid cache entry (OBJ, len 150 ->
+        // 64/64/22) so a corrupt-length report decides orphan removals.
+        let build = |tag: &str| {
+            Master::init_test_metrics();
+            let mut conf = ClusterConf::format();
+            conf.testing = true;
+            conf.journal.enable = false;
+            conf.master.cache_metadata_enabled = true;
+            conf.master.meta_dir = Utils::test_sub_dir(format!(
+                "master-fs-4d2-lostfence/meta-{}",
+                Utils::rand_str(6)
+            ));
+            conf.journal.journal_dir = Utils::test_sub_dir(format!(
+                "master-fs-4d2-lostfence/journal-{}",
+                Utils::rand_str(6)
+            ));
+            let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+            fs.master_monitor
+                .journal_ctl
+                .set_state(curvine_raft::raft::RoleState::Leader);
+            let addr = WorkerAddress {
+                worker_id: 1,
+                hostname: format!("lostfence-{}", tag),
+                ip_addr: "10.0.0.1".into(),
+                rpc_port: 8200,
+                web_port: 8300,
+            };
+            fs.begin_worker_session(&addr, "s1").unwrap();
+
+            let obj = BlockIdCodec::CACHE_OBJECT_MIN;
+            let lay = crate::master::meta::CacheBlockLayout::derive(obj, 150, 64).unwrap();
+            let b1 = lay.block_id(1).unwrap();
+            {
+                let store = fs.fs_dir.read();
+                let rocks = store.get_rocks_store();
+                let mgr = &store.cache;
+                mgr.apply_incarnation_allocate_v2(rocks, token(91, 1), 5, 1, 0)
+                    .unwrap();
+                mgr.apply_id_reserve(rocks, token(1, 1), obj, obj + 100)
+                    .unwrap();
+                let alloc = crate::master::meta::cache::entry::CacheEntry {
+                    generation: 1,
+                    state: crate::master::meta::cache::entry::CacheEntryState::Reserved,
+                    object_id: obj,
+                    len: 0,
+                    ufs_mtime: 0,
+                    block_size: 64,
+                    expire_at: 0,
+                };
+                mgr.apply_allocate(rocks, token(2, 1), 1, "/k", 150, &alloc)
+                    .unwrap();
+                mgr.apply_commit(
+                    rocks,
+                    token(2, 1),
+                    token(2, 2),
+                    1,
+                    "/k",
+                    1,
+                    obj,
+                    150,
+                    777,
+                    0,
+                )
+                .unwrap();
+            }
+            (fs, conf, addr, b1)
+        };
+
+        // -- Branch A (lost-wins): retire precedes the gated apply. --
+        let (fs, conf, addr, b1) = build("a");
+        let cluster_id = conf.cluster_id.clone();
+        let stale = fs
+            .cache_service
+            .incr_block_report(
+                1,
+                "s1",
+                &[BlockReportInfo::new(
+                    b1,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    63, // corrupt length -> orphan removal under s1's tag
+                )],
+            )
+            .unwrap();
+        assert_eq!(stale.remove_blocks.clone(), vec![b1]);
+
+        // The lost-worker exact retire completes before the outcome
+        // takes the gate (the checker path holds start_gate for its
+        // whole transition; here it has already finished).
+        fs.end_worker_session(1, "s1");
+        assert!(
+            fs.cache_service.cache_session_tag(1).is_none(),
+            "lost retire removed the registry row"
+        );
+
+        // The gated apply now rechecks against a GONE tag: loud drop,
+        // zero side effects — b1 never reaches the BlockMap delete queue.
+        fs.apply_cache_incr_outcome(1, stale);
+        let cmds = fs
+            .worker_manager
+            .write()
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                addr,
+                1,
+                "s1".to_string(),
+                Default::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        let mut queued: Vec<i64> = Vec::new();
+        for cmd in cmds {
+            let WorkerCommand::DeleteBlock(c) = cmd;
+            queued.extend(c.blocks);
+        }
+        assert!(
+            queued.is_empty(),
+            "lost-wins: stale outcome must have zero WM side effects"
+        );
+
+        // -- Branch B (outcome-wins): the apply is inside the gate past
+        // the recheck when lost arrives; lost must BLOCK. --
+        let (fs, conf, addr, b1) = build("b");
+        let fresh = fs
+            .cache_service
+            .incr_block_report(
+                1,
+                "s1",
+                &[BlockReportInfo::new(
+                    b1,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    63,
+                )],
+            )
+            .unwrap();
+        assert_eq!(fresh.remove_blocks.clone(), vec![b1]);
+        let fresh_tag = fresh.session_tag;
+
+        // The seam fires between the passed recheck and the WM side
+        // effects, with start_gate and the WM write guard held. A lost
+        // transition in that window can only BLOCK on the gate — its
+        // try_lock must fail — and the registry tag cannot have swapped
+        // mid-apply.
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let fired = fired.clone();
+            let fs_probe = fs.clone();
+            *crate::master::master_handler::INCR_OUTCOME_SEAM
+                .lock()
+                .unwrap() = Some(Box::new(move || {
+                fired.store(true, std::sync::atomic::Ordering::SeqCst);
+                assert!(
+                    fs_probe.start_gate.try_lock().is_none(),
+                    "outcome-wins: lost transition must block on the gate"
+                );
+                assert_eq!(
+                    fs_probe.cache_service.cache_session_tag(1),
+                    Some(fresh_tag),
+                    "no session swap between recheck and side effects"
+                );
+            }));
+        }
+        fs.apply_cache_incr_outcome(1, fresh);
+        *crate::master::master_handler::INCR_OUTCOME_SEAM
+            .lock()
+            .unwrap() = None;
+        assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
+
+        // The side effects landed under the still-live tag: b1 reached
+        // the BlockMap delete queue (heartbeat re-delivers pending).
+        assert_eq!(fs.cache_service.cache_session_tag(1), Some(fresh_tag));
+        let cmds = fs
+            .worker_manager
+            .write()
+            .heartbeat(
+                &conf.cluster_id,
+                HeartbeatStatus::Running,
+                addr,
+                1,
+                "s1".to_string(),
+                Default::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        let mut queued: Vec<i64> = Vec::new();
+        for cmd in cmds {
+            let WorkerCommand::DeleteBlock(c) = cmd;
+            queued.extend(c.blocks);
+        }
+        assert_eq!(queued, vec![b1], "outcome-wins: side effects completed");
+
+        // ...and only THEN can the lost retire proceed (the gate is
+        // free again — the checker path would now run to completion).
+        fs.end_worker_session(1, "s1");
+        assert!(fs.cache_service.cache_session_tag(1).is_none());
     }
 }

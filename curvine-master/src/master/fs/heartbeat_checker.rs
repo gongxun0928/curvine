@@ -66,6 +66,17 @@ impl LoopTask for HeartbeatChecker {
         let mut blacklisted_workers = Vec::new();
         let mut removed_workers = Vec::new();
         {
+            // 4d.2 round-3 (gpt56 `f5980e03` P0-1): the lost-worker
+            // transition — WM expired removal below and the exact cache
+            // retire in the spawned task — shares the outcome apply's
+            // transition gate (`start_gate`), so an incremental-report
+            // outcome's tag recheck and its WM/ack side effects are
+            // linearized against the retire: either the retire wins first
+            // (the outcome's recheck sees the tag gone and drops it) or
+            // the apply wins first (the retire blocks until the side
+            // effects land). Lock order matches the heartbeat path
+            // (start_gate → WM write).
+            let _gate = self.fs.start_gate.lock();
             let mut wm = self.fs.worker_manager.write();
             let workers = wm.get_last_heartbeat();
             let now = LocalTime::mills();
@@ -119,7 +130,16 @@ impl LoopTask for HeartbeatChecker {
                 // verifies the recorded session still matches before
                 // moving the live reverse set to the retired drain; a
                 // Start that landed in between makes this a no-op.
-                fs.end_worker_session(id, &worker_session_id);
+                // Round-3 P0-1: the retire takes the same transition
+                // gate as the fenced outcome apply, closing the
+                // recheck→side-effect window against a concurrent
+                // incremental-report outcome. The gate is dropped before
+                // the FS location cleanup so the (possibly long) delete
+                // never stretches the transition critical section.
+                {
+                    let _gate = fs.start_gate.lock();
+                    fs.end_worker_session(id, &worker_session_id);
+                }
                 let cleanup = match fs.delete_locations(id) {
                     Err(e) => {
                         warn!("{}", curvine_core_error::err_msg!(e));

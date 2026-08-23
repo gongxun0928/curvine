@@ -1442,6 +1442,16 @@ impl MessageHandler for MasterHandler {
 static HEARTBEAT_TRANSITION_SEAM: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
     std::sync::Mutex::new(None);
 
+/// #[cfg(test)] seam storage for the 4d.2 round-3 outcome-wins proof
+/// (gpt56 `f5980e03` P0-1 / `48dec504`): the hook set here (if any) is
+/// fired by `MasterFilesystem::apply_cache_incr_outcome` exactly after
+/// the fenced tag recheck passed, with the transition gate and the WM
+/// write guard held. Never set in production; compiled out entirely
+/// outside cfg(test).
+#[cfg(test)]
+pub(crate) static INCR_OUTCOME_SEAM: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
+    std::sync::Mutex::new(None);
+
 #[cfg(test)]
 mod tests {
     use super::*;
