@@ -5903,6 +5903,157 @@ mod tests {
         assert!(format!("{}", err).contains("raft"), "{}", err);
     }
 
+    /// Phase 3 task #5 RC (gpt56 `e0875176`) P0 regression: cache-load
+    /// op tokens live in PER-TASK domains (unique client id per task,
+    /// fixed load.op_seq=1 / commit.op_seq=2, minted by the master's
+    /// `mint_cache_load_spec`). Under a SHARED client id with increasing
+    /// op seqs, a later-created task's applied Allocate pushes the
+    /// per-client watermark past an earlier task's not-yet-executed
+    /// Allocate, which is then misjudged Expired on FIRST execution —
+    /// reproducible without any outcome GC, purely by dispatch order.
+    #[test]
+    fn test_allocate_per_task_token_domain_no_cross_expiry() {
+        let service = build_service("alloc-per-task-domain", chooser(vec![worker(1)]));
+        seed_sessions(&service, &[worker(1)]);
+        mount_incarnation(&service, 1, 0);
+
+        // The shared-domain hazard, reproduced deterministically: task B
+        // (minted later, op_seq 102) is dispatched first and its applied
+        // Allocate sets the shared client's watermark to 102.
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let mgr = &store.cache;
+            mgr.apply_id_reserve(rocks, token(1, 1), OBJ, OBJ + 100)
+                .unwrap();
+            let alloc = CacheEntry {
+                generation: 1,
+                state: CacheEntryState::Reserved,
+                object_id: OBJ,
+                len: 0,
+                ufs_mtime: 0,
+                block_size: 64,
+                expire_at: 0,
+            };
+            mgr.apply_allocate(rocks, token(7, 102), 1, "/b", 128, &alloc)
+                .unwrap();
+        }
+        // Earlier-created task A (op_seq 100, same shared client) is
+        // Expired on its very first execution — the failure the fix
+        // removes.
+        let err = service
+            .allocate(token(7, 100), 7, 1, "/a", 128, 64)
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("expired (client watermark 102)"),
+            "{}",
+            err
+        );
+
+        // The fixed scheme: per-task domains. Task B (client 10, load
+        // op 1) applied first; earlier task A (client 9, load op 1) has
+        // its own watermark domain, so its FIRST execution passes the
+        // FSM token gate and reaches the fail-closed raft reserve
+        // barrier — the unit-harness terminal for a fully valid
+        // allocate (no cluster).
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let mgr = &store.cache;
+            let alloc = CacheEntry {
+                generation: 1,
+                state: CacheEntryState::Reserved,
+                object_id: OBJ + 1,
+                len: 0,
+                ufs_mtime: 0,
+                block_size: 64,
+                expire_at: 0,
+            };
+            mgr.apply_allocate(rocks, token(10, 1), 1, "/b2", 128, &alloc)
+                .unwrap();
+        }
+        let err = service
+            .allocate(token(9, 1), 7, 1, "/a2", 128, 64)
+            .unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("raft") && !msg.contains("expired"),
+            "per-task domain: first execution must pass the token gate: {}",
+            msg
+        );
+    }
+
+    /// Phase 3 task #5: the cache-load task's exact token pair (one
+    /// client, load.op_seq=1 / commit.op_seq=2) round-trips both
+    /// response-loss retries — the Allocate replays its recorded
+    /// geometry (same identity, regenerated placement), and the Commit
+    /// resolves its recorded Committed outcome as AlreadyApplied.
+    #[test]
+    fn test_cache_load_task_token_pair_exact_retry() {
+        let service = build_service("load-task-token-pair", chooser(vec![worker(1)]));
+        seed_sessions(&service, &[worker(1)]);
+        mount_incarnation(&service, 1, 0);
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let mgr = &store.cache;
+            mgr.apply_id_reserve(rocks, token(1, 1), OBJ, OBJ + 100)
+                .unwrap();
+            let alloc = CacheEntry {
+                generation: 1,
+                state: CacheEntryState::Reserved,
+                object_id: OBJ,
+                len: 0,
+                ufs_mtime: 0,
+                block_size: 64,
+                expire_at: 0,
+            };
+            mgr.apply_allocate(rocks, token(20, 1), 1, "/t", 130, &alloc)
+                .unwrap();
+            mgr.apply_commit(
+                rocks,
+                token(20, 1),
+                token(20, 2),
+                1,
+                "/t",
+                1,
+                OBJ,
+                130,
+                777,
+                0,
+            )
+            .unwrap();
+        }
+
+        // Allocate response-loss retry: committed identity, regenerated
+        // placement for the SAME identity (130 = 3 blocks of 64).
+        let replay = service.allocate(token(20, 1), 7, 1, "/t", 130, 64).unwrap();
+        assert_eq!(replay.object_id, OBJ);
+        assert_eq!(replay.generation, 1);
+        assert_eq!(replay.blocks.len(), 3);
+        assert_eq!(replay.blocks[0].workers, vec![worker(1)]);
+
+        // Commit response-loss retry with the same pair resolves its
+        // recorded outcome — never a re-execution.
+        let params = CacheCommitParams {
+            token: token(20, 2),
+            load_token: token(20, 1),
+            rpc_id: 7,
+            incarnation: 1,
+            key: "/t",
+            generation: 1,
+            object_id: OBJ,
+            len: 130,
+            ufs_mtime: 777,
+            ttl_ms: 0,
+            blocks: replay.blocks.clone(),
+        };
+        assert_eq!(
+            service.commit(params).unwrap(),
+            CacheOpStatus::AlreadyApplied
+        );
+    }
+
     /// len=0 is a legal empty object end to end at the retry path: the
     /// regenerated plan (and thus the future commit evidence) is empty.
     #[test]

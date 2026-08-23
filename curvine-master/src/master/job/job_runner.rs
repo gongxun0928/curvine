@@ -63,12 +63,6 @@ enum CvSourceMode {
 impl LoadJobRunner {
     const RUN_ID_SEQ_MOD: u64 = 1_000_000;
 
-    /// Phase 3: reserved non-zero issuer client id for master-minted
-    /// cache load/commit op tokens (`validate_client_token` rejects
-    /// client_id 0 = CACHE_ISSUER_CLIENT_ID for RPC tokens, and these
-    /// tokens are replayed by workers as ordinary client tokens).
-    const CACHE_LOAD_ISSUER_CLIENT_ID: u64 = 0x6361_6368_656c_6f61;
-
     pub fn new(
         jobs: JobStore,
         master_fs: MasterFilesystem,
@@ -192,14 +186,33 @@ impl LoadJobRunner {
             .saturating_add(self.run_seq.next() % Self::RUN_ID_SEQ_MOD)
     }
 
-    /// Master-minted retry-stable cache op token (gpt56 `f7788b98` point
-    /// 2): a fixed non-zero issuer client id plus an op_seq from the same
-    /// `mills * MOD + seq` scheme as `next_run_id`, so a master restart
-    /// never regresses below the token outcome watermark.
-    fn mint_cache_op_token(&self) -> CacheOpTokenId {
-        CacheOpTokenId {
-            client_id: Self::CACHE_LOAD_ISSUER_CLIENT_ID,
-            op_seq: self.next_run_id(),
+    /// Master-minted retry-stable spec for one cache-mode load task
+    /// (gpt56 `f7788b98` point 2 + RC `e0875176` P0 fix).
+    ///
+    /// The op-token domain is PER TASK: a unique non-zero `client_id`
+    /// drawn from the same restart-stable `mills * MOD + seq` scheme as
+    /// `next_run_id` (`validate_client_token` rejects client_id 0 =
+    /// CACHE_ISSUER_CLIENT_ID), shared by the task's two tokens with
+    /// FIXED op seqs `load=1` / `commit=2`. Distinct tasks therefore
+    /// never share a watermark domain: a later task's applied Allocate
+    /// can never push the per-client watermark past an earlier task's
+    /// not-yet-executed Allocate and misjudge it Expired on first
+    /// execution. The whole spec is serialized into the task and
+    /// replayed verbatim on every worker retry / response loss.
+    fn mint_cache_load_spec(&self, incarnation: u64, key: String) -> CacheLoadSpec {
+        let client_id = self.next_run_id();
+        debug_assert_ne!(client_id, 0);
+        CacheLoadSpec {
+            incarnation,
+            key,
+            load_token: CacheOpTokenId {
+                client_id,
+                op_seq: 1,
+            },
+            commit_token: CacheOpTokenId {
+                client_id,
+                op_seq: 2,
+            },
         }
     }
 
@@ -763,15 +776,13 @@ impl LoadJobRunner {
                 task_index += 1;
                 total_size += status.len;
 
-                // Cache-mode spec: minted per task (both op tokens must be
-                // task-scoped and distinct); the key is mount-relative.
+                // Cache-mode spec: minted per task — one private token
+                // domain per task (unique client_id, load=1/commit=2);
+                // the key is mount-relative.
                 let cache = match cache_incarnation {
-                    Some(incarnation) => Some(CacheLoadSpec {
-                        incarnation,
-                        key: mnt.get_cache_key(&source_path)?,
-                        load_token: self.mint_cache_op_token(),
-                        commit_token: self.mint_cache_op_token(),
-                    }),
+                    Some(incarnation) => Some(
+                        self.mint_cache_load_spec(incarnation, mnt.get_cache_key(&source_path)?),
+                    ),
                     None => None,
                 };
 

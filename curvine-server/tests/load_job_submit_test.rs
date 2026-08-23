@@ -119,6 +119,7 @@ fn load_task(task_id: &str, job_id: &str) -> LoadTaskInfo {
         create_time: 0,
         source_read_plan_json: String::new(),
         transfer_report: None,
+        cache: None,
     }
 }
 
