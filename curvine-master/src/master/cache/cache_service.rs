@@ -361,11 +361,13 @@ impl CacheService {
     ) -> CommonResult<Option<CacheGetResult>> {
         self.require_enabled()?;
         validate_key(key)?;
-        // Incarnation gate first (4b P0-2, no-token path): a revoked or
-        // stale namespace is a plain miss — the caller falls back to the
-        // UFS and re-resolves the mount.
+        // Incarnation gate first (4b P0-2, no-token path), fail-closed
+        // (gate 2): a missing, revoked, or stale namespace is a TYPED
+        // TERMINAL error — never a plain miss. Folding it into a miss
+        // would silently send the caller to the UFS fallback under a dead
+        // namespace; the caller must re-resolve the mount instead.
         if !self.incarnation_active(incarnation)? {
-            return Ok(None);
+            return Err(Self::fenced(incarnation));
         }
         let store = self.fs_dir.read();
         let rocks = store.get_rocks_store();
@@ -466,15 +468,19 @@ impl CacheService {
         // section for uniqueness and in-segment monotonicity.
         let _guard = self.issue_lock.lock().unwrap();
 
-        // Idempotent retry, resolved from committed state only: the token
-        // outcome comes before ANY entry-state check or issuance, so a
-        // retry after a lost response returns the committed identity even
-        // though the first execution (or a later commit) moved the entry
-        // row to Reserved/Valid. The retry must replay the EXACT recorded
-        // geometry; if the volatile plan was lost to a master restart a
-        // fresh plan is generated for the SAME identity (a second identity
-        // is never minted, and the placement is never silently swapped
-        // behind a commit: commit still validates against the live plan).
+        // Idempotent retry, classified from committed state only: the
+        // token outcome is read (and its immutable payload compared) BEFORE
+        // any entry-state check, incarnation gate, or issuance, so a retry
+        // after a lost response replays the EXACT recorded geometry; if the
+        // volatile plan was lost to a master restart a fresh plan is
+        // generated for the SAME identity (a second identity is never
+        // minted, and the placement is never silently swapped behind a
+        // commit: commit still validates against the live plan). An exact
+        // match only RECORDS the replay below — the incarnation gate then
+        // decides whether that history may still be handed back to the
+        // client (4b P0-2: a revoked/stale namespace is terminal even for
+        // an exact retry; only divergence reporting precedes the fence).
+        let mut replay: Option<(i64, u64)> = None; // (object_id, generation)
         {
             let store = self.fs_dir.read();
             let rocks = store.get_rocks_store();
@@ -507,28 +513,7 @@ impl CacheService {
                             out_bs
                         );
                     }
-                    // Scoped lock: the guard must be released before the
-                    // replan arm, which takes the plans lock again (the
-                    // match-scrutinee temporary would otherwise live across
-                    // the whole match and self-deadlock).
-                    let prior = {
-                        let plans = self.plans.lock().unwrap();
-                        plans.get(&token).map(|plan| plan.blocks.clone())
-                    };
-                    let blocks = match prior {
-                        Some(blocks) => blocks,
-                        None => {
-                            // Plan lost (master restart): regenerate a
-                            // fresh volatile plan for the same identity.
-                            let layout = CacheBlockLayout::derive(object_id, file_len, block_size)?;
-                            self.replan(token, generation, layout)?
-                        }
-                    };
-                    return Ok(CacheAllocateResult {
-                        object_id,
-                        generation,
-                        blocks,
-                    });
+                    replay = Some((object_id, generation));
                 }
                 Some(other) => {
                     return err_box!(
@@ -557,13 +542,39 @@ impl CacheService {
             }
         }
 
-        // Incarnation gate (4b P0-2): ordered AFTER the token outcome read
-        // — an exact recorded retry resolves from history even when the
-        // namespace has since moved on — and BEFORE any row classification
-        // or identity issuance. A revoked/stale incarnation is terminal for
-        // this allocate.
+        // Incarnation gate (4b P0-2): divergence is detected from the
+        // recorded outcome first (a token replayed with different
+        // parameters is loud divergence, never a generic fenced error);
+        // the gate itself is terminal for this allocate EVEN for an exact
+        // recorded retry — a revoked or stale namespace never hands its
+        // identities back to the client.
         if !self.incarnation_active(incarnation)? {
             return Err(Self::fenced(incarnation));
+        }
+
+        // Exact recorded replay: resolve from history now that the
+        // namespace is confirmed live.
+        if let Some((object_id, generation)) = replay {
+            // Scoped lock: the guard must be released before the replan
+            // arm, which takes the plans lock again.
+            let prior = {
+                let plans = self.plans.lock().unwrap();
+                plans.get(&token).map(|plan| plan.blocks.clone())
+            };
+            let blocks = match prior {
+                Some(blocks) => blocks,
+                None => {
+                    // Plan lost (master restart): regenerate a fresh
+                    // volatile plan for the same identity.
+                    let layout = CacheBlockLayout::derive(object_id, file_len, block_size)?;
+                    self.replan(token, generation, layout)?
+                }
+            };
+            return Ok(CacheAllocateResult {
+                object_id,
+                generation,
+                blocks,
+            });
         }
 
         // Fast-fail entry-state check and generation selection. The
@@ -831,32 +842,17 @@ impl CacheService {
             );
         }
 
-        // 4b P0-3: the expiry deadline is derived ONCE, here, from the
+        // 4b P0-3: the expiry deadline is derived ONCE, from the
         // incarnation's frozen durable policy — never from the client and
-        // never from a later mutable mount table entry. An exact outcome
-        // retry below reuses the recorded absolute value bit-exactly
-        // instead of recomputing.
-        let policy_ttl_ms = {
-            let store = self.fs_dir.read();
-            let rocks = store.get_rocks_store();
-            rocks
-                .cache_get_incarnation_policy(incarnation)
-                .map_err(fs_err)?
-                .map(|p| p.ttl_ms)
-                .unwrap_or(0)
-        };
-        let mut expire_at = if policy_ttl_ms == 0 {
-            0
-        } else {
-            (LocalTime::mills() as i64)
-                .checked_add(policy_ttl_ms)
-                .ok_or_else(|| {
-                    cm_err(format!(
-                        "cache commit expire_at overflow: now + ttl {} ms",
-                        policy_ttl_ms
-                    ))
-                })?
-        };
+        // never from a later mutable mount table entry — and ONLY for an
+        // outcome-free fresh commit (the None arm below). An exact
+        // outcome retry reuses the recorded absolute value bit-exactly and
+        // NEVER recomputes: the policy row is not even read, so a retry
+        // cannot fail on clock drift or a ttl overflow that did not exist
+        // when the commit first applied.
+        #[allow(unused_assignments)] // the 0 is never read: exact replay and
+        // the fresh-derivation arm below both assign before any read
+        let mut expire_at: i64 = 0;
 
         // Commit-token durable idempotency first: a retry after a lost
         // response resolves to its recorded Committed outcome. The outcome
@@ -871,10 +867,10 @@ impl CacheService {
         // exact Valid row answers AlreadyApplied.
         //
         // 4b P0-3: the recorded absolute `expire_at` is authoritative — an
-        // exact retry reuses it bit-exactly (the fresh computation above is
-        // discarded) so the deadline can never drift across retries, and
-        // the comparison deliberately excludes it (a recomputed value that
-        // differs only by retry latency is still an exact replay).
+        // exact retry reuses it bit-exactly so the deadline can never drift
+        // across retries, and the comparison deliberately excludes it (a
+        // recomputed value that differs only by retry latency is still an
+        // exact replay).
         let mut committed_outcome_exact = false;
         {
             let store = self.fs_dir.read();
@@ -935,6 +931,27 @@ impl CacheService {
                             );
                         }
                     }
+                    // Fresh commit (no outcome): derive the absolute
+                    // deadline ONCE from the frozen policy row.
+                    // Fail-closed on an unsatisfiable deadline — the
+                    // entry is rejected before any propose.
+                    let policy_ttl_ms = rocks
+                        .cache_get_incarnation_policy(incarnation)
+                        .map_err(fs_err)?
+                        .map(|p| p.ttl_ms)
+                        .unwrap_or(0);
+                    expire_at = if policy_ttl_ms == 0 {
+                        0
+                    } else {
+                        (LocalTime::mills() as i64)
+                            .checked_add(policy_ttl_ms)
+                            .ok_or_else(|| {
+                                cm_err(format!(
+                                    "cache commit expire_at overflow: now + ttl {} ms",
+                                    policy_ttl_ms
+                                ))
+                            })?
+                    };
                 }
             }
         }
@@ -1415,19 +1432,81 @@ impl CacheService {
 
     /// 4b: allocate the next never-reused mount incarnation for `mount_id`.
     ///
+    /// The caller supplies a PERSISTENT `OpToken` (request-level
+    /// idempotency, P0): a retry after a lost response — or after a master
+    /// restart that replays the journal — resolves from the recorded
+    /// `IncarnationAllocatedV2` outcome FIRST, returning the original
+    /// incarnation without minting a second identity; only an outcome-free
+    /// token proceeds to issuance.
+    ///
     /// Capability is verified against the PERSISTED mount table (gate 4):
     /// the mount must exist and be write-cache-enabled, and the TTL +
     /// capability snapshot frozen into the V2 journal entry come from that
     /// durable `MountInfo` — never from the request and never from a later
-    /// mutable mount entry. Issuance is serialized under the issue lock
-    /// with a durable issuer token (committed watermark + 1), so restarts
-    /// and concurrent callers can never collide or regress; the committed
-    /// apply re-verifies the snapshot (fs_dir dispatch) and the service
-    /// re-reads the persisted mount table after the barrier.
-    pub fn allocate_incarnation(&self, rpc_id: i64, mount_id: u32) -> CommonResult<u64> {
+    /// mutable mount entry. Issuance is serialized under the issue lock;
+    /// the committed apply re-verifies the snapshot (fs_dir dispatch,
+    /// deterministic no-op on mismatch) and the service re-reads the
+    /// persisted mount table after the barrier.
+    pub fn allocate_incarnation(
+        &self,
+        token: OpToken,
+        rpc_id: i64,
+        mount_id: u32,
+    ) -> CommonResult<u64> {
         self.require_enabled()?;
         self.require_leader()?;
+        validate_client_token(token)?;
         let _guard = self.issue_lock.lock().unwrap();
+
+        // Outcome-first (P0 idempotency): an exact recorded retry resolves
+        // from durable history — the outcome binds the request's immutable
+        // parameters (mount id), and its ttl must still agree with the
+        // frozen policy row of the incarnation it issued. A token replayed
+        // against a different mount is divergence, never a silent rebind.
+        {
+            let store = self.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            match rocks.cache_get_outcome(token).map_err(fs_err)? {
+                Some(OpOutcome::IncarnationAllocatedV2 {
+                    incarnation: out_inc,
+                    mount_id: out_mount,
+                    ttl_ms: out_ttl,
+                }) => {
+                    if out_mount != mount_id {
+                        return err_box!(
+                            "cache incarnation allocate token {:?} replayed with different parameters (mount {}): committed incarnation {} for mount {}",
+                            token,
+                            mount_id,
+                            out_inc,
+                            out_mount
+                        );
+                    }
+                    let frozen_ttl = rocks
+                        .cache_get_incarnation_policy(out_inc)
+                        .map_err(fs_err)?
+                        .map(|p| p.ttl_ms)
+                        .unwrap_or(0);
+                    if frozen_ttl != out_ttl {
+                        return err_box!(
+                            "cache incarnation allocate token {:?} outcome ttl {} disagrees with the frozen policy row ttl {} of incarnation {}",
+                            token,
+                            out_ttl,
+                            frozen_ttl,
+                            out_inc
+                        );
+                    }
+                    return Ok(out_inc);
+                }
+                Some(other) => {
+                    return err_box!(
+                        "cache incarnation allocate token {:?} has a non-issuance committed outcome: {:?}",
+                        token,
+                        other
+                    )
+                }
+                None => (),
+            }
+        }
 
         // Policy snapshot from the persisted mount table.
         let (ttl_ms, cache_write) = {
@@ -1451,10 +1530,8 @@ impl CacheService {
             (m.ttl_ms, true)
         };
 
-        // Durable issuer token (watermark + 1) and the next incarnation
-        // (durable watermark + 1); both strictly monotonic under the issue
-        // lock.
-        let token = self.next_issuer_token()?;
+        // The next incarnation (durable watermark + 1) is strictly
+        // monotonic under the issue lock.
         let incarnation = {
             let store = self.fs_dir.read();
             let hw = store
@@ -2260,8 +2337,13 @@ mod tests {
             "missing block location must be a whole-object miss"
         );
 
-        // Other incarnation / key -> miss; oversized key -> error.
-        assert!(service.get(2, "/k", true).unwrap().is_none());
+        // Other (never-mounted) incarnation -> typed terminal fenced error
+        // (gate-2: never a plain miss, no silent UFS fallback); other key ->
+        // miss; oversized key -> error.
+        let fenced = service.get(2, "/k", true).unwrap_err();
+        assert!(fenced
+            .to_string()
+            .contains("cache incarnation 2 is revoked or stale"));
         assert!(service.get(1, "/other", true).unwrap().is_none());
         assert!(service
             .get(1, &"x".repeat(MAX_KEY_BYTES + 1), true)
@@ -3185,15 +3267,17 @@ mod tests {
                 .unwrap_err(),
         );
         expect_disabled(service.invalidate(7, 1, "/k", 1, OBJ).unwrap_err());
-        expect_disabled(service.allocate_incarnation(7, 5).unwrap_err());
+        expect_disabled(service.allocate_incarnation(token(3, 1), 7, 5).unwrap_err());
         expect_disabled(service.revoke_incarnation(7, 5, 1).unwrap_err());
     }
 
-    /// 4b P0-2 fenced paths: once the incarnation is revoked, the
-    /// no-token paths are terminal (get = plain miss, mutations = fenced
-    /// error), while an exact recorded allocate retry still resolves from
-    /// durable history BEFORE the gate (lost-response replay must return
-    /// the committed identity even though the namespace has since died).
+    /// 4b P0-2 fenced paths: once the incarnation is revoked, every path
+    /// is terminal — get fails closed with a typed fenced error (never a
+    /// plain miss that would silently fall back to the UFS), and
+    /// mutations are fenced errors. An exact recorded retry is fenced
+    /// too: a dead namespace never hands identities back; only DIVERGENCE
+    /// reporting (a token replayed with different parameters) precedes
+    /// the fence.
     #[test]
     fn test_fenced_incarnation_paths() {
         let service = build_service("fenced-paths", chooser(vec![worker(1)]));
@@ -3209,10 +3293,7 @@ mod tests {
             store.cache.apply_incarnation_revoke(rocks, 5, 1).unwrap();
         }
 
-        // get is a plain miss — the caller falls back to the UFS.
-        assert!(service.get(1, "/k", false).unwrap().is_none());
-
-        // Mutations are fenced terminal errors naming the incarnation.
+        // get fails closed: typed terminal fenced error, NOT a plain miss.
         let fenced = |err: _| {
             let msg = format!("{}", err);
             assert!(
@@ -3221,6 +3302,9 @@ mod tests {
                 msg
             );
         };
+        fenced(service.get(1, "/k", false).unwrap_err());
+
+        // Mutations are fenced terminal errors naming the incarnation.
         fenced(
             service
                 .allocate(token(3, 1), 7, 1, "/x", 64, 64)
@@ -3244,10 +3328,26 @@ mod tests {
                 .unwrap_err(),
         );
 
-        // BUT the exact recorded allocate retry resolves BEFORE the gate.
-        let res = service.allocate(token(2, 1), 7, 1, "/k", 130, 64).unwrap();
-        assert_eq!(res.object_id, OBJ);
-        assert_eq!(res.generation, 1);
+        // An EXACT recorded allocate retry is fenced as well: the recorded
+        // identity of a dead namespace is not handed back to the client.
+        fenced(
+            service
+                .allocate(token(2, 1), 7, 1, "/k", 130, 64)
+                .unwrap_err(),
+        );
+
+        // But divergence still precedes the fence: the SAME token replayed
+        // with different parameters reports the parameter divergence, not
+        // the generic fenced error.
+        let err = service
+            .allocate(token(2, 1), 7, 1, "/k", 999, 64)
+            .unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("replayed with different parameters"),
+            "{}",
+            msg
+        );
     }
 
     /// 4b P0-3: commit expiry derivation. The deadline comes from the
@@ -3310,6 +3410,45 @@ mod tests {
         // second incarnation with the unsatisfiable ttl (the manager apply
         // only validates ttl >= 0 — the deadline math is commit-time).
         mount_incarnation(&service, 2, i64::MAX);
+
+        // FIRST: an EXACT recorded retry under the unsatisfiable policy
+        // must still resolve. The recorded outcome exists (written via the
+        // manager with a fixed deadline); the retry reuses it WITHOUT
+        // reading the policy row — under the old compute-first code this
+        // exact retry failed with an overflow that did not exist when the
+        // commit originally applied.
+        const E2: i64 = 2_345_678;
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let mgr = &store.cache;
+            mgr.apply_id_reserve(rocks, token(1, 2), OBJ + 100, OBJ + 300)
+                .unwrap();
+            let alloc = CacheEntry {
+                generation: 1,
+                state: CacheEntryState::Reserved,
+                object_id: OBJ + 200,
+                len: 0,
+                ufs_mtime: 0,
+                block_size: 64,
+                expire_at: 0,
+            };
+            mgr.apply_allocate(rocks, token(4, 1), 2, "/k2", 130, &alloc)
+                .unwrap();
+            mgr.apply_commit(
+                rocks,
+                token(4, 1),
+                token(4, 2),
+                2,
+                "/k2",
+                1,
+                OBJ + 200,
+                130,
+                777,
+                E2,
+            )
+            .unwrap();
+        }
         let params = CacheCommitParams {
             token: token(4, 2),
             load_token: token(4, 1),
@@ -3317,7 +3456,28 @@ mod tests {
             incarnation: 2,
             key: "/k2",
             generation: 1,
-            object_id: OBJ,
+            object_id: OBJ + 200,
+            len: 130,
+            ufs_mtime: 777,
+            ttl_ms: 0,
+            blocks: vec![],
+        };
+        assert_eq!(
+            service.commit(params).unwrap(),
+            CacheOpStatus::AlreadyApplied,
+            "exact retry must reuse the recorded deadline and never read the overflowing policy"
+        );
+
+        // THEN the fresh (outcome-free) commit under the same policy fails
+        // closed on the unsatisfiable deadline, pre-barrier.
+        let params = CacheCommitParams {
+            token: token(4, 3),
+            load_token: token(4, 1),
+            rpc_id: 7,
+            incarnation: 2,
+            key: "/k2",
+            generation: 1,
+            object_id: OBJ + 200,
             len: 130,
             ufs_mtime: 777,
             ttl_ms: 0,
@@ -3329,15 +3489,18 @@ mod tests {
         assert!(!msg.contains("raft"), "{}", msg);
     }
 
-    /// 4b gate 4: incarnation issuance verifies the PERSISTED mount table.
-    /// An unknown or non-write-cache mount never mints an incarnation; a
-    /// valid write-cache mount proceeds to the (fail-closed) raft barrier.
+    /// 4b gate 4 + P0 idempotency: incarnation issuance verifies the
+    /// PERSISTED mount table; the caller's persistent token resolves an
+    /// exact recorded retry from the outcome FIRST (response loss / restart
+    /// replay) without minting a second identity.
     #[test]
     fn test_issuer_capability_gates() {
         let service = build_service("issuer-gates", chooser(vec![worker(1)]));
+        // The caller's persistent token for mount 5 issuance.
+        let issue = token(6, 1);
 
         // Nothing persisted at all.
-        let err = service.allocate_incarnation(7, 5).unwrap_err();
+        let err = service.allocate_incarnation(issue, 7, 5).unwrap_err();
         assert!(format!("{}", err).contains("not found"), "{}", err);
 
         // Persist mounts: 5 = write-cache enabled (1h ttl), 6 = cache mode
@@ -3379,28 +3542,53 @@ mod tests {
             .unwrap();
 
         // Unknown id still not found (the table is keyed by mount id).
-        let err = service.allocate_incarnation(7, 99).unwrap_err();
+        let err = service.allocate_incarnation(issue, 7, 99).unwrap_err();
         assert!(format!("{}", err).contains("not found"), "{}", err);
 
         // Capability gates: read-only cache mode and fs mode are rejected
         // before any token or id is minted.
-        let err = service.allocate_incarnation(7, 6).unwrap_err();
+        let err = service.allocate_incarnation(issue, 7, 6).unwrap_err();
         assert!(
             format!("{}", err).contains("not write-cache-enabled"),
             "{}",
             err
         );
-        let err = service.allocate_incarnation(7, 7).unwrap_err();
+        let err = service.allocate_incarnation(issue, 7, 7).unwrap_err();
         assert!(
             format!("{}", err).contains("not write-cache-enabled"),
             "{}",
             err
         );
 
-        // Valid mount: passes the capability gates and reaches the
-        // fail-closed raft barrier (rejected there only because unit tests
-        // have no cluster).
-        let err = service.allocate_incarnation(7, 5).unwrap_err();
+        // P0 idempotency, outcome-first: pre-write the issuance outcome via
+        // the manager apply (unit-test stand-in for a completed barrier).
+        // A retry with the SAME token — even though the mount table lookup
+        // below it would still pass — must resolve from the outcome alone,
+        // before any mount check, and return the same incarnation.
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            store
+                .cache
+                .apply_incarnation_allocate_v2(rocks, issue, 5, 3, 3_600_000)
+                .unwrap();
+        }
+        assert_eq!(service.allocate_incarnation(issue, 7, 5).unwrap(), 3);
+
+        // Divergence: the SAME token replayed against a different mount is
+        // loud divergence, never a silent rebind.
+        let err = service.allocate_incarnation(issue, 7, 6).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("replayed with different parameters"),
+            "{}",
+            msg
+        );
+
+        // Valid mount, fresh token: passes the capability gates and reaches
+        // the fail-closed raft barrier (rejected there only because unit
+        // tests have no cluster).
+        let err = service.allocate_incarnation(token(6, 2), 7, 5).unwrap_err();
         let msg = format!("{}", err);
         assert!(msg.contains("raft"), "{}", msg);
         assert!(
@@ -3413,8 +3601,12 @@ mod tests {
     /// 4b gate 4 apply side: the V2 journal apply re-verifies the frozen
     /// policy snapshot against the persisted mount table — leader and
     /// follower replay the same deterministic check. A vanished mount, a
-    /// TTL change, or a capability change between issuance and apply is
-    /// loud divergence, never a silently mis-policy'd namespace.
+    /// TTL change, or a capability change between issuance and apply makes
+    /// the entry a DETERMINISTIC NO-OP (a cache apply error is fatal to
+    /// the authoritative FSM) that writes NO outcome, watermark, or
+    /// pointer; the FSM keeps advancing and a later valid entry still
+    /// applies. `cache_write == false` against a non-write-cache mount
+    /// (false == false) must NOT slip through as a match.
     #[test]
     fn test_incarnation_allocate_v2_apply_time_policy_verification() {
         let service = build_service("apply-v2-verify", chooser(vec![worker(1)]));
@@ -3425,29 +3617,113 @@ mod tests {
             .ttl_ms(3_600_000)
             .build()
             .to_info(5, "/mnt/a", "file:///tmp/curvine-a");
+        // A non-write-cache mount for the false==false probe.
+        let fs_mount = MountOptions::builder()
+            .write_type(WriteType::FsMode)
+            .access_mode(AccessMode::ReadWrite)
+            .write_cache(false)
+            .build()
+            .to_info(7, "/mnt/c", "file:///tmp/curvine-c");
         service
             .fs_dir
             .write()
             .unprotected_store_mount(mount)
             .unwrap();
+        service
+            .fs_dir
+            .write()
+            .unprotected_store_mount(fs_mount)
+            .unwrap();
 
-        let v2 = |ttl_ms: i64, cache_write: bool, mount_id: u32| {
+        let v2 = |ttl_ms: i64, cache_write: bool, mount_id: u32, incarnation: u64| {
             JournalEntry::CacheIncarnationAllocateV2(CacheIncarnationAllocateV2Entry {
                 op_id: 1,
                 rpc_id: 7,
-                token: token(91, 1),
+                token: token(91, incarnation),
                 mount_id,
-                incarnation: 1,
+                incarnation,
                 ttl_ms,
                 cache_write,
             })
         };
+        // Every stale/mismatched shape below must leave NO trace: no row,
+        // no policy, no outcome, no incarnation watermark, no pointer.
+        let assert_no_state = |service: &CacheService, incarnation: u64| {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            assert!(
+                rocks.cache_get_incarnation(incarnation).unwrap().is_none(),
+                "incarnation {} must not exist",
+                incarnation
+            );
+            // A missing policy key synthesizes the ttl-0 default (never
+            // None), so assert the synthesized default — nothing durable
+            // was written for this incarnation.
+            assert_eq!(
+                rocks
+                    .cache_get_incarnation_policy(incarnation)
+                    .unwrap()
+                    .map(|p| p.ttl_ms),
+                Some(0),
+                "no durable policy row for incarnation {}",
+                incarnation
+            );
+            assert!(
+                rocks
+                    .cache_get_outcome(token(91, incarnation))
+                    .unwrap()
+                    .is_none(),
+                "outcome for incarnation {} must not exist",
+                incarnation
+            );
+            assert_eq!(
+                rocks
+                    .cache_get_state(state_tags::CACHE_INCARNATION)
+                    .unwrap(),
+                None,
+                "watermark must stay untouched by no-op applies"
+            );
+        };
 
-        // Exact snapshot applies and the frozen policy row is durable.
+        // TTL mismatch: deterministic no-op.
         service
             .fs_dir
             .read()
-            .apply_cache_journal_entry(&v2(3_600_000, true, 5))
+            .apply_cache_journal_entry(&v2(9, true, 5, 1))
+            .unwrap();
+        assert_no_state(&service, 1);
+
+        // Capability mismatch (entry claims no write-cache): no-op.
+        service
+            .fs_dir
+            .read()
+            .apply_cache_journal_entry(&v2(3_600_000, false, 5, 1))
+            .unwrap();
+        assert_no_state(&service, 1);
+
+        // false==false (non-cache entry against a non-write-cache mount)
+        // must NOT pass as a match: no-op.
+        service
+            .fs_dir
+            .read()
+            .apply_cache_journal_entry(&v2(0, false, 7, 1))
+            .unwrap();
+        assert_no_state(&service, 1);
+
+        // Vanished mount: no-op.
+        service
+            .fs_dir
+            .read()
+            .apply_cache_journal_entry(&v2(3_600_000, true, 99, 1))
+            .unwrap();
+        assert_no_state(&service, 1);
+
+        // The FSM keeps advancing: the exact snapshot still applies after
+        // all the no-ops, with the frozen policy row durable.
+        service
+            .fs_dir
+            .read()
+            .apply_cache_journal_entry(&v2(3_600_000, true, 5, 1))
             .unwrap();
         {
             let store = service.fs_dir.read();
@@ -3459,43 +3735,13 @@ mod tests {
                     .map(|p| p.ttl_ms),
                 Some(3_600_000)
             );
+            assert_eq!(
+                rocks
+                    .cache_get_state(state_tags::CACHE_INCARNATION)
+                    .unwrap(),
+                Some(1)
+            );
         }
-
-        // TTL mismatch: loud divergence before the manager apply.
-        let err = service
-            .fs_dir
-            .read()
-            .apply_cache_journal_entry(&v2(9, true, 5))
-            .unwrap_err();
-        assert!(
-            format!("{}", err).contains("apply-time policy verification"),
-            "{}",
-            err
-        );
-
-        // Capability mismatch: loud divergence.
-        let err = service
-            .fs_dir
-            .read()
-            .apply_cache_journal_entry(&v2(3_600_000, false, 5))
-            .unwrap_err();
-        assert!(
-            format!("{}", err).contains("apply-time policy verification"),
-            "{}",
-            err
-        );
-
-        // Vanished mount: loud divergence.
-        let err = service
-            .fs_dir
-            .read()
-            .apply_cache_journal_entry(&v2(3_600_000, true, 99))
-            .unwrap_err();
-        assert!(
-            format!("{}", err).contains("apply-time policy verification"),
-            "{}",
-            err
-        );
     }
 
     /// P2-1 (4a review): when the barrier readback reveals the durable

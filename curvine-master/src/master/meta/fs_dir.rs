@@ -993,20 +993,34 @@ impl FsDir {
                 // PERSISTED mount table at apply time (leader and follower
                 // replay the same log, so this is deterministic). A mount
                 // that vanished, lost write-cache capability, or changed
-                // TTL between issuance and apply is loud divergence.
+                // TTL between issuance and apply makes the entry a
+                // DETERMINISTIC NO-OP — never an error: a cache apply
+                // error is fatal to the authoritative FSM (journal replay
+                // would wedge), while the raced issuance is reported loudly
+                // by the issuer's post-barrier recheck. No outcome, no
+                // watermark, no pointer are written.
+                //
+                // The check requires the entry to actually claim
+                // write-cache (`cache_write == true`) AND the persisted
+                // mount to be write-cache-enabled with the frozen TTL —
+                // `false == false` (a non-cache entry against a non-cache
+                // mount) must NOT slip through as a match.
                 let mounts = self.get_mount_table()?;
-                match mounts.iter().find(|m| m.mount_id == e.mount_id) {
-                    Some(m)
-                        if m.write_cache_enabled() == e.cache_write && m.ttl_ms == e.ttl_ms => {}
-                    other => {
-                        return err_box!(
-                            "cache incarnation allocate V2 for mount {} failed apply-time policy verification (entry cache_write {} ttl {}, persisted {:?})",
-                            e.mount_id,
-                            e.cache_write,
-                            e.ttl_ms,
-                            other.map(|m| (m.write_cache_enabled(), m.ttl_ms))
-                        )
-                    }
+                let persisted = mounts
+                    .iter()
+                    .find(|m| m.mount_id == e.mount_id)
+                    .map(|m| (m.write_cache_enabled(), m.ttl_ms));
+                let matches =
+                    e.cache_write && matches!(persisted, Some((true, ttl)) if ttl == e.ttl_ms);
+                if !matches {
+                    warn!(
+                        "cache incarnation allocate V2 for mount {} no-op at apply: entry cache_write {} ttl {}, persisted {:?} (raced mount table change)",
+                        e.mount_id,
+                        e.cache_write,
+                        e.ttl_ms,
+                        persisted
+                    );
+                    return Ok(());
                 }
                 self.cache.apply_incarnation_allocate_v2(
                     store,

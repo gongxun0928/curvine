@@ -1810,26 +1810,41 @@ mod tests {
     }
 
     /// Real single-voter Raft coverage for the 4b incarnation lifecycle,
-    /// all through the REAL propose/apply barrier:
+    /// all through the REAL propose/apply barrier, across TWO leader
+    /// processes (the second replays the first's journal — restart
+    /// semantics):
     ///
-    /// 1. The REAL issuer path: a persisted write-cache mount table entry
-    ///    (gate 4) plus `allocate_incarnation` minting incarnation 1 with
-    ///    the mount's TTL frozen into the V2 entry and the policy row.
-    /// 2. Allocate + commit under the incarnation: the commit deadline is
+    /// Phase 1:
+    /// 1. A stale-snapshot V2 entry (ttl that does not match the persisted
+    ///    mount) proposed straight through the journal applies as a
+    ///    deterministic NO-OP — the propose succeeds, the authoritative
+    ///    FSM keeps advancing, and NO incarnation state is written.
+    /// 2. The REAL issuer path: a persisted write-cache mount table entry
+    ///    (gate 4) plus `allocate_incarnation` with the caller's persistent
+    ///    token minting incarnation 1 with the mount's TTL frozen into the
+    ///    V2 entry and the policy row.
+    /// 3. Response-loss retry: the SAME token resolves the SAME incarnation
+    ///    from the recorded outcome without a second journal entry.
+    /// Phase 2 (fresh process, journal replay):
+    /// 4. Restart idempotency: the SAME token still resolves incarnation 1
+    ///    from the replayed outcome, without minting or proposing.
+    /// 5. Allocate + commit under the incarnation: the commit deadline is
     ///    derived from the frozen policy (now + ttl), never from the client.
-    /// 3. Revoke is Applied, the retry is idempotent AlreadyApplied, and
+    /// 6. Revoke is Applied, the retry is idempotent AlreadyApplied, and
     ///    revoking an unknown incarnation proposes nothing.
-    /// 4. The fenced namespace: get is a plain miss, allocate and commit
-    ///    are terminal fenced errors — with no journal entries for any of
-    ///    them (the parent asserts the exact entry count).
+    /// 7. The fenced namespace: get is a terminal fenced error (never a
+    ///    plain miss), allocate and commit are terminal fenced errors —
+    ///    with no journal entries for any of them (the parent asserts the
+    ///    exact entry count).
     #[test]
     fn real_raft_incarnation_revoke_fence() {
         let leader_mode_env = "CURVINE_TEST_CACHE_INC_LEADER";
+        let phase_env = "CURVINE_TEST_CACHE_INC_PHASE";
         let meta_dir_env = "CURVINE_TEST_CACHE_INC_META_DIR";
         let journal_dir_env = "CURVINE_TEST_CACHE_INC_JOURNAL_DIR";
 
         if std::env::var(leader_mode_env).is_ok() {
-            real_raft_incarnation_lifetime(meta_dir_env, journal_dir_env);
+            real_raft_incarnation_lifetime(meta_dir_env, journal_dir_env, phase_env);
             return;
         }
 
@@ -1845,20 +1860,61 @@ mod tests {
         let _ = FileUtils::delete_path(&base, true);
 
         let exe = std::env::current_exe().unwrap();
-        let output = std::process::Command::new(exe)
-            .arg("--exact")
-            .arg("master::journal::journal_loader::tests::real_raft_incarnation_revoke_fence")
-            .env(leader_mode_env, "1")
-            .env(meta_dir_env, &meta_dir)
-            .env(journal_dir_env, &journal_dir)
-            .output()
-            .expect("spawn incarnation-leader test process");
-        assert!(
-            output.status.success(),
-            "leader lifetime failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        // Count committed data entries in the raft log (read-only).
+        let count_data_entries = |journal_dir: &str| -> usize {
+            let mut journal = JournalConf::with_test();
+            journal.enable = true;
+            journal.journal_dir = journal_dir.to_string();
+            let log_store = RocksLogStorage::from_conf(&journal, false);
+            let last = log_store.read().last_index();
+            if last < 1 {
+                return 0;
+            }
+            let entries = log_store.scan_entries(1, last + 1).unwrap();
+            drop(log_store);
+            entries
+                .into_iter()
+                .filter(|e| e.get_entry_type() == EntryType::EntryNormal && !e.data.is_empty())
+                .count()
+        };
+        for phase in ["1", "2"] {
+            let output = std::process::Command::new(&exe)
+                .arg("--exact")
+                .arg("master::journal::journal_loader::tests::real_raft_incarnation_revoke_fence")
+                .env(leader_mode_env, "1")
+                .env(phase_env, phase)
+                .env(meta_dir_env, &meta_dir)
+                .env(journal_dir_env, &journal_dir)
+                .output()
+                .unwrap_or_else(|e| {
+                    panic!("spawn incarnation-leader phase {} failed: {}", phase, e)
+                });
+            assert!(
+                output.status.success(),
+                "leader phase {} failed\nstdout:\n{}\nstderr:\n{}",
+                phase,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            // Phase 1 must propose EXACTLY the six expected data entries
+            // (stale no-op V2, incarnation V2 allocate, id reserve,
+            // allocate /a, commit /a, incarnation revoke) — the
+            // response-loss retry proposes nothing. Phase 2 must propose
+            // nothing either: its log holds either the same six entries
+            // (no compaction) or none of them (startup snapshot purged
+            // the applied prefix); any OTHER count means a new proposal.
+            let count = count_data_entries(&journal_dir);
+            if phase == "1" {
+                assert_eq!(count, 6, "unexpected journal entry count after phase 1");
+            } else {
+                assert!(
+                    count == 0 || count == 6,
+                    "phase 2 must propose nothing (found {} data entries)",
+                    count
+                );
+            }
+        }
 
         let conf = || {
             let mut journal = JournalConf::with_test();
@@ -1875,23 +1931,6 @@ mod tests {
                 ..Default::default()
             }
         };
-
-        // Exactly the expected committed data entries: incarnation V2
-        // allocate, id reserve, allocate /a, commit /a, incarnation revoke.
-        // The revoke retry, the unknown-incarnation revoke, and every
-        // fenced call must propose NOTHING.
-        {
-            let log_store = RocksLogStorage::from_conf(&conf().journal, false);
-            let last = log_store.read().last_index();
-            assert!(last >= 1, "journal log must exist after leader exit");
-            let entries = log_store.scan_entries(1, last + 1).unwrap();
-            drop(log_store);
-            let data_entries: Vec<Entry> = entries
-                .into_iter()
-                .filter(|e| e.get_entry_type() == EntryType::EntryNormal && !e.data.is_empty())
-                .collect();
-            assert_eq!(data_entries.len(), 5, "unexpected journal entry count");
-        }
 
         // Durable committed state: the revoked row is preserved forever,
         // the frozen policy row, the V2 issuer outcome, the preserved
@@ -1918,7 +1957,7 @@ mod tests {
             );
             match rocks
                 .cache_get_outcome(OpToken {
-                    client_id: 0,
+                    client_id: 6,
                     op_seq: 1,
                 })
                 .unwrap()
@@ -1935,6 +1974,17 @@ mod tests {
                 }
                 other => panic!("issuer outcome: {:?}", other),
             }
+            // The stale no-op entry left no outcome behind.
+            assert!(
+                rocks
+                    .cache_get_outcome(OpToken {
+                        client_id: 6,
+                        op_seq: 90,
+                    })
+                    .unwrap()
+                    .is_none(),
+                "the stale-snapshot entry must not write an outcome"
+            );
             let a = rocks.cache_get_entry(1, "/a").unwrap().expect("/a row");
             assert_eq!(a.state, CacheEntryState::Valid);
             assert_eq!(a.generation, 1);
@@ -2265,18 +2315,21 @@ mod tests {
     /// raft node (production writer, apply worker) with one live worker
     /// registered and a persisted write-cache mount, driving the REAL
     /// issuer, TTL-bearing commit, revoke, and fenced paths through the
-    /// full propose/apply barrier.
-    fn real_raft_incarnation_lifetime(meta_dir_env: &str, journal_dir_env: &str) {
+    /// full propose/apply barrier. Phase 1 formats fresh dirs and runs
+    /// issuance; phase 2 reopens the same dirs (journal replay = restart)
+    /// and runs the load/commit/revoke/fenced lifecycle.
+    fn real_raft_incarnation_lifetime(meta_dir_env: &str, journal_dir_env: &str, phase_env: &str) {
         Master::init_test_metrics();
         let meta_dir = std::env::var(meta_dir_env).unwrap();
         let journal_dir = std::env::var(journal_dir_env).unwrap();
+        let phase = std::env::var(phase_env).unwrap();
 
         let mut journal = JournalConf::with_test();
         journal.enable = true;
         journal.journal_dir = journal_dir;
         let conf = ClusterConf {
             testing: true,
-            format_master: true,
+            format_master: phase == "1",
             journal,
             master: MasterConf {
                 meta_dir,
@@ -2309,15 +2362,18 @@ mod tests {
 
         // 4b gate 4: persist the write-cache mount (1h TTL) BEFORE any
         // issuance — the issuer and the apply-time verification trust this
-        // durable table, never request input.
-        let mount = MountOptions::builder()
-            .write_type(WriteType::CacheMode)
-            .access_mode(AccessMode::ReadWrite)
-            .write_cache(true)
-            .ttl_ms(3_600_000)
-            .build()
-            .to_info(5, "/mnt/a", "file:///tmp/curvine-inc-a");
-        fs_dir.write().unprotected_store_mount(mount).unwrap();
+        // durable table, never request input. Phase 2 inherits the same
+        // rocks-persisted mount from phase 1.
+        if phase == "1" {
+            let mount = MountOptions::builder()
+                .write_type(WriteType::CacheMode)
+                .access_mode(AccessMode::ReadWrite)
+                .write_cache(true)
+                .ttl_ms(3_600_000)
+                .build()
+                .to_info(5, "/mnt/a", "file:///tmp/curvine-inc-a");
+            fs_dir.write().unprotected_store_mount(mount).unwrap();
+        }
 
         let fs = MasterFilesystem::new(
             &conf,
@@ -2369,25 +2425,119 @@ mod tests {
         let mut listener = rt.block_on(raft.run()).unwrap();
         rt.block_on(listener.wait_leader()).unwrap();
 
-        // 1. REAL issuer: incarnation 1 for the write-cache mount, with the
-        //    mount TTL frozen into the V2 entry and the durable policy row.
-        let inc = cache.allocate_incarnation(21, 5).unwrap();
-        assert_eq!(inc, 1);
-        {
-            let store = fs_dir.read();
-            let rocks = store.get_rocks_store();
-            assert_eq!(
-                rocks
-                    .cache_get_incarnation_policy(1)
-                    .unwrap()
-                    .map(|p| p.ttl_ms),
-                Some(3_600_000)
-            );
+        // The caller's persistent issuance token for mount 5.
+        let issue = OpToken {
+            client_id: 6,
+            op_seq: 1,
+        };
+
+        if phase == "1" {
+            // 1. Stale-snapshot injection: a V2 entry whose ttl does not
+            //    match the persisted mount applies as a deterministic
+            //    NO-OP. The propose itself must succeed (a cache apply
+            //    error would be FATAL to the authoritative FSM and wedge
+            //    replay); no row, policy, outcome, or watermark is
+            //    written, and the FSM keeps advancing.
+            let stale = JournalEntry::CacheIncarnationAllocateV2(CacheIncarnationAllocateV2Entry {
+                op_id: fs_dir.read().next_op_id(),
+                rpc_id: 21,
+                token: OpToken {
+                    client_id: 6,
+                    op_seq: 90,
+                },
+                mount_id: 5,
+                incarnation: 1,
+                ttl_ms: 999,
+                cache_write: true,
+            });
+            journal_writer.sync_propose_cache(stale).unwrap();
+            {
+                let store = fs_dir.read();
+                let rocks = store.get_rocks_store();
+                assert!(
+                    rocks.cache_get_incarnation(1).unwrap().is_none(),
+                    "the stale-snapshot entry must be a no-op"
+                );
+                assert_eq!(
+                    rocks
+                        .cache_get_state(state_tags::CACHE_INCARNATION)
+                        .unwrap(),
+                    None,
+                    "the stale-snapshot entry must not touch the watermark"
+                );
+            }
+
+            // 2. REAL issuer: incarnation 1 for the write-cache mount, with
+            //    the mount TTL frozen into the V2 entry and the durable
+            //    policy row.
+            let inc = cache.allocate_incarnation(issue, 21, 5).unwrap();
+            assert_eq!(inc, 1);
+            {
+                let store = fs_dir.read();
+                let rocks = store.get_rocks_store();
+                assert_eq!(
+                    rocks
+                        .cache_get_incarnation_policy(1)
+                        .unwrap()
+                        .map(|p| p.ttl_ms),
+                    Some(3_600_000)
+                );
+            }
+
+            // 3. Response-loss retry: the SAME persistent token resolves
+            //    the SAME incarnation from the recorded outcome — no new
+            //    identity, no new journal entry.
+            assert_eq!(cache.allocate_incarnation(issue, 21, 5).unwrap(), 1);
+        } else {
+            // 4. Restart idempotency: the journal replay restored the V2
+            //    outcome; the SAME token resolves incarnation 1 again
+            //    without minting or proposing.
+            assert_eq!(cache.allocate_incarnation(issue, 21, 5).unwrap(), 1);
+
+            // 5'. Post-restart fenced namespace: the phase-1 journal —
+            //     including the revoke — replayed, so the namespace stays
+            //     terminal across the restart. Even an EXACT recorded
+            //     retry must respect the incarnation gate (P0-3 ordering:
+            //     gate before replay resolution).
+            let err = cache.get(1, "/a", false).unwrap_err();
+            assert!(format!("{}", err).contains("terminal"), "{}", err);
+            let err = cache
+                .allocate(
+                    OpToken {
+                        client_id: 9,
+                        op_seq: 1,
+                    },
+                    22,
+                    1,
+                    "/a",
+                    128,
+                    64,
+                )
+                .unwrap_err();
+            assert!(format!("{}", err).contains("terminal"), "{}", err);
+            let err = cache
+                .allocate(
+                    OpToken {
+                        client_id: 9,
+                        op_seq: 3,
+                    },
+                    22,
+                    1,
+                    "/y",
+                    64,
+                    64,
+                )
+                .unwrap_err();
+            assert!(format!("{}", err).contains("terminal"), "{}", err);
+
+            std::process::exit(0);
         }
 
-        // 2. Allocate + commit under the incarnation: the deadline is
-        //    derived ONCE from the frozen policy (now + ttl), never from
-        //    the client (ttl_ms must be 0 on the wire).
+        // 5. Allocate + commit under the incarnation (phase-1 lifecycle
+        //    only — phase 2 replays this journal, including the revoke
+        //    below, and asserts the fenced namespace instead): the
+        //    deadline is derived ONCE from the frozen policy (now + ttl),
+        //    never from the client (ttl_ms must be 0 on the wire).
         let a = cache
             .allocate(
                 OpToken {
@@ -2437,7 +2587,7 @@ mod tests {
             );
         }
 
-        // 3. Revoke: Applied, the retry is idempotent AlreadyApplied, and
+        // 6. Revoke: Applied, the retry is idempotent AlreadyApplied, and
         //    revoking an unknown incarnation resolves without a propose.
         assert_eq!(
             cache.revoke_incarnation(23, 5, 1).unwrap(),
@@ -2452,9 +2602,11 @@ mod tests {
             CacheOpStatus::AlreadyApplied
         );
 
-        // 4. Fenced namespace: get is a plain miss, mutations are terminal
-        //    fenced errors — none of them propose.
-        assert!(cache.get(1, "/a", false).unwrap().is_none());
+        // 7. Fenced namespace: get fails closed with a terminal fenced
+        //    error (never a plain miss), mutations are terminal fenced
+        //    errors — none of them propose.
+        let err = cache.get(1, "/a", false).unwrap_err();
+        assert!(format!("{}", err).contains("terminal"), "{}", err);
         let err = cache
             .allocate(
                 OpToken {
