@@ -1500,63 +1500,95 @@ impl CacheService {
             Superseded { current: u64 },
             Fenced,
             Divergence(CacheEntry),
+            ReadbackFailure(CacheEntry),
         }
         let settlement = {
             let mut volatile = self.state.lock().unwrap();
-            let active = self.incarnation_active(incarnation)?;
-            let cur = {
+            // ONE authoritative snapshot (review `4dd264df` P0-1): the
+            // incarnation row, the mount's current pointer, and the entry
+            // row are read consecutively under a SINGLE fs_dir guard, so
+            // a revoke cannot commit between the namespace read and the
+            // entry read (lock order: volatile → fs_dir read).
+            let (active, cur) = {
                 let store = self.fs_dir.read();
                 let rocks = store.get_rocks_store();
-                rocks.cache_get_entry(incarnation, key).map_err(fs_err)?
+                let active = match rocks.cache_get_incarnation(incarnation).map_err(fs_err)? {
+                    Some(row) if !row.revoked => {
+                        rocks
+                            .cache_current_incarnation(row.mount_id)
+                            .map_err(fs_err)?
+                            == Some(incarnation)
+                    }
+                    _ => false,
+                };
+                let cur = rocks.cache_get_entry(incarnation, key).map_err(fs_err)?;
+                (active, cur)
+            };
+            // Proven-dead classification (review `4dd264df` P0-2): only
+            // an inactive namespace, a missing row, a row that already
+            // belongs to a different object, a same-object tombstone, or
+            // an advanced generation prove THIS load dead. An ACTIVE
+            // same-object Reserved row (our apply did not land and
+            // nothing else fenced the entry) is NOT dead — an exact
+            // allocate retry can still plan and commit the same
+            // object_id, so GC must never see it and the plan is kept.
+            let merge_dead = |volatile: &mut CacheVolatile| -> CommonResult<()> {
+                self.merge_dead_commit_evidence(
+                    volatile,
+                    incarnation,
+                    object_id,
+                    len,
+                    block_size,
+                    &blocks,
+                )
             };
             if !active {
-                self.merge_dead_commit_evidence(
-                    &mut volatile,
-                    incarnation,
-                    object_id,
-                    len,
-                    block_size,
-                    &blocks,
-                )?;
+                merge_dead(&mut volatile)?;
                 Settlement::Fenced
-            } else if cur.as_ref().is_some_and(|cur| {
-                cur.state == CacheEntryState::Valid
-                    && cur.generation == generation
-                    && cur.object_id == object_id
-                    && cur.len == len
-                    && cur.ufs_mtime == ufs_mtime
-                    && cur.expire_at == expire_at
-            }) {
-                let object_locations = volatile.locations.entry(object_id).or_default();
-                object_locations.len = len;
-                object_locations.block_size = block_size;
-                object_locations.blocks.clear();
-                for (index, block) in blocks.into_iter().enumerate() {
-                    object_locations
-                        .blocks
-                        .insert((index + 1) as i64, block.workers);
-                }
-                Settlement::Applied
-            } else if cur.as_ref().is_some_and(|cur| {
-                cur.state == CacheEntryState::Valid
-                    && cur.generation == generation
-                    && cur.object_id == object_id
-            }) {
-                Settlement::Divergence(cur.unwrap())
             } else {
-                // Dead (missing / advanced / tombstoned) exactly as the
-                // race gate describes: hand the evidence to GC instead
-                // of publishing.
-                self.merge_dead_commit_evidence(
-                    &mut volatile,
-                    incarnation,
-                    object_id,
-                    len,
-                    block_size,
-                    &blocks,
-                )?;
-                Settlement::Superseded {
-                    current: cur.map_or(0, |cur| cur.generation),
+                match cur {
+                    None => {
+                        merge_dead(&mut volatile)?;
+                        Settlement::Superseded { current: 0 }
+                    }
+                    Some(c) if c.object_id != object_id || c.generation > generation => {
+                        merge_dead(&mut volatile)?;
+                        Settlement::Superseded {
+                            current: c.generation,
+                        }
+                    }
+                    Some(c)
+                        if c.generation == generation && c.state == CacheEntryState::Tombstoned =>
+                    {
+                        merge_dead(&mut volatile)?;
+                        Settlement::Superseded {
+                            current: c.generation,
+                        }
+                    }
+                    Some(c)
+                        if c.state == CacheEntryState::Valid
+                            && c.generation == generation
+                            && c.object_id == object_id =>
+                    {
+                        if c.len == len && c.ufs_mtime == ufs_mtime && c.expire_at == expire_at {
+                            let object_locations = volatile.locations.entry(object_id).or_default();
+                            object_locations.len = len;
+                            object_locations.block_size = block_size;
+                            object_locations.blocks.clear();
+                            for (index, block) in blocks.into_iter().enumerate() {
+                                object_locations
+                                    .blocks
+                                    .insert((index + 1) as i64, block.workers);
+                            }
+                            Settlement::Applied
+                        } else {
+                            Settlement::Divergence(c)
+                        }
+                    }
+                    // Active + same-object Reserved@generation (or an
+                    // impossible lower generation): not proven dead —
+                    // loud, plan kept, nothing enqueued.
+                    Some(c) => Settlement::ReadbackFailure(c),
                 }
             }
         };
@@ -1589,6 +1621,12 @@ impl CacheService {
                 len,
                 ufs_mtime,
                 expire_at
+            ),
+            Settlement::ReadbackFailure(cur) => err_box!(
+                "cache commit barrier readback failed for ({}, {}): {:?}",
+                incarnation,
+                key,
+                cur
             ),
         }
     }
@@ -5632,16 +5670,22 @@ mod tests {
         assert!(!service.gc_has_work(OBJ));
         assert!(!service.location_retained(OBJ));
 
-        // (c) fenced namespace beats an exact-Valid row: the evidence
-        // still goes to GC, the load answers the typed fence.
-        let service = build_service("settle-fenced", chooser(vec![worker(1)]));
+        // (c) fenced namespace beats an exact-Valid row (reviews
+        // `618498f7` + `4dd264df` P0-1): the revoke commits via the
+        // publish hook — deterministically between the barrier and the
+        // settlement's single authoritative snapshot — while the entry
+        // row stays exact-Valid. The snapshot reads namespace + entry
+        // under ONE fs_dir guard, so the revoke cannot slip between the
+        // two reads; the load is fenced and the evidence goes to GC.
+        let service = Arc::new(build_service("settle-fenced", chooser(vec![worker(1)])));
         mount_incarnation(&service, 1, 0);
         committed_entry(&service, token(2, 1), token(2, 2), "/k", OBJ, 130, 0);
-        {
-            let store = service.fs_dir.read();
+        let hook_service = service.clone();
+        service.set_publish_hook(Box::new(move || {
+            let store = hook_service.fs_dir.read();
             let rocks = store.get_rocks_store();
             store.cache.apply_incarnation_revoke(rocks, 5, 1).unwrap();
-        }
+        }));
         let lay = layout(OBJ, 130);
         let err = service
             .commit_barrier_settle(
@@ -5713,6 +5757,61 @@ mod tests {
             .unwrap_err();
         let msg = format!("{}", err);
         assert!(msg.contains("divergence"), "{}", msg);
+
+        // (f) active + same-object Reserved@generation (review
+        // `4dd264df` P0-2): our apply did not land and nothing fenced
+        // the entry — NOT proven dead. Loud barrier failure, the plan is
+        // retained for the exact allocate retry, and GC never sees the
+        // object (a re-plan on the same object_id must not be
+        // counter-deleted).
+        let service = build_service("settle-reserved", chooser(vec![worker(1)]));
+        mount_incarnation(&service, 1, 0);
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let mgr = &store.cache;
+            mgr.apply_id_reserve(rocks, token(1, 1), OBJ, OBJ + 100)
+                .unwrap();
+            let alloc = CacheEntry {
+                generation: 1,
+                state: CacheEntryState::Reserved,
+                object_id: OBJ,
+                len: 0,
+                ufs_mtime: 0,
+                block_size: 64,
+                expire_at: 0,
+            };
+            mgr.apply_allocate(rocks, token(9, 1), 1, "/k", 130, &alloc)
+                .unwrap();
+        }
+        let lay = layout(OBJ, 130);
+        service.install_plan(token(9, 1), plan_for(&lay));
+        let err = service
+            .commit_barrier_settle(
+                &token(9, 1),
+                1,
+                "/k",
+                1,
+                OBJ,
+                130,
+                777,
+                0,
+                64,
+                full_locations(&lay),
+            )
+            .unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("barrier readback failed"),
+            "live Reserved is loud, not dead: {}",
+            msg
+        );
+        assert!(
+            service.plans.lock().unwrap().contains_key(&token(9, 1)),
+            "plan retained for the exact retry"
+        );
+        assert!(!service.gc_has_work(OBJ), "no GC for a live Reserved load");
+        assert!(!service.location_retained(OBJ), "no evidence merge");
     }
 
     /// Production heartbeat progress (review `327b30d2` item 1 +
