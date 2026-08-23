@@ -85,21 +85,35 @@ use curvine_runtime::common::LocalTime;
 use curvine_runtime::sync::ArcRwLock;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Object ids per durable reserve segment. Reserves are rare (one per
 /// segment consumed), so the per-reserve outcome rows of the issuer
 /// client stay trivially small.
 const CACHE_RESERVE_SEGMENT: i64 = 4096;
 
-/// Load-lease deadline of a Reserved row (task #5 gate 2, gpt56
-/// `cfa2f0d7` blocker 3): a Reserved row is reclaimable by the fenced
-/// lazy reap once this deadline passes. The runner's own CacheAbort is
-/// the primary release; the lease is the durable last-resort escape for
-/// a runner that died (SIGKILL) between Allocate and Abort. Must exceed
-/// any task's total cache-load timeout budget (replan rounds included) —
-/// a live load whose lease expires is reaped underneath and its late
-/// Commit resolves terminal Superseded.
-const CACHE_RESERVED_LEASE_MS: i64 = 24 * 60 * 60 * 1000;
+/// Safety margin added on top of the configured `job.task_timeout` when
+/// deriving the Reserved load-lease (task #5 gate 2, gpt56 `cfa2f0d7`
+/// blocker 3 + `107c1701`): a task that finishes right at its configured
+/// budget must still find its row live when committing, so the lease is
+/// the task timeout plus this fixed grace.
+const RESERVED_LEASE_MARGIN_MS: i64 = 60 * 60 * 1000;
+
+/// Derives the Reserved load-lease from the configured job task timeout
+/// (gpt56 `107c1701`): `job.task_timeout` is a user-configurable
+/// `Duration` with no 24h cap (default 1h), so a fixed lease constant
+/// cannot hold the "never reap a live load" invariant — a legal
+/// `task_timeout=48h` deployment would have its still-running rows
+/// lazy-reaped at 24h. The lease covers the task's total cache-load
+/// budget (replan rounds included); a live load whose lease expires is
+/// reaped underneath and its late Commit resolves terminal Superseded.
+/// Saturating arithmetic: absurd configs saturate to a lease that is
+/// never confused with "no lease" (0) and never overflows the
+/// `expire_at` stamp.
+pub fn reserved_lease_ms(task_timeout: Duration) -> i64 {
+    let timeout_ms = i64::try_from(task_timeout.as_millis()).unwrap_or(i64::MAX);
+    timeout_ms.saturating_add(RESERVED_LEASE_MARGIN_MS)
+}
 
 /// Hard cap on block location entries per commit / placement. Bounded so
 /// a malformed commit can never make the master build an unbounded
@@ -1411,6 +1425,10 @@ pub struct CacheService {
     report_sessions: Mutex<HashMap<u32, CacheReportSession>>,
     /// 4d (R7-5) configured hard cap on a session's declared total.
     report_total_cap: u64,
+    /// Reserved load-lease in millis, derived at construction from
+    /// `job.task_timeout` via [`reserved_lease_ms`] (gpt56 `107c1701`):
+    /// always > 0 ("no lease" is 0) and monotone in the task budget.
+    reserved_lease_ms: i64,
     /// One-shot fault-injection seam fired between a sync-propose
     /// barrier's return and the code's post-barrier verification (reserve
     /// epoch check / commit-invalidate readback). Tests use it to make
@@ -1485,8 +1503,14 @@ impl CacheService {
         chooser: Arc<dyn CacheWorkerChooser>,
         enabled: bool,
         report_total_cap: u64,
+        reserved_lease_ms: i64,
     ) -> Self {
+        debug_assert!(
+            reserved_lease_ms > 0,
+            "reserved lease must be positive (derived from job.task_timeout)"
+        );
         Self {
+            reserved_lease_ms,
             fs_dir,
             journal_writer,
             monitor,
@@ -1998,7 +2022,7 @@ impl CacheService {
             // `cfa2f0d7` blocker 3). Stored on the row itself; a
             // Reserved row never has an expiry row, so the ttl sweep
             // (expiry-index scan) can never see it.
-            expire_at: LocalTime::mills() as i64 + CACHE_RESERVED_LEASE_MS,
+            expire_at: (LocalTime::mills() as i64).saturating_add(self.reserved_lease_ms),
         };
         let op_id = self.fs_dir.read().next_op_id();
         let journal_entry = JournalEntry::CacheAllocate(CacheAllocateEntry {
@@ -5867,16 +5891,20 @@ mod tests {
     }
 
     fn build_service(name: &str, chooser: Arc<dyn CacheWorkerChooser>) -> CacheService {
-        build_service_enabled(name, chooser, true)
+        // Mirrors the production default budget (`job.task_timeout=1h`).
+        build_service_enabled(name, chooser, true, Duration::from_secs(3600))
     }
 
     /// 4b gate 5: `enabled=false` mirrors a production master started with
     /// `master.cache_metadata_enabled=false` (the default); the dedicated
     /// disabled test uses this to assert every entry point rejects.
+    /// `task_timeout` overrides `job.task_timeout` so lease-derivation
+    /// seam tests can pin deterministic budgets (gpt56 `107c1701`).
     fn build_service_enabled(
         name: &str,
         chooser: Arc<dyn CacheWorkerChooser>,
         enabled: bool,
+        task_timeout: Duration,
     ) -> CacheService {
         let mut journal = JournalConf::with_test();
         journal.enable = true;
@@ -5888,6 +5916,7 @@ mod tests {
             ..Default::default()
         };
         conf.change_test_meta_dir(name);
+        conf.job.task_timeout = task_timeout;
         Master::init_test_metrics();
         let rt = conf.journal.create_runtime();
         let client = RaftClient::from_conf(rt, &conf.journal);
@@ -5909,7 +5938,15 @@ mod tests {
         monitor.journal_ctl.set_state(RoleState::Leader);
         // 4b gate 5: production defaults the capability OFF; tests enable
         // it explicitly (a dedicated test covers the disabled rejection).
-        CacheService::new(fs_dir, writer, monitor, chooser, enabled, 1_000_000)
+        CacheService::new(
+            fs_dir,
+            writer,
+            monitor,
+            chooser,
+            enabled,
+            1_000_000,
+            reserved_lease_ms(conf.job.task_timeout),
+        )
     }
 
     /// Grants `incarnation` an active incarnation row with a frozen TTL
@@ -7213,6 +7250,98 @@ mod tests {
         }
     }
 
+    /// gpt56 `107c1701` blocker: `job.task_timeout` is user-configurable
+    /// with no 24h cap (default 1h), so the Reserved lease is DERIVED from
+    /// it — a legal 48h-budget deployment must never have a live row
+    /// reaped at a fixed 24h deadline. Saturating derivation: never
+    /// panics, never wraps, never confused with "no lease" (0).
+    #[test]
+    fn test_reserved_lease_derived_from_task_timeout() {
+        // Floor: even a zero budget keeps the fixed grace margin (a task
+        // finishing right at its budget edge still commits into a live
+        // row).
+        assert_eq!(reserved_lease_ms(Duration::ZERO), 60 * 60 * 1000);
+        // The blocker case: a 48h budget leases strictly beyond both the
+        // budget itself and the old fixed 24h constant.
+        let forty_eight_h = reserved_lease_ms(Duration::from_secs(48 * 3600));
+        assert!(forty_eight_h >= 48 * 60 * 60 * 1000);
+        assert!(
+            forty_eight_h > 24 * 60 * 60 * 1000,
+            "lease must exceed the old fixed 24h constant"
+        );
+        // Absurd configs saturate instead of panicking/wrapping.
+        assert_eq!(reserved_lease_ms(Duration::from_secs(u64::MAX)), i64::MAX);
+        // The service wires the derivation from the conf it was built
+        // with (the same path `MasterFileSystem::new` uses in production).
+        let service = build_service_enabled(
+            "lease-48h",
+            chooser(vec![worker(1)]),
+            true,
+            Duration::from_secs(48 * 3600),
+        );
+        assert_eq!(service.reserved_lease_ms, forty_eight_h);
+    }
+
+    /// Deadline seam (gpt56 `107c1701`): BEFORE the lease deadline a new
+    /// Allocate must NOT reap — zero journal proposals (the error is the
+    /// loud row wedge, not the post-propose raft barrier), row untouched.
+    /// (AFTER the deadline, `test_reserved_lease_lazy_reap_reopens_key`
+    /// covers the fenced reap.)
+    #[test]
+    fn test_allocate_never_reaps_a_live_lease() {
+        let service = build_service("live-lease-no-reap", chooser(vec![worker(1)]));
+        seed_sessions(&service, &[worker(1)]);
+        mount_incarnation(&service, 1, 0);
+        // Task A: Reserved@1 with a LIVE lease (default 1h budget + grace).
+        let live_lease_at = LocalTime::mills() as i64 + service.reserved_lease_ms;
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let mgr = &store.cache;
+            mgr.apply_id_reserve(rocks, token(1, 1), OBJ, OBJ + 100)
+                .unwrap();
+            let alloc = CacheEntry {
+                generation: 1,
+                state: CacheEntryState::Reserved,
+                object_id: OBJ,
+                len: 0,
+                ufs_mtime: 0,
+                block_size: 64,
+                expire_at: live_lease_at,
+            };
+            mgr.apply_allocate(rocks, token(195, 1), 1, "/k", 130, &alloc)
+                .unwrap();
+        }
+
+        // Task B: the loud wedge — and crucially NOT the fail-closed raft
+        // barrier, which only surfaces after a sync_propose; a reap here
+        // would have had to propose a CacheReservedReap entry first.
+        let err = service
+            .allocate(token(196, 1), 7, 1, "/k", 130, 64)
+            .unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("only None or Tombstoned rows allocate"),
+            "live-lease allocate must hit the loud row wedge: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("raft"),
+            "no journal proposal of any kind before the deadline: {}",
+            msg
+        );
+
+        // The row is untouched: still Reserved@1 holding the live lease.
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let row = rocks.cache_get_entry(1, "/k").unwrap().unwrap();
+            assert_eq!(row.state, CacheEntryState::Reserved);
+            assert_eq!(row.generation, 1);
+            assert_eq!(row.expire_at, live_lease_at);
+        }
+    }
+
     /// The reap apply CAS matrix: exact Reserved applies; lease mismatch
     /// is loud divergence; a racing Commit's Valid row converges (never
     /// fatal); replay is idempotent; a LIVE lease is never reaped (the
@@ -8054,7 +8183,12 @@ mod tests {
     /// every cache entry point rejects before touching any state.
     #[test]
     fn test_service_disabled_rejects_all_entry_points() {
-        let service = build_service_enabled("disabled-gate", chooser(vec![worker(1)]), false);
+        let service = build_service_enabled(
+            "disabled-gate",
+            chooser(vec![worker(1)]),
+            false,
+            Duration::from_secs(3600),
+        );
 
         let expect_disabled = |err: _| {
             let msg = format!("{}", err);
@@ -8718,8 +8852,12 @@ mod tests {
         assert!(service.remove_scope(7, 1, "/a", Some("/zz"), 4).is_err());
 
         // Capability gate mirrors every other cache entry point.
-        let disabled =
-            build_service_enabled("mutation-drivers-off", chooser(vec![worker(1)]), false);
+        let disabled = build_service_enabled(
+            "mutation-drivers-off",
+            chooser(vec![worker(1)]),
+            false,
+            Duration::from_secs(3600),
+        );
         assert!(disabled.remove_scope(7, 1, "/a", None, 4).is_err());
         assert!(disabled.sweep_ttl(7, 1000, None, 4).is_err());
         assert!(disabled.vacuum_incarnation(7, 5, 1, None, 4).is_err());
