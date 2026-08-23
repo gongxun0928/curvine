@@ -146,11 +146,27 @@ pub struct MasterConf {
     #[serde(default)]
     pub cache_metadata_enabled: bool,
 
+    /// 4d (R7-5) hard cap on a worker full block report's declared
+    /// `total_len` in the CACHE domain: a page declaring (or a session
+    /// accumulating) beyond this cap terminally invalidates that
+    /// worker's cache accumulator for the session, bounding the
+    /// master-side memory a single worker can demand. The FS-domain
+    /// legacy accumulator is unaffected.
+    #[serde(default = "MasterConf::cache_report_total_cap_default")]
+    pub cache_report_total_cap: u64,
+
     #[serde(default = "MasterConf::rocksdb_default")]
     pub rocksdb: DBConf,
 }
 
 impl MasterConf {
+    /// 4d R7-5: 1M block entries per worker report session (~tens of
+    /// MB accumulator bound) — far above a real worker's block count at
+    /// production block sizes, small enough to bound abuse.
+    pub fn cache_report_total_cap_default() -> u64 {
+        1_000_000
+    }
+
     pub fn init(&mut self) -> CommonResult<()> {
         self.heartbeat_interval_unit = DurationUnit::from_str(&self.heartbeat_interval)?;
 
@@ -350,6 +366,7 @@ impl Default for MasterConf {
             compatibility: Default::default(),
 
             cache_metadata_enabled: false,
+            cache_report_total_cap: MasterConf::cache_report_total_cap_default(),
 
             rocksdb,
         };

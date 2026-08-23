@@ -100,6 +100,7 @@ fn stress_add_block_vs_block_report_no_hang() {
                 cluster_id: "curvine".into(),
                 worker_id: 100,
                 full_report: false,
+                worker_session_id: None,
                 total_len: 0,
                 blocks: vec![BlockReportInfo::new(
                     9_000_000 + i as i64,
@@ -180,6 +181,7 @@ fn sanity_single_thread_paths_progress() {
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: false,
+            worker_session_id: None,
             total_len: 0,
             blocks: vec![BlockReportInfo::new(
                 8_000_000 + i as i64,

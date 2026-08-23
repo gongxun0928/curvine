@@ -81,7 +81,17 @@ impl LoopTask for HeartbeatChecker {
                 if now > last_update + self.worker_lost_ms {
                     // Heartbeat timeout
                     if let Some(worker) = wm.remove_expired_worker(id) {
-                        removed_workers.push((id, worker.address, worker.last_update));
+                        // 4d (R9-2): snapshot the worker's wire session id
+                        // BEFORE the WorkerInfo is discarded, so the async
+                        // cleanup can retire the CACHE session exactly — a
+                        // worker that restarted in between keeps its new
+                        // session untouched.
+                        removed_workers.push((
+                            id,
+                            worker.address,
+                            worker.last_update,
+                            worker.worker_session_id,
+                        ));
                     }
                 }
             }
@@ -94,7 +104,7 @@ impl LoopTask for HeartbeatChecker {
             );
         }
 
-        for (id, address, last_update) in removed_workers {
+        for (id, address, last_update, worker_session_id) in removed_workers {
             warn!(
                 "Worker {} ({}) last heartbeat {} has exceeded lost timeout {} ms and will be removed",
                 id, address, last_update, self.worker_lost_ms
@@ -104,6 +114,12 @@ impl LoopTask for HeartbeatChecker {
             let rm = self.replication_manager.clone();
             let res = self.executor.spawn(move || {
                 let spend = TimeSpent::new();
+                // 4d (R9-2): retire the lost worker's CACHE session
+                // first and exactly — the volatile registry callback
+                // verifies the recorded session still matches before
+                // moving the live reverse set to the retired drain; a
+                // Start that landed in between makes this a no-op.
+                fs.end_worker_session(id, &worker_session_id);
                 let cleanup = match fs.delete_locations(id) {
                     Err(e) => {
                         warn!("{}", curvine_core_error::err_msg!(e));

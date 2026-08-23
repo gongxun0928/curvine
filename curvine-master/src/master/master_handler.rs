@@ -737,9 +737,23 @@ impl MasterHandler {
         // Worker weight comes from trusted administrator configuration. Preserve the
         // configured u32 value so the master does not silently alter allocation ratios.
         let weight = header.weight.unwrap_or_else(WorkerInfo::default_weight);
-        if matches!(status, HeartbeatStatus::Start) {
-            fs.reset_full_block_report(address.worker_id);
-        }
+        let worker_session_id = header.worker_session_id.unwrap_or_default();
+
+        // 4d R8-1 start_gate: a Start's whole critical section — WM
+        // validation/clear, accumulator reset, volatile session
+        // install — is serialized against every other Start, so dual or
+        // reordered Starts cannot interleave their state transitions.
+        // Declared lock order: start_gate → WM write → accumulator
+        // control → CacheVolatile. The GC tick below never holds the
+        // volatile guard while taking the WM write lock, so no cycle
+        // exists between the two orders.
+        // Underscore-prefixed: the guard is held for its lifetime
+        // (until end of the Start critical section), not read.
+        let _start_gate = if matches!(status, HeartbeatStatus::Start) {
+            Some(fs.start_gate.lock())
+        } else {
+            None
+        };
 
         // 4c.3 physical GC handoff (review `6bc4f569` gate 3 /
         // `327b30d2` item 1): the leader drains a bounded batch of cache
@@ -757,9 +771,9 @@ impl MasterHandler {
         let cmds = wm.heartbeat(
             &header.cluster_id,
             status,
-            address,
+            address.clone(),
             weight,
-            header.worker_session_id.unwrap_or_default(),
+            worker_session_id.clone(),
             curvine_model::TransferWorkerCapabilities {
                 task_submit: header.transfer_task_submit.unwrap_or(false),
                 report_target: header.transfer_report_target.unwrap_or(false),
@@ -772,6 +786,20 @@ impl MasterHandler {
             ProtoUtils::storage_info_list_from_pb(header.storages),
             header.component_info,
         )?;
+        drop(wm);
+
+        // 4d Start/End cache-domain control (R7-1 order fix, R9-2/R9-3):
+        // runs only after the WM accepted the transition. For Start this
+        // fixes the pre-4d order where the full-report accumulator was
+        // reset BEFORE the registration was validated; for End the
+        // retirement is session-exact against the volatile registry.
+        match status {
+            // The start_gate stays held through begin_worker_session —
+            // the whole critical section is serialized.
+            HeartbeatStatus::Start => fs.begin_worker_session(&address, &worker_session_id),
+            HeartbeatStatus::End => fs.end_worker_session(address.worker_id, &worker_session_id),
+            HeartbeatStatus::Running => {}
+        }
         Ok(cmds)
     }
 

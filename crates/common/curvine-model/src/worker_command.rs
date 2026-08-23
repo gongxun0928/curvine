@@ -67,4 +67,8 @@ pub struct BlockReportList {
     pub full_report: bool,
     pub total_len: u64,
     pub blocks: Vec<BlockReportInfo>,
+    /// 4d session fence: the reporting worker process's session id (same
+    /// value as its Start heartbeat). `None`/empty = legacy worker without
+    /// the field; the cache domain skips such reports entirely.
+    pub worker_session_id: Option<String>,
 }

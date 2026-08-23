@@ -115,6 +115,7 @@ impl MasterClient {
             full_report: true,
             total_len: total_size as u64,
             blocks: vec![],
+            worker_session_id: Some(self.worker_session_id.clone()),
         };
 
         for block in blocks {
@@ -150,6 +151,7 @@ impl MasterClient {
             full_report: false,
             total_len: blocks.len() as u64,
             blocks: vec![],
+            worker_session_id: Some(self.worker_session_id.clone()),
         };
 
         for block in blocks {

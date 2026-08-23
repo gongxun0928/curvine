@@ -79,10 +79,10 @@ use crate::master::meta::cache::MUTATION_PAGE_CAP;
 use crate::master::meta::{BlockIdCodec, CacheBlockLayout};
 use crate::master::{MasterMonitor, SyncFsDir};
 use curvine_core_error::{err_box, err_msg, CommonError, CommonResult};
-use curvine_model::WorkerAddress;
+use curvine_model::{BlockReportInfo, BlockReportStatus, StorageType, WorkerAddress};
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::sync::ArcRwLock;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 /// Object ids per durable reserve segment. Reserves are rare (one per
@@ -319,6 +319,55 @@ impl CacheGcQueue {
     }
 }
 
+// Field-level dead-code allowance: `tag`/`entries` (and the registry's
+// `address`/`epoch`) become production-read by the 4d.2 routing work
+// (retired-session drain, current-tag get filter, trusted full-report
+// address source); the 4d.1 spine writes them and the unit tests read
+// them for exactness.
+#[allow(dead_code)]
+/// 4d (R8-2): one retired session of a worker — the block identities it
+/// held when its session ended (a later Start superseded it, or
+/// End/lost-worker retired it session-exactly). Drained boundedly from
+/// the queue front; the identities are `(object_id, seq)` pairs so the
+/// drain can both derive block ids (via the locations geometry) and
+/// remove the replica rows.
+struct RetiredSession {
+    tag: u64,
+    entries: HashSet<(i64, i64)>,
+}
+
+/// 4d (R8-2): per-worker reverse view of the published locations.
+/// `live` holds the block identities published under the worker's
+/// CURRENT session tag; a Start moves live into a retired session
+/// record in O(1) instead of swapping hash sets.
+#[derive(Default)]
+struct WorkerRev {
+    live: HashSet<(i64, i64)>,
+    retired: VecDeque<RetiredSession>,
+}
+
+#[allow(dead_code)]
+/// 4d (R4/R9-3): the cache session registry entry for one worker,
+/// installed by its Start heartbeat.
+struct WorkerSession {
+    /// The worker process's wire session id (the Start heartbeat's
+    /// `worker_session_id`): the exact-match key for End/lost-worker
+    /// retirement (R9-2) — a stale callback from an older process must
+    /// never retire a newer session.
+    session: String,
+    /// Monotonic process tag (issued from `next_tag`); published
+    /// location replicas record the tag they were written under so the
+    /// read path can filter to the current session (R9-1).
+    tag: u64,
+    /// The worker address as reported at Start — the ONLY trusted
+    /// address source for cache locations during the full-report window
+    /// (the worker manager removes the old row at Start and inserts
+    /// nothing until the first regular heartbeat).
+    address: WorkerAddress,
+    /// Journal epoch the session was installed under.
+    epoch: u64,
+}
+
 /// All leader-volatile cache state under ONE lock (4c.3 lock-order
 /// contract, review `6bc4f569` gate 3/4): the published locations of
 /// live objects and the GC work queue. The lock order is strictly
@@ -327,7 +376,32 @@ impl CacheGcQueue {
 /// commit-publish recheck + GC drain serialization sound.
 #[derive(Default)]
 struct CacheVolatile {
+    /// Journal epoch this volatile state is bound to (4d R5/R7-2
+    /// leader-epoch fence): every entry point compares
+    /// `monitor.journal_epoch()`; any mismatch cold-clears ALL volatile
+    /// state below and rebinds, so no stale-warm state survives a
+    /// leadership loss+regain. The initial 0 binds harmlessly (first
+    /// touch against a nonzero epoch just clears empty maps).
+    epoch: u64,
     locations: HashMap<i64, ObjectLocations>,
+    /// Load plans by allocate token, merged into the volatile domain
+    /// (4d R8-1 supplement): plan reads/writes are now atomic with the
+    /// session registry and the epoch fence, and a cold clear drops
+    /// plans too (they are leader-volatile by definition).
+    plans: HashMap<OpToken, LoadPlan>,
+    /// 4d session registry (R4/R9-3): worker_id → current session.
+    worker_sessions: HashMap<u32, WorkerSession>,
+    /// 4d reverse index (R8-2): worker_id → live set + retired sessions.
+    by_worker: HashMap<u32, WorkerRev>,
+    /// 4d reconcile generations (R8-4/R9-4): worker_id → generation of
+    /// the last cache incremental accepted for it; a full-report
+    /// reconcile only proceeds against a stable generation.
+    reconcile_gens: HashMap<u32, u64>,
+    /// Monotonic session tag issuer — NEVER reset, including by the
+    /// epoch cold clear: a tag must never be reused across sessions,
+    /// or a stale retired-session drain could match fresh state. 0 is
+    /// reserved as the UNFENCED sentinel; the first real tag is 1.
+    next_tag: u64,
     gc: CacheGcQueue,
 }
 
@@ -387,6 +461,121 @@ impl CacheVolatile {
         }
         Ok(out)
     }
+
+    /// 4d R5/R7-2 epoch fence: bind to the current journal epoch,
+    /// cold-clearing every volatile map on mismatch. `next_tag` survives
+    /// the clear (tags are never reused). Returns true when a clear
+    /// happened, so entry points can log/skip accordingly.
+    fn sync_epoch(&mut self, journal_epoch: u64) -> bool {
+        if self.epoch == journal_epoch {
+            return false;
+        }
+        self.epoch = journal_epoch;
+        self.locations.clear();
+        self.plans.clear();
+        self.worker_sessions.clear();
+        self.by_worker.clear();
+        self.reconcile_gens.clear();
+        self.gc.items.clear();
+        self.gc.order.clear();
+        true
+    }
+
+    /// 4d R9-3: install the fresh session a Start heartbeat opens.
+    /// Retires the worker's previous live set (O(1) move) if any, issues
+    /// the next never-reused tag, and bumps the reconcile generation so
+    /// a concurrent full-report reconcile aborts against the new
+    /// session. Called with the volatile guard held.
+    fn install_session(&mut self, worker_id: u32, session: String, address: WorkerAddress) -> u64 {
+        if let Some(prev) = self.worker_sessions.remove(&worker_id) {
+            self.retire_live(worker_id, prev.tag);
+        }
+        // Real tags start at 1: 0 is the UNFENCED sentinel (R8-3).
+        self.next_tag += 1;
+        let tag = self.next_tag;
+        self.worker_sessions.insert(
+            worker_id,
+            WorkerSession {
+                session,
+                tag,
+                address,
+                epoch: self.epoch,
+            },
+        );
+        *self.reconcile_gens.entry(worker_id).or_insert(0) += 1;
+        tag
+    }
+
+    /// 4d R9-2: retire the worker's session EXACTLY. If the registry no
+    /// longer records this wire session id (a newer Start intervened),
+    /// the whole operation is a no-op — a stale End/lost-worker
+    /// callback must never delete a future session's state. On an exact
+    /// match the registry row is removed, the live set moves to
+    /// retired, and the reconcile generation bumps. Returns true when
+    /// the session was retired.
+    fn retire_session(&mut self, worker_id: u32, session: &str) -> bool {
+        let tag = match self.worker_sessions.get(&worker_id) {
+            Some(s) if s.session == session => s.tag,
+            _ => return false,
+        };
+        self.worker_sessions.remove(&worker_id);
+        self.retire_live(worker_id, tag);
+        *self.reconcile_gens.entry(worker_id).or_insert(0) += 1;
+        true
+    }
+
+    /// Move the worker's live reverse set into a retired session record
+    /// (O(1); an empty live set records nothing).
+    fn retire_live(&mut self, worker_id: u32, tag: u64) {
+        if let Some(rev) = self.by_worker.get_mut(&worker_id) {
+            if !rev.live.is_empty() {
+                let live = std::mem::take(&mut rev.live);
+                rev.retired.push_back(RetiredSession { tag, entries: live });
+            }
+        }
+    }
+}
+
+/// 4d (R7-5): the strict single-key full-report accumulator for the
+/// CACHE domain — one entry per block id carrying the reported
+/// `(status, len, storage_type)`. Terminal semantics (`0b900a2f`):
+/// unlike the FS legacy accumulator, an invalidated session is NEVER
+/// removed-and-restarted — every further full page of the same worker
+/// session is permanently cache-skipped; only a successful Start
+/// (installing a fresh session) creates a fresh accumulator. No
+/// preallocation by `total_len`; the declared total is hard-capped by
+/// configuration.
+struct CacheReportSession {
+    /// Wire session id this accumulator is bound to (exact match with
+    /// the Start that opened it; pages from any other session are
+    /// skipped).
+    session: String,
+    /// Declared total from the first accepted page; a later page with
+    /// a different total invalidates terminally.
+    total_len: u64,
+    /// Block id → reported (status, len, storage type). A duplicate id
+    /// with the SAME triple is idempotent; any conflicting duplicate
+    /// invalidates terminally.
+    entries: HashMap<i64, (BlockReportStatus, i64, StorageType)>,
+    /// Terminal invalidation flag (sources: F/W/Deleted incremental,
+    /// total_len conflict, duplicate conflict, overflow).
+    invalid: bool,
+    update_time_ms: u64,
+}
+
+/// 4d (R7-5): result of feeding one full-report page into the cache
+/// accumulator.
+pub enum CacheFullReportOutcome {
+    /// No valid accumulation for this page (unknown/foreign session,
+    /// terminal-invalid, total conflict, duplicate conflict, or cap
+    /// overflow) — the page is cache-skipped.
+    Skipped,
+    /// Accumulation continues (unique count < declared total).
+    Partial,
+    /// This page completed a valid accumulation (unique count ==
+    /// total): the full entry set is handed out and the accumulator is
+    /// consumed.
+    Complete(Vec<BlockReportInfo>),
 }
 
 /// Volatile leader-scoped segment cursor for the object id issuer.
@@ -416,6 +605,18 @@ struct LoadPlan {
     /// policy at planning time): commit evidence must reach it.
     replicas: usize,
     blocks: Vec<CacheBlockLocation>,
+    /// 4d R8-3 fence: journal epoch captured at planning time. A commit
+    /// may only propose while the volatile domain still sits on this
+    /// epoch; the settle path re-checks it across the barrier.
+    epoch: u64,
+    /// 4d R8-3 fence: per-block, per-worker SESSION TAGS captured from
+    /// the registry at planning time (parallel to `blocks[i].workers`).
+    /// A commit validates every planned replica's (worker, tag) against
+    /// the live registry BEFORE proposing, and again at settle — a
+    /// worker that restarted in between cannot be handed a commit for
+    /// its predecessor's plan. Empty (test-installed) plans skip the
+    /// per-replica check (nothing frozen).
+    tags: Vec<Vec<u64>>,
 }
 
 pub struct CacheService {
@@ -433,12 +634,19 @@ pub struct CacheService {
     issue_lock: Mutex<()>,
     /// Leader-scoped segment cursor (see `Segment`). None = burned.
     segment: Mutex<Option<Segment>>,
-    /// Volatile load plans by allocate token.
-    plans: Mutex<HashMap<OpToken, LoadPlan>>,
-    /// Published locations + GC work queue under one lock (4c.3). The
-    /// `plans` map stays a separate leaf lock: it is always accessed
-    /// without holding this lock (and vice versa).
+    /// Published locations + GC work queue + load plans + the 4d
+    /// session/epoch spine, all under one lock (4c.3 + 4d R8-1
+    /// supplement): merging the plans into the volatile domain makes
+    /// plan access atomic with the session registry and the epoch
+    /// fence, and lets a cold clear drop plans together with the rest.
     state: Mutex<CacheVolatile>,
+    /// 4d (R7-5) cache-domain full-report accumulators, keyed by worker
+    /// id. A SEPARATE leaf from the volatile domain on purpose: the
+    /// declared lock order is accumulator → CacheVolatile (the Start
+    /// critical section takes both, in that order, never reversed).
+    report_sessions: Mutex<HashMap<u32, CacheReportSession>>,
+    /// 4d (R7-5) configured hard cap on a session's declared total.
+    report_total_cap: u64,
     /// One-shot fault-injection seam fired between a sync-propose
     /// barrier's return and the code's post-barrier verification (reserve
     /// epoch check / commit-invalidate readback). Tests use it to make
@@ -512,6 +720,7 @@ impl CacheService {
         monitor: MasterMonitor,
         chooser: Arc<dyn CacheWorkerChooser>,
         enabled: bool,
+        report_total_cap: u64,
     ) -> Self {
         Self {
             fs_dir,
@@ -521,8 +730,9 @@ impl CacheService {
             enabled,
             issue_lock: Mutex::new(()),
             segment: Mutex::new(None),
-            plans: Mutex::new(HashMap::new()),
             state: Mutex::new(CacheVolatile::default()),
+            report_sessions: Mutex::new(HashMap::new()),
+            report_total_cap,
             #[cfg(test)]
             barrier_hook: Mutex::new(None),
             #[cfg(test)]
@@ -657,7 +867,7 @@ impl CacheService {
         let layout = CacheBlockLayout::derive(entry.object_id, entry.len, entry.block_size)?;
         let mut blocks = Vec::new();
         if need_locations {
-            let locations = &self.state.lock().unwrap().locations;
+            let locations = &self.lock_volatile().locations;
             let Some(object_locations) = locations.get(&entry.object_id) else {
                 return Ok(None);
             };
@@ -827,10 +1037,10 @@ impl CacheService {
         // namespace is confirmed live.
         if let Some((object_id, generation)) = replay {
             // Scoped lock: the guard must be released before the replan
-            // arm, which takes the plans lock again.
+            // arm, which takes the volatile lock again.
             let prior = {
-                let plans = self.plans.lock().unwrap();
-                plans.get(&token).map(|plan| plan.blocks.clone())
+                let volatile = self.lock_volatile();
+                volatile.plans.get(&token).map(|plan| plan.blocks.clone())
             };
             let blocks = match prior {
                 Some(blocks) => blocks,
@@ -877,6 +1087,9 @@ impl CacheService {
         // selection (no workers / below replica policy) must not burn an
         // object id.
         let layout_worker_sets = self.plan_worker_sets(block_count as usize, block_size)?;
+        // 4d R8-3: freeze the plan fences (epoch + per-replica session
+        // tags) for the just-chosen sets before any identity is issued.
+        let (plan_epoch, plan_tags) = self.capture_plan_fences(&layout_worker_sets)?;
         // Wire-size gate before issuance: the response carries the whole
         // plan, and the transport's inbound cap does not protect responses.
         // A plan whose serialized estimate exceeds the cap is rejected
@@ -990,7 +1203,7 @@ impl CacheService {
                         block_size,
                     )?
                 };
-                self.plans.lock().unwrap().insert(
+                self.lock_volatile().plans.insert(
                     token,
                     LoadPlan {
                         object_id,
@@ -999,6 +1212,8 @@ impl CacheService {
                         block_size,
                         replicas,
                         blocks: blocks.clone(),
+                        epoch: plan_epoch,
+                        tags: plan_tags.clone(),
                     },
                 );
                 Ok(CacheAllocateResult {
@@ -1030,6 +1245,9 @@ impl CacheService {
         layout: CacheBlockLayout,
     ) -> CommonResult<Vec<CacheBlockLocation>> {
         let sets = self.plan_worker_sets(layout.block_count as usize, layout.block_size)?;
+        // 4d R8-3: a re-plan freezes FRESH fences against the current
+        // sessions — the lost plan's fences are never resurrected.
+        let (plan_epoch, plan_tags) = self.capture_plan_fences(&sets)?;
         let replicas = self.chooser.replica_policy();
         let mut blocks = Vec::with_capacity(layout.block_count as usize);
         for (index, workers) in sets.into_iter().enumerate() {
@@ -1043,7 +1261,7 @@ impl CacheService {
                 workers,
             });
         }
-        self.plans.lock().unwrap().insert(
+        self.lock_volatile().plans.insert(
             token,
             LoadPlan {
                 object_id: layout.object_id,
@@ -1052,6 +1270,8 @@ impl CacheService {
                 block_size: layout.block_size,
                 replicas,
                 blocks: blocks.clone(),
+                epoch: plan_epoch,
+                tags: plan_tags,
             },
         );
         Ok(blocks)
@@ -1296,7 +1516,7 @@ impl CacheService {
             match rocks.cache_get_entry(incarnation, key).map_err(fs_err)? {
                 None => {
                     drop(store);
-                    self.plans.lock().unwrap().remove(&load_token);
+                    self.lock_volatile().plans.remove(&load_token);
                     return Ok(CacheOpStatus::Superseded {
                         expected: generation,
                         current: 0,
@@ -1304,7 +1524,7 @@ impl CacheService {
                 }
                 Some(cur) if cur.generation > generation => {
                     drop(store);
-                    self.plans.lock().unwrap().remove(&load_token);
+                    self.lock_volatile().plans.remove(&load_token);
                     return Ok(CacheOpStatus::Superseded {
                         expected: generation,
                         current: cur.generation,
@@ -1331,7 +1551,7 @@ impl CacheService {
                 }
                 Some(cur) if cur.state == CacheEntryState::Tombstoned => {
                     drop(store);
-                    self.plans.lock().unwrap().remove(&load_token);
+                    self.lock_volatile().plans.remove(&load_token);
                     return Ok(CacheOpStatus::Superseded {
                         expected: generation,
                         current: cur.generation,
@@ -1342,7 +1562,7 @@ impl CacheService {
                     // could have written it.
                     if cur.len == len && cur.ufs_mtime == ufs_mtime && cur.expire_at == expire_at {
                         drop(store);
-                        self.plans.lock().unwrap().remove(&load_token);
+                        self.lock_volatile().plans.remove(&load_token);
                         return Ok(CacheOpStatus::AlreadyApplied);
                     }
                     return err_box!(
@@ -1364,7 +1584,7 @@ impl CacheService {
                     // Reserved row ever shows up here at the exact recorded
                     // identity, resolve idempotently and spend the plan.
                     drop(store);
-                    self.plans.lock().unwrap().remove(&load_token);
+                    self.lock_volatile().plans.remove(&load_token);
                     return Ok(CacheOpStatus::AlreadyApplied);
                 }
                 Some(_) => (), // Reserved at the right identity: apply.
@@ -1377,8 +1597,9 @@ impl CacheService {
         // writes. Fail closed as a retryable miss — the caller retries the
         // exact allocate (which re-plans the same identity) and re-commits.
         let plan = {
-            let plans = self.plans.lock().unwrap();
-            plans
+            let volatile = self.lock_volatile();
+            volatile
+                .plans
                 .get(&load_token)
                 .cloned()
                 .ok_or_else(|| {
@@ -1404,6 +1625,13 @@ impl CacheService {
                 plan.file_len
             );
         }
+
+        // 4d R8-3 pre-propose fence: the plan's epoch + replica
+        // session tags are validated against the live registry BEFORE
+        // anything is proposed. A breach is retryable the same way a
+        // lost plan is: replay the exact allocate (which re-plans
+        // against the current sessions) and re-commit.
+        self.validate_plan_fences(&plan)?;
 
         // Evidence validation against the plan happens before the
         // barrier: every rejected set below never touches the journal.
@@ -1439,6 +1667,8 @@ impl CacheService {
             ufs_mtime,
             expire_at,
             plan.block_size,
+            plan.epoch,
+            plan.tags,
             blocks,
         )
     }
@@ -1469,6 +1699,8 @@ impl CacheService {
         ufs_mtime: i64,
         expire_at: i64,
         block_size: i64,
+        plan_epoch: u64,
+        plan_tags: Vec<Vec<u64>>,
         blocks: Vec<CacheBlockLocation>,
     ) -> CommonResult<CacheOpStatus> {
         // Test seam (4c.3, review `6bc4f569` gate 4): "the row was fenced
@@ -1497,117 +1729,139 @@ impl CacheService {
         //   object's locations after GC finished.
         enum Settlement {
             Applied,
-            Superseded { current: u64 },
+            Superseded {
+                current: u64,
+            },
             Fenced,
             Divergence(CacheEntry),
             ReadbackFailure(CacheEntry),
+            /// 4d R8-3 settle re-check: the plan's epoch or a planned
+            /// replica's session tag no longer holds (worker restarted
+            /// or leadership changed across the propose barrier).
+            /// Terminal for THIS commit: nothing is published, no dead
+            /// evidence is merged, and the plan is spent — the client
+            /// replays the exact allocate (fresh fences) and re-commits.
+            /// Any blocks the workers already wrote are re-derived by
+            /// the restarted worker's own full report.
+            PlanFenceLost,
         }
         let settlement = {
-            let mut volatile = self.state.lock().unwrap();
-            // ONE authoritative snapshot (review `4dd264df` P0-1): the
-            // incarnation row, the mount's current pointer, and the entry
-            // row are read consecutively under a SINGLE fs_dir guard, so
-            // a revoke cannot commit between the namespace read and the
-            // entry read (lock order: volatile → fs_dir read).
-            let (active, cur) = {
-                let store = self.fs_dir.read();
-                let rocks = store.get_rocks_store();
-                let active = match rocks.cache_get_incarnation(incarnation).map_err(fs_err)? {
-                    Some(row) if !row.revoked => {
-                        rocks
-                            .cache_current_incarnation(row.mount_id)
-                            .map_err(fs_err)?
-                            == Some(incarnation)
-                    }
-                    _ => false,
-                };
-                let cur = rocks.cache_get_entry(incarnation, key).map_err(fs_err)?;
-                (active, cur)
-            };
-            // Proven-dead classification (review `4dd264df` P0-2): only
-            // an inactive namespace, a missing row, a row that already
-            // belongs to a different object, a same-object tombstone, or
-            // an advanced generation prove THIS load dead. An ACTIVE
-            // same-object Reserved row (our apply did not land and
-            // nothing else fenced the entry) is NOT dead — an exact
-            // allocate retry can still plan and commit the same
-            // object_id, so GC must never see it and the plan is kept.
-            let merge_dead = |volatile: &mut CacheVolatile| -> CommonResult<()> {
-                self.merge_dead_commit_evidence(
-                    volatile,
-                    incarnation,
-                    object_id,
-                    len,
-                    block_size,
-                    &blocks,
-                )
-            };
-            if !active {
-                merge_dead(&mut volatile)?;
-                Settlement::Fenced
+            let mut volatile = self.lock_volatile();
+            // 4d R8-3 settle re-check FIRST, under the volatile guard:
+            // if the plan fences no longer hold, the commit must not
+            // publish NOR merge — even against an exact-Valid row.
+            if let Err(e) = Self::check_plan_fences(&volatile, plan_epoch, &blocks, &plan_tags) {
+                log::warn!("cache commit settle fence breach: {}", e);
+                Settlement::PlanFenceLost
             } else {
-                match cur {
-                    None => {
-                        merge_dead(&mut volatile)?;
-                        Settlement::Superseded { current: 0 }
-                    }
-                    Some(c) if c.object_id != object_id || c.generation > generation => {
-                        merge_dead(&mut volatile)?;
-                        Settlement::Superseded {
-                            current: c.generation,
+                // ONE authoritative snapshot (review `4dd264df` P0-1): the
+                // incarnation row, the mount's current pointer, and the entry
+                // row are read consecutively under a SINGLE fs_dir guard, so
+                // a revoke cannot commit between the namespace read and the
+                // entry read (lock order: volatile → fs_dir read).
+                let (active, cur) = {
+                    let store = self.fs_dir.read();
+                    let rocks = store.get_rocks_store();
+                    let active = match rocks.cache_get_incarnation(incarnation).map_err(fs_err)? {
+                        Some(row) if !row.revoked => {
+                            rocks
+                                .cache_current_incarnation(row.mount_id)
+                                .map_err(fs_err)?
+                                == Some(incarnation)
                         }
-                    }
-                    Some(c)
-                        if c.generation == generation && c.state == CacheEntryState::Tombstoned =>
-                    {
-                        merge_dead(&mut volatile)?;
-                        Settlement::Superseded {
-                            current: c.generation,
+                        _ => false,
+                    };
+                    let cur = rocks.cache_get_entry(incarnation, key).map_err(fs_err)?;
+                    (active, cur)
+                };
+                // Proven-dead classification (review `4dd264df` P0-2): only
+                // an inactive namespace, a missing row, a row that already
+                // belongs to a different object, a same-object tombstone, or
+                // an advanced generation prove THIS load dead. An ACTIVE
+                // same-object Reserved row (our apply did not land and
+                // nothing else fenced the entry) is NOT dead — an exact
+                // allocate retry can still plan and commit the same
+                // object_id, so GC must never see it and the plan is kept.
+                let merge_dead = |volatile: &mut CacheVolatile| -> CommonResult<()> {
+                    self.merge_dead_commit_evidence(
+                        volatile,
+                        incarnation,
+                        object_id,
+                        len,
+                        block_size,
+                        &blocks,
+                    )
+                };
+                if !active {
+                    merge_dead(&mut volatile)?;
+                    Settlement::Fenced
+                } else {
+                    match cur {
+                        None => {
+                            merge_dead(&mut volatile)?;
+                            Settlement::Superseded { current: 0 }
                         }
-                    }
-                    Some(c)
-                        if c.state == CacheEntryState::Valid
-                            && c.generation == generation
-                            && c.object_id == object_id =>
-                    {
-                        if c.len == len && c.ufs_mtime == ufs_mtime && c.expire_at == expire_at {
-                            let object_locations = volatile.locations.entry(object_id).or_default();
-                            object_locations.len = len;
-                            object_locations.block_size = block_size;
-                            object_locations.blocks.clear();
-                            for (index, block) in blocks.into_iter().enumerate() {
-                                object_locations
-                                    .blocks
-                                    .insert((index + 1) as i64, block.workers);
+                        Some(c) if c.object_id != object_id || c.generation > generation => {
+                            merge_dead(&mut volatile)?;
+                            Settlement::Superseded {
+                                current: c.generation,
                             }
-                            Settlement::Applied
-                        } else {
-                            Settlement::Divergence(c)
                         }
+                        Some(c)
+                            if c.generation == generation
+                                && c.state == CacheEntryState::Tombstoned =>
+                        {
+                            merge_dead(&mut volatile)?;
+                            Settlement::Superseded {
+                                current: c.generation,
+                            }
+                        }
+                        Some(c)
+                            if c.state == CacheEntryState::Valid
+                                && c.generation == generation
+                                && c.object_id == object_id =>
+                        {
+                            if c.len == len && c.ufs_mtime == ufs_mtime && c.expire_at == expire_at
+                            {
+                                let object_locations =
+                                    volatile.locations.entry(object_id).or_default();
+                                object_locations.len = len;
+                                object_locations.block_size = block_size;
+                                object_locations.blocks.clear();
+                                for (index, block) in blocks.into_iter().enumerate() {
+                                    object_locations
+                                        .blocks
+                                        .insert((index + 1) as i64, block.workers);
+                                }
+                                Settlement::Applied
+                            } else {
+                                Settlement::Divergence(c)
+                            }
+                        }
+                        // Active + same-object Reserved@generation (or an
+                        // impossible lower generation): not proven dead —
+                        // loud, plan kept, nothing enqueued.
+                        Some(c) => Settlement::ReadbackFailure(c),
                     }
-                    // Active + same-object Reserved@generation (or an
-                    // impossible lower generation): not proven dead —
-                    // loud, plan kept, nothing enqueued.
-                    Some(c) => Settlement::ReadbackFailure(c),
                 }
             }
         };
         match settlement {
             Settlement::Applied => {
                 // Terminal state reached: the plan is spent.
-                self.plans.lock().unwrap().remove(load_token);
+                self.lock_volatile().plans.remove(load_token);
                 Ok(CacheOpStatus::Applied)
             }
             Settlement::Superseded { current } => {
                 // The load is terminal: the plan is spent either way.
-                self.plans.lock().unwrap().remove(load_token);
+                self.lock_volatile().plans.remove(load_token);
                 Ok(CacheOpStatus::Superseded {
                     expected: generation,
                     current,
                 })
             }
             Settlement::Fenced => {
-                self.plans.lock().unwrap().remove(load_token);
+                self.lock_volatile().plans.remove(load_token);
                 Err(Self::fenced(incarnation))
             }
             Settlement::Divergence(cur) => err_box!(
@@ -1628,6 +1882,18 @@ impl CacheService {
                 key,
                 cur
             ),
+            Settlement::PlanFenceLost => {
+                // 4d R8-3: the plan is spent (terminal for this
+                // commit); the exact allocate replay re-plans with
+                // fresh fences.
+                self.lock_volatile().plans.remove(load_token);
+                err_box!(
+                    "cache commit plan fence lost across the propose barrier for ({}, {})@{}: zero locations published, no GC merge; replay the exact allocate to re-plan, then re-commit",
+                    incarnation,
+                    key,
+                    generation
+                )
+            }
         }
     }
 
@@ -2295,7 +2561,10 @@ impl CacheService {
             return;
         }
         let batch = match self.state.lock() {
-            Ok(mut volatile) => volatile.gc_take_batch(),
+            Ok(mut volatile) => {
+                volatile.sync_epoch(self.monitor.journal_epoch());
+                volatile.gc_take_batch()
+            }
             Err(_) => return,
         };
         let batch = match batch {
@@ -2312,6 +2581,155 @@ impl CacheService {
         for (worker_id, block_id) in batch {
             wm.remove_block(worker_id, block_id);
         }
+    }
+
+    /// 4d R5/R7-2 epoch fence helper: acquire the volatile guard bound
+    /// to the CURRENT journal epoch, cold-clearing every volatile map on
+    /// a leadership mismatch (see `CacheVolatile::sync_epoch`). Every
+    /// production entry point into the volatile domain goes through
+    /// this — a regained leader never serves stale-warm locations,
+    /// plans, session registry, or GC queue. Test seams may keep the
+    /// raw lock to control the epoch deterministically.
+    fn lock_volatile(&self) -> std::sync::MutexGuard<'_, CacheVolatile> {
+        let mut volatile = self.state.lock().unwrap();
+        volatile.sync_epoch(self.monitor.journal_epoch());
+        volatile
+    }
+
+    /// 4d (R4/R9-3): accept a worker Start in the cache domain —
+    /// install the fresh session (retiring any previous one) under the
+    /// volatile guard, epoch-fenced. The accumulator reset (R7-5) is
+    /// driven by MasterFilesystem BEFORE this under the accumulator
+    /// guard (declared order: accumulator → volatile).
+    pub fn install_worker_session(&self, worker_id: u32, session: &str, address: &WorkerAddress) {
+        let mut volatile = self.lock_volatile();
+        volatile.install_session(worker_id, session.to_string(), address.clone());
+    }
+
+    /// 4d (R9-2): retire the worker's session EXACTLY (End heartbeat or
+    /// lost-worker callback). No-op unless the registry still records
+    /// this exact wire session id — a newer Start in between wins.
+    pub fn retire_worker_session(&self, worker_id: u32, session: &str) -> bool {
+        let mut volatile = self.lock_volatile();
+        volatile.retire_session(worker_id, session)
+    }
+
+    /// 4d (R9-3): the Start acceptance for the cache domain — holds the
+    /// accumulator guard AND the volatile guard SIMULTANEOUSLY (declared
+    /// order: accumulator → volatile) while it atomically replaces the
+    /// session registry row (retiring the previous live set, issuing a
+    /// fresh never-reused tag, bumping the reconcile generation) and
+    /// installs a FRESH accumulator bound to the new session. This is
+    /// the ONLY accumulator creation point (`0b900a2f`: a
+    /// terminally-invalidated session never gets a new accumulator; a
+    /// new Start always does). The epoch fence runs inside
+    /// `lock_volatile` first.
+    pub fn begin_cache_session(&self, worker_id: u32, session: &str, address: &WorkerAddress) {
+        let mut sessions = self.report_sessions.lock().unwrap();
+        let mut volatile = self.lock_volatile();
+        volatile.install_session(worker_id, session.to_string(), address.clone());
+        sessions.insert(
+            worker_id,
+            CacheReportSession {
+                session: session.to_string(),
+                total_len: 0,
+                entries: HashMap::new(),
+                invalid: false,
+                update_time_ms: LocalTime::mills(),
+            },
+        );
+    }
+
+    /// 4d (R8-4/R9-4): terminally invalidate the worker's cache
+    /// accumulator (an incremental F/W/Deleted landed for the worker).
+    /// Per `0b900a2f` the session is NOT removed: later full pages of
+    /// the same session stay cache-skipped; only a new Start reopens.
+    pub fn invalidate_report_session(&self, worker_id: u32) {
+        let mut sessions = self.report_sessions.lock().unwrap();
+        if let Some(sess) = sessions.get_mut(&worker_id) {
+            sess.invalid = true;
+            sess.entries.clear();
+            sess.update_time_ms = LocalTime::mills();
+        }
+    }
+
+    /// 4d (R7-5): feed one full-report page into the worker's cache
+    /// accumulator. See `CacheFullReportOutcome` for the result
+    /// semantics; the terminal rules live on `CacheReportSession`.
+    pub fn cache_full_report_page(
+        &self,
+        worker_id: u32,
+        session: &str,
+        total_len: u64,
+        blocks: &[BlockReportInfo],
+    ) -> CacheFullReportOutcome {
+        let now = LocalTime::mills();
+        let mut sessions = self.report_sessions.lock().unwrap();
+        let Some(sess) = sessions.get_mut(&worker_id) else {
+            return CacheFullReportOutcome::Skipped;
+        };
+        // Foreign session or already terminal: permanently skipped.
+        if sess.invalid || sess.session != session {
+            return CacheFullReportOutcome::Skipped;
+        }
+        sess.update_time_ms = now;
+        // First page binds the declared total; every later page must
+        // repeat it exactly, and it must sit under the configured cap.
+        if sess.total_len == 0 {
+            if total_len == 0 || total_len > self.report_total_cap {
+                sess.invalid = true;
+                return CacheFullReportOutcome::Skipped;
+            }
+            sess.total_len = total_len;
+        } else if sess.total_len != total_len {
+            sess.invalid = true;
+            sess.entries.clear();
+            return CacheFullReportOutcome::Skipped;
+        }
+        for block in blocks {
+            match sess.entries.get(&block.id) {
+                Some((status, len, storage))
+                    if *status == block.status
+                        && *len == block.block_size
+                        && *storage == block.storage_type =>
+                {
+                    // Idempotent duplicate: same id, same triple.
+                }
+                Some(_) => {
+                    // Conflicting duplicate: terminal.
+                    sess.invalid = true;
+                    sess.entries.clear();
+                    return CacheFullReportOutcome::Skipped;
+                }
+                None => {
+                    sess.entries.insert(
+                        block.id,
+                        (block.status, block.block_size, block.storage_type),
+                    );
+                }
+            }
+        }
+        // Overflow (more unique ids than declared) is terminal.
+        if sess.entries.len() as u64 > sess.total_len {
+            sess.invalid = true;
+            sess.entries.clear();
+            return CacheFullReportOutcome::Skipped;
+        }
+        if sess.entries.len() as u64 == sess.total_len {
+            let sess = sessions.remove(&worker_id).expect("entry checked out");
+            let entries = sess
+                .entries
+                .into_iter()
+                .map(|(id, (status, block_size, storage_type))| BlockReportInfo {
+                    id,
+                    status,
+                    storage_type,
+                    block_size,
+                })
+                .collect();
+            return CacheFullReportOutcome::Complete(entries);
+        }
+        CacheFullReportOutcome::Partial
     }
 
     /// Bounded outcome-window GC (4c.2): page the outcome rows with the
@@ -2672,8 +3090,8 @@ impl CacheService {
     /// load fenced mid-write) no item is created: the unreported
     /// physical blocks are the 4d full-report/orphan pass's problem.
     ///
-    /// Lock order (4c.3 invariant): volatile only, then the plans leaf
-    /// lock separately — never nested, and never an fs_dir guard here.
+    /// Lock order (4c.3/4d invariant): volatile only (plans included
+    /// since the 4d merge), and never an fs_dir guard here.
     fn retire_object_state(
         &self,
         incarnation: u64,
@@ -2681,7 +3099,7 @@ impl CacheService {
         geometry: Option<(i64, i64)>,
     ) -> CommonResult<()> {
         {
-            let mut volatile = self.state.lock().unwrap();
+            let mut volatile = self.lock_volatile();
             let recorded = volatile
                 .locations
                 .get(&object_id)
@@ -2706,11 +3124,11 @@ impl CacheService {
                 volatile.gc.order.retain(|id| *id != object_id);
                 volatile.locations.remove(&object_id);
             }
+            // Plans for the object are dropped under the same guard
+            // (4d R8-1 supplement): with plans merged into the volatile
+            // domain the retain is atomic with the retire above.
+            volatile.plans.retain(|_, plan| plan.object_id != object_id);
         }
-        self.plans
-            .lock()
-            .unwrap()
-            .retain(|_, plan| plan.object_id != object_id);
         Ok(())
     }
 
@@ -2801,6 +3219,84 @@ impl CacheService {
             sets.push(workers);
         }
         Ok(sets)
+    }
+
+    /// 4d R8-3 sentinel: a planned replica whose worker had no
+    /// registered session (a legacy worker that never sent a session
+    /// id) is recorded UNFENCED — the commit fence skips it. Real tags
+    /// start at 1, so 0 is unambiguous. Full legacy-worker tracking is
+    /// registered for 4e.
+    const UNFENCED_TAG: u64 = 0;
+
+    /// 4d R8-3: freeze the plan fences for the chosen worker sets —
+    /// the current journal epoch plus every chosen worker's CURRENT
+    /// session tag, captured atomically under the volatile guard.
+    fn capture_plan_fences(
+        &self,
+        sets: &[Vec<WorkerAddress>],
+    ) -> CommonResult<(u64, Vec<Vec<u64>>)> {
+        let volatile = self.lock_volatile();
+        let mut tags = Vec::with_capacity(sets.len());
+        for workers in sets {
+            let mut block_tags = Vec::with_capacity(workers.len());
+            for worker in workers {
+                let tag = volatile
+                    .worker_sessions
+                    .get(&worker.worker_id)
+                    .map_or(Self::UNFENCED_TAG, |session| session.tag);
+                block_tags.push(tag);
+            }
+            tags.push(block_tags);
+        }
+        Ok((volatile.epoch, tags))
+    }
+
+    /// 4d R8-3: do the plan fences still hold? The epoch must match the
+    /// volatile domain's bound epoch, and every planned replica's
+    /// (worker, tag) must still be the registry's current session.
+    /// Returns a descriptive error naming the first breach. Empty
+    /// `tags` (test-installed plan) and `UNFENCED_TAG` replicas are
+    /// skipped.
+    fn check_plan_fences(
+        volatile: &CacheVolatile,
+        plan_epoch: u64,
+        blocks: &[CacheBlockLocation],
+        tags: &[Vec<u64>],
+    ) -> CommonResult<()> {
+        if volatile.epoch != plan_epoch {
+            return err_box!(
+                "cache plan fence lost: plan epoch {} but volatile epoch {} (leadership changed)",
+                plan_epoch,
+                volatile.epoch
+            );
+        }
+        for (block, block_tags) in blocks.iter().zip(tags.iter()) {
+            for (worker, tag) in block.workers.iter().zip(block_tags.iter()) {
+                if *tag == Self::UNFENCED_TAG {
+                    continue;
+                }
+                let current = volatile.worker_sessions.get(&worker.worker_id);
+                if current.map(|s| s.tag) != Some(*tag) {
+                    return err_box!(
+                        "cache plan fence lost: worker {} session advanced past the planned tag {} (now {:?})",
+                        worker.worker_id,
+                        tag,
+                        current.map(|s| s.tag)
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 4d R8-3 pre-propose fence: validate the plan's epoch + replica
+    /// session tags against the live registry BEFORE anything is
+    /// proposed. A breach is retryable the same way a lost plan is:
+    /// replay the exact allocate (which re-plans against current
+    /// sessions) and re-commit.
+    fn validate_plan_fences(&self, plan: &LoadPlan) -> CommonResult<()> {
+        let volatile = self.lock_volatile();
+        Self::check_plan_fences(&volatile, plan.epoch, &plan.blocks, &plan.tags)
     }
 
     /// Ensure the leader-scoped segment cursor is usable and consume one
@@ -2972,7 +3468,7 @@ impl CacheService {
     /// allocate whose raft barrier is unavailable in unit tests).
     #[cfg(test)]
     fn install_plan(&self, token: OpToken, plan: LoadPlan) {
-        self.plans.lock().unwrap().insert(token, plan);
+        self.state.lock().unwrap().plans.insert(token, plan);
     }
 }
 
@@ -3270,7 +3766,7 @@ mod tests {
         monitor.journal_ctl.set_state(RoleState::Leader);
         // 4b gate 5: production defaults the capability OFF; tests enable
         // it explicitly (a dedicated test covers the disabled rejection).
-        CacheService::new(fs_dir, writer, monitor, chooser, enabled)
+        CacheService::new(fs_dir, writer, monitor, chooser, enabled, 1_000_000)
     }
 
     /// Grants `incarnation` an active incarnation row with a frozen TTL
@@ -3380,6 +3876,11 @@ mod tests {
             block_size: lay.block_size,
             replicas: 1,
             blocks: full_locations(lay),
+            // Unfenced test plan: epoch 0 matches the private test
+            // epoch; no per-replica tags means the R8-3 per-replica
+            // check is skipped (fence-specific tests build real tags).
+            epoch: 0,
+            tags: Vec::new(),
         }
     }
 
@@ -3599,7 +4100,12 @@ mod tests {
         // verbatim (no identity, no placement swap).
         let again = service.allocate(token(2, 1), 7, 1, "/k", 128, 64).unwrap();
         assert_eq!(again.blocks, result.blocks);
-        assert!(service.plans.lock().unwrap().contains_key(&token(2, 1)));
+        assert!(service
+            .state
+            .lock()
+            .unwrap()
+            .plans
+            .contains_key(&token(2, 1)));
 
         // Same token aimed at a different key or geometry: divergence.
         assert!(service
@@ -3827,7 +4333,12 @@ mod tests {
             .unwrap();
         assert_eq!(status, CacheOpStatus::AlreadyApplied);
         assert!(
-            !service.plans.lock().unwrap().contains_key(&token(2, 1)),
+            !service
+                .state
+                .lock()
+                .unwrap()
+                .plans
+                .contains_key(&token(2, 1)),
             "recorded-outcome AlreadyApplied must clear the load's plan"
         );
 
@@ -3850,7 +4361,12 @@ mod tests {
             }
         );
         assert!(
-            !service.plans.lock().unwrap().contains_key(&token(2, 1)),
+            !service
+                .state
+                .lock()
+                .unwrap()
+                .plans
+                .contains_key(&token(2, 1)),
             "fenced-row Superseded must clear the load's plan"
         );
 
@@ -3908,7 +4424,12 @@ mod tests {
             }
         );
         assert!(
-            !service.plans.lock().unwrap().contains_key(&token(2, 1)),
+            !service
+                .state
+                .lock()
+                .unwrap()
+                .plans
+                .contains_key(&token(2, 1)),
             "pre-read Superseded must clear the load's plan"
         );
     }
@@ -3948,7 +4469,12 @@ mod tests {
             let rocks = store.get_rocks_store();
             store.cache.apply_remove(rocks, 1, "/k", 1, 2, OBJ).unwrap();
         }
-        assert!(!service.plans.lock().unwrap().contains_key(&token(9, 1)));
+        assert!(!service
+            .state
+            .lock()
+            .unwrap()
+            .plans
+            .contains_key(&token(9, 1)));
 
         // First (lost-response replay) attempt: terminal Superseded, not a
         // retryable "no live plan" miss.
@@ -3978,7 +4504,12 @@ mod tests {
                 current: 2
             }
         );
-        assert!(!service.plans.lock().unwrap().contains_key(&token(9, 1)));
+        assert!(!service
+            .state
+            .lock()
+            .unwrap()
+            .plans
+            .contains_key(&token(9, 1)));
     }
 
     /// TTL stays fail-closed until mount-policy TTL lands (4b).
@@ -4265,7 +4796,12 @@ mod tests {
             "forged invalidate must not clear another object's locations"
         );
         assert!(
-            service.plans.lock().unwrap().contains_key(&token(6, 1)),
+            service
+                .state
+                .lock()
+                .unwrap()
+                .plans
+                .contains_key(&token(6, 1)),
             "forged invalidate must not clear another object's plan"
         );
 
@@ -5551,6 +6087,421 @@ mod tests {
         (from..=to).map(|i| lay.block_id(i).unwrap()).collect()
     }
 
+    fn report(id: i64, len: i64) -> BlockReportInfo {
+        BlockReportInfo::new(id, BlockReportStatus::Finalized, StorageType::Disk, len)
+    }
+
+    fn assert_complete_entries(entries: &[BlockReportInfo], expected: &[(i64, i64)]) {
+        let mut got: BTreeSet<(i64, i64)> = entries.iter().map(|b| (b.id, b.block_size)).collect();
+        let want: BTreeSet<(i64, i64)> = expected.iter().map(|(id, len)| (*id, *len)).collect();
+        assert_eq!(got, want);
+        for b in entries {
+            assert_eq!(b.status, BlockReportStatus::Finalized);
+        }
+        got.clear();
+    }
+
+    /// 4d R5/R7-2: the epoch fence cold-clears every volatile map on a
+    /// leadership mismatch, while `next_tag` (tag uniqueness) survives.
+    #[test]
+    fn test_4d_sync_epoch_cold_clear() {
+        let mut volatile = CacheVolatile::default();
+        // Seed state across every domain.
+        volatile.install_session(7, "s1".to_string(), worker(7));
+        volatile.locations.insert(42, ObjectLocations::default());
+        volatile.plans.insert(
+            token(2, 1),
+            LoadPlan {
+                object_id: 1,
+                generation: 1,
+                file_len: 1,
+                block_size: 1,
+                replicas: 1,
+                blocks: vec![],
+                epoch: 0,
+                tags: vec![],
+            },
+        );
+        volatile
+            .by_worker
+            .entry(7)
+            .or_default()
+            .live
+            .insert((42, 1));
+        volatile
+            .gc
+            .enqueue(CacheGcWork {
+                incarnation: 1,
+                object_id: 42,
+                len: 100,
+                block_size: 64,
+                next_seq: 1,
+            })
+            .unwrap();
+        let tag1 = volatile.worker_sessions.get(&7).unwrap().tag;
+        assert_eq!(tag1, 1, "first real tag is 1 (0 is the UNFENCED sentinel)");
+
+        // Same epoch: no clear.
+        assert!(!volatile.sync_epoch(0));
+        assert!(volatile.worker_sessions.contains_key(&7));
+
+        // Epoch change: everything cold-cleared, next_tag preserved.
+        assert!(volatile.sync_epoch(5));
+        assert!(volatile.worker_sessions.is_empty());
+        assert!(volatile.by_worker.is_empty());
+        assert!(volatile.locations.is_empty());
+        assert!(volatile.plans.is_empty());
+        assert!(volatile.reconcile_gens.is_empty());
+        assert!(volatile.gc.items.is_empty());
+        assert!(volatile.gc.order.is_empty());
+        assert_eq!(volatile.epoch, 5);
+        assert_eq!(volatile.next_tag, 1, "tag issuer never rewinds");
+
+        // A fresh session after the clear gets a NEW tag, never tag 1.
+        let tag2 = volatile.install_session(7, "s2".to_string(), worker(7));
+        assert_eq!(tag2, 2);
+
+        // Re-binding to the same epoch is idempotent.
+        assert!(!volatile.sync_epoch(5));
+    }
+
+    /// 4d R9-2/R9-3: install/retire are session-exact; tags are unique
+    /// per Start; retirement moves the live reverse set and bumps the
+    /// reconcile generation; a foreign session's retire is a no-op.
+    #[test]
+    fn test_4d_session_install_retire_exact() {
+        let mut volatile = CacheVolatile::default();
+        volatile.install_session(7, "s1".to_string(), worker(7));
+        volatile
+            .by_worker
+            .entry(7)
+            .or_default()
+            .live
+            .insert((100, 1));
+        assert_eq!(
+            volatile.reconcile_gens.get(&7).copied().unwrap_or(0),
+            1,
+            "install bumps the reconcile generation"
+        );
+
+        // A stale retire for a foreign session must not touch state:
+        // registry intact, live set unmoved, nothing retired.
+        assert!(!volatile.retire_session(7, "other-session"));
+        assert!(volatile.worker_sessions.contains_key(&7));
+        assert!(!volatile.by_worker.get(&7).unwrap().live.is_empty());
+        assert!(volatile.by_worker.get(&7).unwrap().retired.is_empty());
+
+        // Exact retire: registry row gone, live set moved to retired,
+        // generation bumped again.
+        assert!(volatile.retire_session(7, "s1"));
+        assert!(volatile.worker_sessions.is_empty());
+        let rev = volatile.by_worker.get(&7).unwrap();
+        assert!(rev.live.is_empty());
+        assert_eq!(rev.retired.len(), 1);
+        assert_eq!(rev.retired[0].tag, 1);
+        assert!(rev.retired[0].entries.contains(&(100, 1)));
+        assert_eq!(volatile.reconcile_gens.get(&7).copied().unwrap_or(0), 2);
+
+        // Retiring an already-retired session is a no-op (registry row
+        // is gone).
+        assert!(!volatile.retire_session(7, "s1"));
+
+        // The worker re-registers (new Start, tag 2), publishes again,
+        // and a THIRD Start (tag 3) supersedes: the second live set
+        // moves to retired as well — tags never repeat.
+        volatile.install_session(7, "s1-again".to_string(), worker(7));
+        volatile
+            .by_worker
+            .get_mut(&7)
+            .unwrap()
+            .live
+            .insert((200, 2));
+        let tag = volatile.install_session(7, "s2".to_string(), worker(7));
+        assert_eq!(tag, 3);
+        let rev = volatile.by_worker.get(&7).unwrap();
+        assert!(rev.live.is_empty());
+        assert_eq!(rev.retired.len(), 2, "second retire session recorded");
+        assert_eq!(rev.retired[1].tag, 2);
+        assert!(rev.retired[1].entries.contains(&(200, 2)));
+    }
+
+    /// 4d R7-5: strict single-key accumulator lifecycle — partial pages
+    /// accumulate, idempotent duplicates are free, completion hands out
+    /// the exact entry set exactly once.
+    #[test]
+    fn test_4d_accumulator_lifecycle_and_completion() {
+        let service = build_service("acc-lifecycle", chooser(vec![worker(1)]));
+        service.begin_cache_session(1, "s1", &worker(1));
+
+        // Foreign session pages are skipped entirely.
+        assert!(matches!(
+            service.cache_full_report_page(1, "not-mine", 3, &[report(1, 64)]),
+            CacheFullReportOutcome::Skipped
+        ));
+
+        // Page 1 of 3.
+        assert!(matches!(
+            service.cache_full_report_page(1, "s1", 3, &[report(1, 64)]),
+            CacheFullReportOutcome::Partial
+        ));
+        // Idempotent duplicate of the same (id, status, len, storage).
+        assert!(matches!(
+            service.cache_full_report_page(1, "s1", 3, &[report(1, 64)]),
+            CacheFullReportOutcome::Partial
+        ));
+        // Page 2 (with a benign re-send of page 1's block).
+        assert!(matches!(
+            service.cache_full_report_page(1, "s1", 3, &[report(1, 64), report(2, 64)]),
+            CacheFullReportOutcome::Partial
+        ));
+        // Completing page.
+        match service.cache_full_report_page(1, "s1", 3, &[report(3, 32)]) {
+            CacheFullReportOutcome::Complete(entries) => {
+                assert_complete_entries(&entries, &[(1, 64), (2, 64), (3, 32)]);
+            }
+            _ => panic!("expected Complete"),
+        }
+        // The accumulator is consumed: further pages of the same
+        // session are skipped (no second reconcile).
+        assert!(matches!(
+            service.cache_full_report_page(1, "s1", 3, &[report(1, 64)]),
+            CacheFullReportOutcome::Skipped
+        ));
+    }
+
+    /// 4d `0b900a2f` fixed-point: partial -> incremental Deleted ->
+    /// terminal invalidation; replaying ALL original pages still
+    /// reconciles NOTHING; only a new Start (new session) reopens the
+    /// accumulator and a fresh full report completes.
+    #[test]
+    fn test_4d_accumulator_terminal_invalidation_new_start_recovers() {
+        let service = build_service("acc-terminal", chooser(vec![worker(1)]));
+        service.begin_cache_session(1, "s1", &worker(1));
+
+        assert!(matches!(
+            service.cache_full_report_page(1, "s1", 2, &[report(1, 64)]),
+            CacheFullReportOutcome::Partial
+        ));
+        // An incremental F/W/Deleted lands for this worker.
+        service.invalidate_report_session(1);
+        // Replay ALL old pages (including a fresh full 2/2 set): every
+        // page is permanently cache-skipped for this session.
+        assert!(matches!(
+            service.cache_full_report_page(1, "s1", 2, &[report(1, 64)]),
+            CacheFullReportOutcome::Skipped
+        ));
+        assert!(matches!(
+            service.cache_full_report_page(1, "s1", 2, &[report(1, 64), report(2, 64)]),
+            CacheFullReportOutcome::Skipped
+        ));
+
+        // A new Start opens a fresh accumulator bound to the new
+        // session; the full report runs and completes normally.
+        service.begin_cache_session(1, "s2", &worker(1));
+        assert!(matches!(
+            service.cache_full_report_page(1, "s2", 2, &[report(1, 64)]),
+            CacheFullReportOutcome::Partial
+        ));
+        match service.cache_full_report_page(1, "s2", 2, &[report(2, 64)]) {
+            CacheFullReportOutcome::Complete(entries) => {
+                assert_complete_entries(&entries, &[(1, 64), (2, 64)]);
+            }
+            _ => panic!("expected Complete after new Start"),
+        }
+    }
+
+    /// 4d R7-5 terminal conflicts: total_len divergence, conflicting
+    /// duplicate, overflow past the declared total, and the configured
+    /// hard cap.
+    #[test]
+    fn test_4d_accumulator_conflicts_and_cap() {
+        // total_len divergence between pages of one session.
+        let service = build_service("acc-total-conflict", chooser(vec![worker(1)]));
+        service.begin_cache_session(1, "s1", &worker(1));
+        assert!(matches!(
+            service.cache_full_report_page(1, "s1", 3, &[report(1, 64)]),
+            CacheFullReportOutcome::Partial
+        ));
+        assert!(matches!(
+            service.cache_full_report_page(1, "s1", 2, &[report(2, 64)]),
+            CacheFullReportOutcome::Skipped
+        ));
+        // Terminal: even the original total cannot continue.
+        assert!(matches!(
+            service.cache_full_report_page(1, "s1", 3, &[report(2, 64)]),
+            CacheFullReportOutcome::Skipped
+        ));
+
+        // Conflicting duplicate (same id, different len).
+        let service = build_service("acc-dup-conflict", chooser(vec![worker(1)]));
+        service.begin_cache_session(1, "s1", &worker(1));
+        assert!(matches!(
+            service.cache_full_report_page(1, "s1", 2, &[report(1, 64)]),
+            CacheFullReportOutcome::Partial
+        ));
+        assert!(matches!(
+            service.cache_full_report_page(1, "s1", 2, &[report(1, 128)]),
+            CacheFullReportOutcome::Skipped
+        ));
+        assert!(matches!(
+            service.cache_full_report_page(1, "s1", 2, &[report(2, 64)]),
+            CacheFullReportOutcome::Skipped
+        ));
+
+        // Overflow: more unique ids than the declared total.
+        let service = build_service("acc-overflow", chooser(vec![worker(1)]));
+        service.begin_cache_session(1, "s1", &worker(1));
+        assert!(matches!(
+            service.cache_full_report_page(1, "s1", 1, &[report(1, 64), report(2, 64)]),
+            CacheFullReportOutcome::Skipped
+        ));
+
+        // Declared total above the configured hard cap (1_000_000 in
+        // the test builder): terminal immediately.
+        let service = build_service("acc-cap", chooser(vec![worker(1)]));
+        service.begin_cache_session(1, "s1", &worker(1));
+        assert!(matches!(
+            service.cache_full_report_page(1, "s1", 2_000_000, &[report(1, 64)]),
+            CacheFullReportOutcome::Skipped
+        ));
+        assert!(matches!(
+            service.cache_full_report_page(1, "s1", 2, &[report(1, 64)]),
+            CacheFullReportOutcome::Skipped
+        ));
+    }
+
+    /// 4d R8-3 pre-propose fence: a plan validates while its epoch and
+    /// every replica (worker, tag) still hold; a worker restart (new
+    /// tag) or a leadership change breaches it.
+    #[test]
+    fn test_4d_plan_fence_prepropose() {
+        let service = build_service("fence-prepropose", chooser(vec![worker(1), worker(2)]));
+        service.begin_cache_session(1, "w1-s1", &worker(1));
+        service.begin_cache_session(2, "w2-s1", &worker(2));
+        let lay = layout(OBJ, 130);
+        let mut plan = plan_for(&lay);
+        plan.epoch = service.monitor.journal_epoch();
+        {
+            let volatile = service.state.lock().unwrap();
+            let t1 = volatile.worker_sessions.get(&1).unwrap().tag;
+            let t2 = volatile.worker_sessions.get(&2).unwrap().tag;
+            plan.tags = plan.blocks.iter().map(|_| vec![t1, t2]).collect();
+        }
+        service.install_plan(token(2, 1), plan.clone());
+        assert!(service.validate_plan_fences(&plan).is_ok());
+
+        // Worker 2 restarts: new session, new tag — the old plan's
+        // fence for worker 2 no longer holds.
+        service.begin_cache_session(2, "w2-s2", &worker(2));
+        let err = service.validate_plan_fences(&plan).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("worker 2"), "{}", msg);
+
+        // Leadership change: the volatile epoch moves; the plan's epoch
+        // fence is breached (and the domain cold-cleared).
+        service.monitor.journal_epoch.advance();
+        let err = service.validate_plan_fences(&plan).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("epoch"), "{}", msg);
+    }
+
+    /// 4d R8-3 settle re-check: across the propose barrier the fences
+    /// are re-verified under the volatile guard. A breach yields a loud
+    /// terminal error with ZERO location publish and NO GC merge — even
+    /// against an exact-Valid row; the plan is spent (exact allocate
+    /// replay re-plans with fresh fences).
+    #[test]
+    fn test_4d_plan_fence_settle_lost() {
+        // (a) fences hold: exact-Valid row publishes normally.
+        let service = build_service("fence-settle-ok", chooser(vec![worker(1), worker(2)]));
+        mount_incarnation(&service, 1, 0);
+        committed_entry(&service, token(2, 1), token(2, 2), "/k", OBJ, 130, 0);
+        service.begin_cache_session(1, "w1-s1", &worker(1));
+        service.begin_cache_session(2, "w2-s1", &worker(2));
+        let (t1, t2) = {
+            let volatile = service.state.lock().unwrap();
+            (
+                volatile.worker_sessions.get(&1).unwrap().tag,
+                volatile.worker_sessions.get(&2).unwrap().tag,
+            )
+        };
+        let lay = layout(OBJ, 130);
+        let live_tags: Vec<Vec<u64>> = lay.block_ids().map(|_| vec![t1, t2]).collect();
+        assert_eq!(
+            service
+                .commit_barrier_settle(
+                    &token(2, 1),
+                    1,
+                    "/k",
+                    1,
+                    OBJ,
+                    130,
+                    777,
+                    0,
+                    64,
+                    service.monitor.journal_epoch(),
+                    live_tags.clone(),
+                    full_locations(&lay),
+                )
+                .unwrap(),
+            CacheOpStatus::Applied
+        );
+        assert!(service.location_retained(OBJ));
+        assert!(!service.gc_has_work(OBJ));
+
+        // (b) worker 2 restarted mid-propose (its session tag advanced):
+        // settle must fail loud, publish nothing, merge nothing, and
+        // spend the plan.
+        let service = build_service("fence-settle-lost", chooser(vec![worker(1), worker(2)]));
+        mount_incarnation(&service, 1, 0);
+        committed_entry(&service, token(2, 1), token(2, 2), "/k", OBJ, 130, 0);
+        service.begin_cache_session(1, "w1-s1", &worker(1));
+        service.begin_cache_session(2, "w2-s1", &worker(2));
+        service.install_plan(token(2, 1), plan_for(&lay));
+        let (t1, t2) = {
+            let volatile = service.state.lock().unwrap();
+            (
+                volatile.worker_sessions.get(&1).unwrap().tag,
+                volatile.worker_sessions.get(&2).unwrap().tag,
+            )
+        };
+        let stale_tags: Vec<Vec<u64>> = lay.block_ids().map(|_| vec![t1, t2]).collect();
+        // The restart lands between propose and settle.
+        service.begin_cache_session(2, "w2-s2", &worker(2));
+        let err = service
+            .commit_barrier_settle(
+                &token(2, 1),
+                1,
+                "/k",
+                1,
+                OBJ,
+                130,
+                777,
+                0,
+                64,
+                service.monitor.journal_epoch(),
+                stale_tags,
+                full_locations(&lay),
+            )
+            .unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("fence"), "{}", msg);
+        assert!(
+            !service.location_retained(OBJ),
+            "zero old-location publish on fence breach"
+        );
+        assert!(!service.gc_has_work(OBJ), "no GC merge on fence breach");
+        assert!(
+            !service
+                .state
+                .lock()
+                .unwrap()
+                .plans
+                .contains_key(&token(2, 1)),
+            "the plan is spent (terminal for this commit)"
+        );
+    }
+
     /// Review `4b2e2a72` P0-2 + `6bc4f569` gate 4: the commit settlement.
     /// A load invalidated between propose and readback resolves terminal
     /// Superseded, its validated block evidence goes to GC (never a late
@@ -5581,6 +6532,8 @@ mod tests {
                     777,
                     0,
                     64,
+                    0,
+                    Vec::new(),
                     full_locations(&lay),
                 )
                 .unwrap(),
@@ -5589,7 +6542,12 @@ mod tests {
                 current: 2
             }
         );
-        assert!(!service.plans.lock().unwrap().contains_key(&token(2, 1)));
+        assert!(!service
+            .state
+            .lock()
+            .unwrap()
+            .plans
+            .contains_key(&token(2, 1)));
         assert!(service.gc_has_work(OBJ));
         assert!(service.location_retained(OBJ));
 
@@ -5642,6 +6600,8 @@ mod tests {
                     777,
                     0,
                     64,
+                    0,
+                    Vec::new(),
                     full_locations(&lay),
                 )
                 .unwrap(),
@@ -5698,6 +6658,8 @@ mod tests {
                 777,
                 0,
                 64,
+                0,
+                Vec::new(),
                 full_locations(&lay),
             )
             .unwrap_err();
@@ -5730,6 +6692,8 @@ mod tests {
                     777,
                     0,
                     64,
+                    0,
+                    Vec::new(),
                     full_locations(&lay),
                 )
                 .unwrap(),
@@ -5752,6 +6716,8 @@ mod tests {
                 777,
                 0,
                 64,
+                0,
+                Vec::new(),
                 full_locations(&layout(OBJ, 131)),
             )
             .unwrap_err();
@@ -5797,6 +6763,8 @@ mod tests {
                 777,
                 0,
                 64,
+                0,
+                Vec::new(),
                 full_locations(&lay),
             )
             .unwrap_err();
@@ -5807,7 +6775,12 @@ mod tests {
             msg
         );
         assert!(
-            service.plans.lock().unwrap().contains_key(&token(9, 1)),
+            service
+                .state
+                .lock()
+                .unwrap()
+                .plans
+                .contains_key(&token(9, 1)),
             "plan retained for the exact retry"
         );
         assert!(!service.gc_has_work(OBJ), "no GC for a live Reserved load");

@@ -512,6 +512,10 @@ impl ProtoUtils {
             full_report: list.full_report,
             total_len: list.total_len,
             blocks: vec![],
+            worker_session_id: match list.worker_session_id {
+                Some(s) if !s.is_empty() => Some(s),
+                _ => None,
+            },
         };
         for block in list.blocks {
             let dst_blocks = BlockReportInfo {

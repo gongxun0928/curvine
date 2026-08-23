@@ -378,6 +378,7 @@ fn block_report_for_non_file_inode_schedules_worker_delete() -> CommonResult<()>
             cluster_id: "curvine".into(),
             worker_id: 0,
             full_report: false,
+            worker_session_id: None,
             total_len: 1,
             blocks: vec![BlockReportInfo::new(
                 block_id,
@@ -406,6 +407,7 @@ fn block_report_for_writing_non_file_inode_defers_worker_delete() -> CommonResul
             cluster_id: "curvine".into(),
             worker_id: 0,
             full_report: false,
+            worker_session_id: None,
             total_len: 1,
             blocks: vec![BlockReportInfo::new(
                 block_id,
@@ -434,6 +436,7 @@ fn block_report_for_writing_missing_inode_defers_worker_delete() -> CommonResult
             cluster_id: "curvine".into(),
             worker_id: 0,
             full_report: false,
+            worker_session_id: None,
             total_len: 1,
             blocks: vec![BlockReportInfo::new(
                 block_id,
@@ -462,6 +465,7 @@ fn full_block_report_for_writing_missing_inode_schedules_worker_delete() -> Comm
             cluster_id: "curvine".into(),
             worker_id: 0,
             full_report: true,
+            worker_session_id: None,
             total_len: 1,
             blocks: vec![BlockReportInfo::new(
                 block_id,
@@ -506,6 +510,7 @@ fn full_block_report_reconcile_removes_stale_location_async() -> CommonResult<()
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: false,
+            worker_session_id: None,
             total_len: 0,
             blocks: vec![
                 BlockReportInfo::new(
@@ -534,6 +539,7 @@ fn full_block_report_reconcile_removes_stale_location_async() -> CommonResult<()
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: true,
+            worker_session_id: None,
             total_len: 1,
             blocks: vec![BlockReportInfo::new(
                 first.block.id,
@@ -773,6 +779,7 @@ fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResu
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: false,
+            worker_session_id: None,
             total_len: 0,
             blocks: vec![
                 BlockReportInfo::new(
@@ -803,6 +810,7 @@ fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResu
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: true,
+            worker_session_id: None,
             total_len: 2,
             blocks: vec![BlockReportInfo::new(
                 first.block.id,
@@ -819,6 +827,7 @@ fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResu
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: false,
+            worker_session_id: None,
             total_len: 0,
             blocks: vec![BlockReportInfo::new(
                 second.block.id,
@@ -835,6 +844,7 @@ fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResu
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: true,
+            worker_session_id: None,
             total_len: 2,
             blocks: vec![BlockReportInfo::new(
                 third.block.id,
@@ -2541,6 +2551,7 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
                 cluster_id: "curvine".into(),
                 worker_id: block.locs[0].worker_id,
                 full_report: true,
+                worker_session_id: None,
                 total_len: 1,
                 blocks: vec![BlockReportInfo::new(
                     block.block.id,
@@ -2574,6 +2585,7 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
                 cluster_id: "curvine".into(),
                 worker_id: block.locs[0].worker_id,
                 full_report: true,
+                worker_session_id: None,
                 total_len: 1,
                 blocks: vec![BlockReportInfo::new(
                     block.block.id,
@@ -2607,6 +2619,7 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
                 cluster_id: "curvine".into(),
                 worker_id: block.locs[0].worker_id,
                 full_report: true,
+                worker_session_id: None,
                 total_len: 1,
                 blocks: vec![BlockReportInfo::new(
                     block.block.id,
@@ -2651,6 +2664,7 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
                 cluster_id: "curvine".into(),
                 worker_id: 100,
                 full_report: true,
+                worker_session_id: None,
                 total_len: 1,
                 blocks: vec![BlockReportInfo::new(
                     block.block.id,
@@ -2668,6 +2682,7 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
                 cluster_id: "curvine".into(),
                 worker_id: 200,
                 full_report: false,
+                worker_session_id: None,
                 total_len: 0,
                 blocks: vec![BlockReportInfo::new(
                     block.block.id,

@@ -2237,6 +2237,53 @@ mod tests {
             assert_eq!(rocks.cache_client_watermark(0).unwrap(), Some(3));
         }
 
+        // 4b. 4d R5: the epoch advance cold-cleared the volatile plans
+        // together with the rest of the cache domain — the pending
+        // commit for load (9, 1) now fails closed as a retryable
+        // "no live plan" miss, and the exact allocate replay re-plans
+        // the same committed identity under the new epoch.
+        let miss = cache
+            .commit(CacheCommitParams {
+                token: OpToken {
+                    client_id: 9,
+                    op_seq: 5,
+                },
+                load_token: OpToken {
+                    client_id: 9,
+                    op_seq: 1,
+                },
+                rpc_id: 12,
+                incarnation: 1,
+                key: "/a",
+                generation: 1,
+                object_id: min + SEG,
+                len: 128,
+                ufs_mtime: 777,
+                ttl_ms: 0,
+                blocks: a_retry.blocks.clone(),
+            })
+            .unwrap_err();
+        assert!(
+            format!("{}", miss).contains("no live plan"),
+            "post-epoch commit is a retryable plan miss, got: {}",
+            miss
+        );
+        let a_post = cache
+            .allocate(
+                OpToken {
+                    client_id: 9,
+                    op_seq: 1,
+                },
+                11,
+                1,
+                "/a",
+                128,
+                64,
+            )
+            .unwrap();
+        assert_eq!(a_post.object_id, min + SEG);
+        assert_eq!(a_post.blocks.len(), 2, "re-plan after the cold clear");
+
         // 5. Commit-vs-Invalidate interleave: the seam injects a FULL
         //    invalidate (its own raft barrier) between the commit propose
         //    barrier's return and the commit's terminal readback. The
@@ -2267,7 +2314,7 @@ mod tests {
                 len: 128,
                 ufs_mtime: 777,
                 ttl_ms: 0,
-                blocks: a_retry.blocks.clone(),
+                blocks: a_post.blocks.clone(),
             })
             .unwrap();
         assert_eq!(
@@ -2301,7 +2348,7 @@ mod tests {
                 len: 128,
                 ufs_mtime: 777,
                 ttl_ms: 0,
-                blocks: a_retry.blocks.clone(),
+                blocks: a_post.blocks.clone(),
             })
             .unwrap();
         assert_eq!(

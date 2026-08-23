@@ -75,6 +75,12 @@ pub struct MasterFilesystem {
     full_block_reports: Arc<Mutex<HashMap<u32, FullBlockReportState>>>,
     full_block_reconciles: Arc<Mutex<HashMap<u32, FullBlockReconcileState>>>,
     full_block_reconcile_executor: Arc<GroupExecutor>,
+    /// 4d (R8-1): serializes a Start heartbeat's whole critical
+    /// section — WorkerManager validation/clear, accumulator reset,
+    /// volatile session install — so dual or reordered Starts cannot
+    /// interleave their state transitions. Declared lock order:
+    /// `start_gate → WM write → accumulator control → CacheVolatile`.
+    pub(crate) start_gate: Arc<Mutex<()>>,
 }
 
 pub struct BlockReportResult {
@@ -211,12 +217,14 @@ impl MasterFilesystem {
                 master_monitor.clone(),
                 chooser,
                 conf.master.cache_metadata_enabled,
+                conf.master.cache_report_total_cap,
             )),
             fs_dir,
             worker_manager,
             master_monitor,
             conf: Arc::new(conf.master.clone()),
             full_block_reports: Default::default(),
+            start_gate: Default::default(),
             full_block_reconciles: Default::default(),
             full_block_reconcile_executor: Arc::new(GroupExecutor::new(
                 "master-full-block-reconcile",
@@ -238,12 +246,14 @@ impl MasterFilesystem {
                 js.master_monitor(),
                 chooser,
                 conf.master.cache_metadata_enabled,
+                conf.master.cache_report_total_cap,
             )),
             fs_dir,
             worker_manager,
             master_monitor: js.master_monitor(),
             conf: Arc::new(conf.master.clone()),
             full_block_reports: Default::default(),
+            start_gate: Default::default(),
             full_block_reconciles: Default::default(),
             full_block_reconcile_executor: Arc::new(GroupExecutor::new(
                 "master-full-block-reconcile",
@@ -1312,6 +1322,38 @@ impl MasterFilesystem {
     pub fn reset_full_block_report(&self, worker_id: u32) {
         self.full_block_reports.lock().remove(&worker_id);
         self.invalidate_full_block_reconcile(worker_id);
+    }
+
+    /// 4d (R8-1/R9-3): a Start heartbeat's cache-domain acceptance.
+    /// Called from the heartbeat handler with the start_gate held, only
+    /// AFTER the WorkerManager validated the registration (R7-1 order
+    /// fix: no accumulator or session state moves on a rejected Start).
+    /// Declared order inside the critical section: accumulator control
+    /// first, then the volatile guard. Legacy workers (empty session
+    /// id) skip the session registry entirely — their reports keep the
+    /// FS-only path untouched.
+    pub fn begin_worker_session(&self, address: &WorkerAddress, session: &str) {
+        // Accumulator domain first (FS full-report accumulation + any
+        // running reconcile for this worker).
+        self.reset_full_block_report(address.worker_id);
+        if session.is_empty() {
+            return;
+        }
+        // 4d R9-3: atomic cache-session install — accumulator guard and
+        // volatile guard held simultaneously (accumulator first): fresh
+        // registry row + fresh accumulator bound to the new session.
+        self.cache_service
+            .begin_cache_session(address.worker_id, session, address);
+    }
+
+    /// 4d (R9-2): an End heartbeat's cache-domain retirement —
+    /// session-exact against the volatile registry; a no-op when a
+    /// newer Start already replaced the session.
+    pub fn end_worker_session(&self, worker_id: u32, session: &str) {
+        if session.is_empty() {
+            return;
+        }
+        self.cache_service.retire_worker_session(worker_id, session);
     }
 
     fn invalidate_full_block_report_session(&self, worker_id: u32) {
