@@ -198,6 +198,16 @@ impl CacheLoadTaskRunner {
         //   the commit-side path alone.
         let client = self.fs.fs_client();
 
+        // gpt56 `e9c554b2`: ONE absolute, saturating deadline computed
+        // BEFORE the first Allocate and shared by every phase — each block
+        // write, every replan round, and every commit retry checks this
+        // same instant; no phase ever resets it. This makes the master's
+        // Reserved lease (task_timeout + fixed grace, `reserved_lease_ms`)
+        // provably cover the whole live task: the runner can never
+        // legally run past this deadline, so a live row can never be past
+        // its lease while its runner still commits.
+        let deadline_ms = LocalTime::mills().saturating_add(self.task_timeout_ms);
+
         let allocate = {
             let client = client.clone();
             let spec = spec.clone();
@@ -224,7 +234,10 @@ impl CacheLoadTaskRunner {
             // async block only moves Copy references.
             let ufs = &ufs;
             let source_path = &source_path;
-            async move { self.write_round(ufs, source_path, file_len, &alloc).await }
+            async move {
+                self.write_round(ufs, source_path, file_len, &alloc, deadline_ms)
+                    .await
+            }
         };
         let commit = {
             let client = client.clone();
@@ -258,7 +271,7 @@ impl CacheLoadTaskRunner {
         let commit_issued = AtomicBool::new(false);
         let (commit, evidence) = match drive_cache_load(
             || self.task.is_cancel(),
-            self.task_timeout_ms,
+            deadline_ms,
             COMMIT_RETRY_BACKOFF_MS,
             &commit_issued,
             allocate,
@@ -337,6 +350,7 @@ impl CacheLoadTaskRunner {
         source_path: &Path,
         file_len: i64,
         alloc: &curvine_proto::CacheAllocateResponse,
+        deadline_ms: u64,
     ) -> FsResult<CommitEvidence> {
         // Plan shape must match the observed file length — both for the
         // initial plan and for every replan round (hard gate 1 shape).
@@ -368,7 +382,7 @@ impl CacheLoadTaskRunner {
             let mut written: i64 = 0;
             for block in &alloc.blocks {
                 let (loaded, completed) = self
-                    .write_planned_block(&mut reader, block, written, file_len)
+                    .write_planned_block(&mut reader, block, written, file_len, deadline_ms)
                     .await?;
                 written = loaded;
                 committed_blocks.push(completed);
@@ -397,6 +411,7 @@ impl CacheLoadTaskRunner {
         block: &curvine_proto::CacheBlockLocationProto,
         loaded_before: i64,
         file_len: i64,
+        deadline_ms: u64,
     ) -> FsResult<(i64, curvine_proto::CacheBlockLocationProto)> {
         let block_len = block.block_len;
         if block_len <= 0 {
@@ -428,17 +443,20 @@ impl CacheLoadTaskRunner {
         let mut writer = BlockWriter::new(self.fs.fs_context(), locate, 0, block_len).await?;
         let mut written_block: i64 = 0;
         let mut last_progress_time = LocalTime::mills();
-        let start_ms = LocalTime::mills();
 
         let outcome = loop {
             if self.task.is_cancel() {
                 break Err(curvine_error::FsError::common("cache load task canceled"));
             }
-            if LocalTime::mills() - start_ms > self.task_timeout_ms {
+            // gpt56 `e9c554b2`: the whole-task absolute deadline — shared
+            // with every other phase and never reset per block — so N slow
+            // blocks consume ONE budget, not N.
+            if deadline_exceeded(deadline_ms) {
                 break err_box!(
-                    "Task {} exceed timeout {} ms",
+                    "Task {} exceeded global deadline {} ms in cache block {}",
                     self.task.info.task_id,
-                    self.task_timeout_ms
+                    deadline_ms,
+                    block.block_id
                 );
             }
             // Block full: complete before the loop would issue an
@@ -613,13 +631,14 @@ struct CommitEvidence {
 /// session/epoch change), so the loop replays the EXACT allocate — the
 /// FSM replays the same identity and installs a fresh plan — rewrites
 /// every block per the NEW placements, rebuilds the evidence, and
-/// re-commits, bounded by the task timeout budget. Any other commit
+/// re-commits, bounded by the whole-task absolute deadline shared with
+/// the write phases (gpt56 `e9c554b2`). Any other commit
 /// outcome is terminal (Applied/AlreadyApplied/Superseded) or fails
 /// closed (missing/unknown discriminator). Cancellation is loud at every
 /// state boundary.
 async fn drive_cache_load<C, A, AFut, W, WFut, K, KFut>(
     mut is_cancel: C,
-    timeout_ms: u64,
+    deadline_ms: u64,
     backoff_ms: u64,
     commit_issued: &AtomicBool,
     mut allocate: A,
@@ -635,11 +654,20 @@ where
     K: FnMut(CommitEvidence) -> KFut,
     KFut: std::future::Future<Output = FsResult<curvine_proto::CacheCommitResponse>>,
 {
-    let start = LocalTime::mills();
     let mut evidence = write_round(allocate().await?).await?;
     loop {
         if is_cancel() {
             return err_box!("cache load aborted by task cancellation before commit");
+        }
+        // gpt56 `e9c554b2`: the whole-task absolute deadline, checked
+        // BEFORE `commit_issued` is set — a task past its global budget
+        // never sends a Commit, and the ambiguity flag stays in the
+        // state that lets the failure path take the SAFE abort.
+        if deadline_exceeded(deadline_ms) {
+            return err_box!(
+                "cache load global deadline {} ms exceeded before commit",
+                deadline_ms
+            );
         }
         let commit_resp = {
             // Mark BEFORE the first send and never reset (gpt56
@@ -648,7 +676,7 @@ where
             // could tombstone a row the commit just published over.
             commit_issued.store(true, Ordering::Release);
             let evidence = evidence.clone();
-            commit_with_retry(&mut is_cancel, timeout_ms, backoff_ms, || {
+            commit_with_retry(&mut is_cancel, deadline_ms, backoff_ms, || {
                 commit(evidence.clone())
             })
             .await?
@@ -660,19 +688,21 @@ where
             Some(CacheOpStatusProto::ReplanNeeded) => {
                 // The commit did NOT apply and this round's writes only
                 // count as orphans: re-plan, rewrite, rebuild evidence.
-                if LocalTime::mills() - start > timeout_ms {
-                    return err_box!(
-                        "cache load replan budget exhausted (task timeout {} ms) after REPLAN_NEEDED",
-                        timeout_ms
-                    );
-                }
+                //
                 // Typed REPLAN_NEEDED definitively resolves the commit
                 // ambiguity (the master asserted the commit did NOT
                 // apply), so the failure path may abort again if the
                 // NEXT round fails before issuing another commit (gpt56
                 // `cfa2f0d7` blocker 1). Transport errors never clear
-                // the flag — only this typed outcome does.
+                // the flag — only this typed outcome does. Clear FIRST so
+                // a deadline exhaustion here also takes the safe abort.
                 commit_issued.store(false, Ordering::Release);
+                if deadline_exceeded(deadline_ms) {
+                    return err_box!(
+                        "cache load replan budget exhausted (global deadline {} ms) after REPLAN_NEEDED",
+                        deadline_ms
+                    );
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 evidence = write_round(allocate().await?).await?;
             }
@@ -770,7 +800,7 @@ fn completed_location(
 /// from its durable outcome — never a second execution.
 async fn commit_with_retry<C, F, Fut>(
     mut is_cancel: C,
-    timeout_ms: u64,
+    deadline_ms: u64,
     backoff_ms: u64,
     mut attempt: F,
 ) -> FsResult<curvine_proto::CacheCommitResponse>
@@ -779,7 +809,9 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = FsResult<curvine_proto::CacheCommitResponse>>,
 {
-    let start = LocalTime::mills();
+    // gpt56 `e9c554b2`: the deadline is the task's WHOLE-budget absolute
+    // instant (shared with the write/replan phases), not a fresh
+    // per-commit budget.
     loop {
         match attempt().await {
             Ok(resp) => return Ok(resp),
@@ -790,13 +822,21 @@ where
                         e
                     );
                 }
-                if LocalTime::mills() - start > timeout_ms {
+                if deadline_exceeded(deadline_ms) {
                     return Err(e);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
             }
         }
     }
+}
+
+/// Whole-task deadline predicate (gpt56 `e9c554b2`): every phase — each
+/// block write, every replan round, every commit retry — checks the SAME
+/// absolute instant, computed once before the first Allocate, against the
+/// current clock. No phase computes its own budget.
+fn deadline_exceeded(deadline_ms: u64) -> bool {
+    LocalTime::mills() > deadline_ms
 }
 
 /// Fail-closed decode of the commit op status. The repo's prost codegen
@@ -841,12 +881,13 @@ fn cache_op_status(v: Option<i32>) -> Option<CacheOpStatusProto> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_op_status, commit_with_retry, completed_location};
+    use super::{cache_op_status, commit_with_retry, completed_location, deadline_exceeded};
     use curvine_error::FsError;
     use curvine_model::{BlockLocation, CommitBlock, StorageType};
     use curvine_proto::{
         CacheBlockLocationProto, CacheCommitResponse, CacheOpStatusProto, WorkerAddressProto,
     };
+    use curvine_runtime::common::LocalTime;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     fn worker(id: u32) -> WorkerAddressProto {
@@ -937,7 +978,7 @@ mod tests {
         let attempts = AtomicU32::new(0);
         let resp = commit_with_retry(
             || false,
-            10_000,
+            LocalTime::mills() + 10_000,
             1,
             || {
                 let n = attempts.fetch_add(1, Ordering::SeqCst);
@@ -961,7 +1002,7 @@ mod tests {
         let attempts = AtomicU32::new(0);
         let err = commit_with_retry(
             || false,
-            20,
+            LocalTime::mills() + 20,
             5,
             || {
                 attempts.fetch_add(1, Ordering::SeqCst);
@@ -986,7 +1027,7 @@ mod tests {
         let attempts = AtomicU32::new(0);
         let err = commit_with_retry(
             || true,
-            10_000,
+            LocalTime::mills() + 10_000,
             1,
             || {
                 attempts.fetch_add(1, Ordering::SeqCst);
@@ -1042,7 +1083,7 @@ mod tests {
         let commit_issued = AtomicBool::new(false);
         let (resp, evidence) = drive_cache_load(
             || false,
-            10_000,
+            LocalTime::mills() + 10_000,
             1,
             &commit_issued,
             || {
@@ -1103,7 +1144,7 @@ mod tests {
         let commit_issued = AtomicBool::new(false);
         let (resp, _evidence) = drive_cache_load(
             || false,
-            10_000,
+            LocalTime::mills() + 10_000,
             1,
             &commit_issued,
             || {
@@ -1155,7 +1196,7 @@ mod tests {
         let commit_issued = AtomicBool::new(false);
         let err = drive_cache_load(
             || false,
-            30,
+            LocalTime::mills() + 30,
             1,
             &commit_issued,
             || {
@@ -1173,10 +1214,112 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.to_string().contains("replan budget"), "err: {}", err);
+        // Either deadline surface fires loud: the loop-top pre-commit
+        // check ("global deadline ... before commit") or the post-REPLAN
+        // branch ("replan budget exhausted ... global deadline").
+        let msg = err.to_string();
+        assert!(
+            msg.contains("replan budget") || msg.contains("global deadline"),
+            "err: {}",
+            msg
+        );
         assert!(
             allocs.load(Ordering::SeqCst) >= 2,
             "at least one full replan round before the budget error"
+        );
+        assert!(
+            !commit_issued.load(Ordering::Acquire),
+            "REPLAN_NEEDED resolved the ambiguity: the exhausted budget takes the safe abort"
+        );
+    }
+
+    // gpt56 `e9c554b2` whole-task absolute deadline seams: a task past its
+    // global deadline must NEVER send a Commit, and the failure must leave
+    // the ambiguity flag in the state that allows the SAFE abort. The
+    // deadline is one absolute instant shared by every phase (block
+    // writes, replan rounds, commit retries) — no per-phase budget.
+
+    #[test]
+    fn deadline_predicate_compares_absolute_instant() {
+        assert!(deadline_exceeded(LocalTime::mills().saturating_sub(1)));
+        assert!(!deadline_exceeded(LocalTime::mills() + 60_000));
+    }
+
+    #[tokio::test]
+    async fn drive_global_deadline_blocks_commit_after_slow_first_round() {
+        let commits = AtomicU32::new(0);
+        let commit_issued = AtomicBool::new(false);
+        let err = drive_cache_load(
+            || false,
+            LocalTime::mills() + 20,
+            1,
+            &commit_issued,
+            || async {
+                Ok(CacheAllocateResponse {
+                    object_id: 5,
+                    generation: 1,
+                    blocks: Vec::new(),
+                })
+            },
+            |_alloc| async move {
+                // The first write round alone outlives the whole task —
+                // N slow blocks consume ONE budget, not N.
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                Ok(round_evidence(1))
+            },
+            |_ev| {
+                commits.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(resp_with_status(1)) }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("global deadline"), "err: {}", err);
+        assert_eq!(
+            commits.load(Ordering::SeqCst),
+            0,
+            "no commit may be sent past the global deadline"
+        );
+        assert!(
+            !commit_issued.load(Ordering::Acquire),
+            "flag never set: the safe abort remains allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn drive_global_deadline_blocks_second_commit_after_replan() {
+        let commits = AtomicU32::new(0);
+        let commit_issued = AtomicBool::new(false);
+        let err = drive_cache_load(
+            || false,
+            LocalTime::mills() + 40,
+            // The replan backoff alone carries the task past its deadline.
+            45,
+            &commit_issued,
+            || async {
+                Ok(CacheAllocateResponse {
+                    object_id: 5,
+                    generation: 1,
+                    blocks: Vec::new(),
+                })
+            },
+            |_alloc| async move { Ok(round_evidence(1)) },
+            |_ev| {
+                let n = 1 + commits.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(resp_with_status(if n == 1 { 4 } else { 1 })) }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("global deadline"), "err: {}", err);
+        assert_eq!(
+            commits.load(Ordering::SeqCst),
+            1,
+            "round 1 committed; the expired round 2 must not"
+        );
+        assert!(
+            !commit_issued.load(Ordering::Acquire),
+            "REPLAN_NEEDED resolved round 1's ambiguity before the deadline error: safe abort allowed"
         );
     }
 
@@ -1191,7 +1334,7 @@ mod tests {
         let flag_at_entry = std::sync::Mutex::new(Vec::new());
         let err = drive_cache_load(
             || false,
-            20,
+            LocalTime::mills() + 20,
             1,
             &commit_issued,
             || async {
@@ -1242,7 +1385,7 @@ mod tests {
         let commit_issued = AtomicBool::new(false);
         let err = drive_cache_load(
             || false,
-            10_000,
+            LocalTime::mills() + 10_000,
             1,
             &commit_issued,
             || async {
@@ -1298,7 +1441,7 @@ mod tests {
         let rounds = AtomicU32::new(0);
         let err = drive_cache_load(
             || false,
-            10_000,
+            LocalTime::mills() + 10_000,
             1,
             &commit_issued,
             || async {
