@@ -1452,6 +1452,20 @@ static HEARTBEAT_TRANSITION_SEAM: std::sync::Mutex<Option<Box<dyn Fn() + Send + 
 pub(crate) static INCR_OUTCOME_SEAM: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
     std::sync::Mutex::new(None);
 
+/// #[cfg(test)] seam storage for the 4d.3 RC1 P0-1 checkout-window proof
+/// (gpt56 `d2546338` item 1): the hook set here (if any) is fired by
+/// `MasterFilesystem::block_report` exactly between the end-of-report
+/// snapshot checkout (self-Complete stash read-back or mixed
+/// `take_cache_full_snapshot` — the row is now Reconciling with a fresh
+/// attempt) and the reconcile/apply/release sequence. A hook can run an
+/// incremental report or an End/lost retire and WIN the row
+/// (terminalize it) inside the window; the finish CAS must then leave
+/// the row terminal and the reconcile must no-op. Never set in
+/// production; compiled out entirely outside cfg(test).
+#[cfg(test)]
+pub(crate) static FULL_TRIGGER_SEAM: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
+    std::sync::Mutex::new(None);
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1106,7 +1106,30 @@ struct CacheReportSession {
     /// Terminal invalidation flag (sources: F/W/Deleted incremental,
     /// total_len conflict, duplicate conflict, overflow).
     invalid: bool,
+    /// RC1 P0-1 (gpt56 `d2546338` item 1): the row is NEVER removed at
+    /// checkout. `Accumulating` accepts pages; a checkout (self-
+    /// Complete or the 4d.3 end-of-report take) transitions the ROW to
+    /// `Reconciling` under `attempt` while the entries are handed out —
+    /// so an incremental / exact End / lost landing mid-flight still
+    /// finds the row and TERMINALIZES it instead of finding nothing and
+    /// letting a blind reopen resurrect the session.
+    /// `release_full_accumulator` is the only way back to `Accumulating`
+    /// (exact session+attempt CAS; a terminalized row stays terminal).
+    phase: ReportPhase,
+    /// Monotonic checkout ticket, bumped on every Accumulating →
+    /// Reconciling transition; the release CAS is exact on it.
+    attempt: u64,
     update_time_ms: u64,
+}
+
+/// RC1 P0-1: lifecycle phase of one `CacheReportSession` row. The row
+/// lives until a new Start replaces it — checkout hands the entry set
+/// out but keeps the row (as `Reconciling`) so terminalization can
+/// always reach it.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ReportPhase {
+    Accumulating,
+    Reconciling,
 }
 
 /// 4d.2: WorkerManager effects of one routed incremental report —
@@ -1118,9 +1141,20 @@ struct CacheReportSession {
 /// (`start_gate → WM → volatile`) so a Start/lost swap between the
 /// decision and the WM side effect makes the whole outcome a loud
 /// no-op instead of acting on the new session. 0 = no-op outcome.
+/// RC1 P0-2 (gpt56 `d2546338` item 2): the outcome also carries the
+/// APPLIED reconcile generation — the fenced apply rechecks tag AND
+/// generation and holds the volatile guard across the WM side effects,
+/// so a same-session report that bumped the generation in between
+/// makes this outcome a drop (its effects can never be re-ordered
+/// after the newer report's). 0 = no-op outcome.
 #[derive(Debug, Default)]
 pub struct CacheIncrOutcome {
     pub session_tag: u64,
+    /// Reconcile generation the volatile mutations were applied under
+    /// (post-bump value). The fenced WM apply requires it to STILL be
+    /// current — any newer same-session report (incremental or
+    /// reconcile) supersedes this outcome entirely.
+    pub gen: u64,
     /// Block ids proven orphan or corrupt for THIS worker (R1 dead
     /// classification / R3 length violation): each is enqueued into
     /// the worker's delete queue (the BlockMap re-delivers until the
@@ -1130,6 +1164,75 @@ pub struct CacheIncrOutcome {
     /// BlockMap (a master-initiated delete completes); the volatile
     /// replica row was already removed under the guard.
     pub deleted_acks: Vec<i64>,
+}
+
+/// RC1 P0-2 (gpt56 `d2546338` item 2): the WorkerManager side effect one
+/// outcome apply must perform, delivered through the fenced apply so the
+/// volatile guard stays held across the WM mutation (linearization: no
+/// same-session report can interleave between the volatile strip and the
+/// WM bookkeeping).
+pub enum WmEffect {
+    RemoveBlock(i64),
+    DeletedAck(i64),
+}
+
+/// 4d.2 RC2 / RC1 P0-2: release the delete-pending quarantine for one
+/// EXACT `(worker, session_tag, object, seq)`. Shared by the public
+/// ack path (`ack_cache_deleted`) and the fenced outcome apply
+/// (`apply_outcome_fenced`) so the WM ack and the quarantine release can
+/// never diverge.
+///
+/// Round-3 P1 (gpt56 `f5980e03` item 4): the directed index is pruned
+/// as soon as THIS exact `(worker, tag)` subrow for the object is empty
+/// — independently of the object row's other reporters. Waiting for the
+/// whole object row to empty leaks a stale object reference in
+/// `quarantine_index[worker][tag]` whenever another reporter still holds
+/// quarantine for the object.
+fn release_quarantine_identity(
+    volatile: &mut CacheVolatile,
+    worker_id: u32,
+    session_tag: u64,
+    object_id: i64,
+    seq: i64,
+) {
+    let key = (worker_id, session_tag);
+    let mut index_prune = false;
+    let row_now_empty = {
+        let Some(row) = volatile.quarantine.get_mut(&object_id) else {
+            return;
+        };
+        let key_empty = if let Some(seqs) = row.get_mut(&key) {
+            seqs.remove(&seq);
+            seqs.is_empty()
+        } else {
+            false
+        };
+        if key_empty {
+            row.remove(&key);
+            index_prune = true;
+        }
+        row.is_empty()
+    };
+    if row_now_empty {
+        volatile.quarantine.remove(&object_id);
+    }
+    if index_prune {
+        if let Some(tags) = volatile.quarantine_index.get_mut(&worker_id) {
+            if let Some(objs) = tags.get_mut(&session_tag) {
+                objs.remove(&object_id);
+            }
+            if tags.get(&session_tag).is_some_and(|s| s.is_empty()) {
+                tags.remove(&session_tag);
+            }
+        }
+        if volatile
+            .quarantine_index
+            .get(&worker_id)
+            .is_none_or(|m| m.is_empty())
+        {
+            volatile.quarantine_index.remove(&worker_id);
+        }
+    }
 }
 
 /// 4d.2/4d.3: per-item routing decision for ONE reported cache block,
@@ -3357,6 +3460,8 @@ impl CacheService {
                 total_len: 0,
                 entries: HashMap::new(),
                 invalid: false,
+                phase: ReportPhase::Accumulating,
+                attempt: 0,
                 update_time_ms: LocalTime::mills(),
             },
         );
@@ -3525,7 +3630,11 @@ impl CacheService {
             Some(s) if s.session == session => (s.tag, s.address.clone()),
             _ => return Ok(CacheIncrOutcome::default()),
         };
-        *volatile.reconcile_gens.entry(worker_id).or_insert(0) += 1;
+        let gen = {
+            let entry = volatile.reconcile_gens.entry(worker_id).or_insert(0);
+            *entry += 1;
+            *entry
+        };
 
         // Per-item routing decision, classified against ONE fs_dir read
         // guard (geometry snapshot carried into the apply phase).
@@ -3538,10 +3647,15 @@ impl CacheService {
         // it under the transition gate before applying, so an outcome
         // computed before a Start/lost swap can never act on the new
         // session.
+        // RC1 P0-2 (gpt56 `d2546338` item 2): the outcome also carries
+        // the APPLIED generation; the fenced WM apply rechecks tag AND
+        // gen, so a newer same-session report supersedes this outcome
+        // wholesale (no re-ordering of its WM/ack effects).
         let (remove_blocks, deleted_acks) =
             volatile.apply_cache_decisions(worker_id, reg_tag, &reg_address, decisions);
         Ok(CacheIncrOutcome {
             session_tag: reg_tag,
+            gen,
             remove_blocks,
             deleted_acks,
         })
@@ -3717,51 +3831,124 @@ impl CacheService {
         }
         let seq = BlockIdCodec::get_seq(block_id);
         let mut volatile = self.lock_volatile();
-        let key = (worker_id, session_tag);
-        // Round-3 P1 (gpt56 `f5980e03` item 4): the directed index is
-        // pruned as soon as THIS exact `(worker, tag)` subrow for the
-        // object is empty — independently of the object row's other
-        // reporters. Waiting for the whole object row to empty leaks a
-        // stale object reference in `quarantine_index[worker][tag]`
-        // whenever another reporter still holds quarantine for the
-        // object.
-        let mut index_prune = false;
-        let row_now_empty = {
-            let Some(row) = volatile.quarantine.get_mut(&object_id) else {
-                return;
-            };
-            let key_empty = if let Some(seqs) = row.get_mut(&key) {
-                seqs.remove(&seq);
-                seqs.is_empty()
-            } else {
-                false
-            };
-            if key_empty {
-                row.remove(&key);
-                index_prune = true;
-            }
-            row.is_empty()
-        };
-        if row_now_empty {
-            volatile.quarantine.remove(&object_id);
+        release_quarantine_identity(&mut volatile, worker_id, session_tag, object_id, seq);
+    }
+
+    /// RC1 P0-3 (gpt56 `d2546338` item 3): the worker's CURRENT registry
+    /// wire session, read under the volatile guard. `None` = no live
+    /// registration (or cache disabled / follower) — full-report pages
+    /// only ever feed an accumulator bound to this value.
+    pub fn registry_session(&self, worker_id: u32) -> Option<String> {
+        if !self.enabled || !self.monitor.is_active() {
+            return None;
         }
-        if index_prune {
-            if let Some(tags) = volatile.quarantine_index.get_mut(&worker_id) {
-                if let Some(objs) = tags.get_mut(&session_tag) {
-                    objs.remove(&object_id);
-                }
-                if tags.get(&session_tag).is_some_and(|s| s.is_empty()) {
-                    tags.remove(&session_tag);
-                }
-            }
-            if volatile
-                .quarantine_index
-                .get(&worker_id)
-                .is_none_or(|m| m.is_empty())
-            {
-                volatile.quarantine_index.remove(&worker_id);
-            }
+        let volatile = self.lock_volatile();
+        volatile
+            .worker_sessions
+            .get(&worker_id)
+            .map(|s| s.session.clone())
+    }
+
+    /// RC1 P0-3 (gpt56 `2b83f05d` tightening): per-page authorization of
+    /// a full-report page against the CURRENT registry wire session,
+    /// taken BEFORE the page may create/switch/clear/count the FS
+    /// trigger row. `Some(current)` registry row: the page session must
+    /// equal it exactly. No live registration: only a legacy
+    /// EMPTY-session page passes. Cache domain disabled / follower:
+    /// vacuously true — the FS accumulator's behavior on cache-disabled
+    /// clusters is exactly the pre-4d.3 one (no new fence there).
+    pub fn authorize_full_report_page(&self, worker_id: u32, page_session: &str) -> bool {
+        if !self.enabled || !self.monitor.is_active() {
+            return true;
         }
+        let volatile = self.lock_volatile();
+        match volatile.worker_sessions.get(&worker_id) {
+            Some(s) => s.session == page_session,
+            None => page_session.is_empty(),
+        }
+    }
+
+    /// RC1 P0-1: read back the attempt ticket of an in-flight
+    /// (Reconciling) checkout for `(worker, session)`. Only the
+    /// self-Complete path needs this — the checkout transitioned the row
+    /// in place, and the attempt is stable until the exact-CAS release.
+    /// `None` (row absent, foreign session, or already terminal/never
+    /// checked out) yields a 0 attempt, which can never match a real
+    /// CAS, so the paired release is a safe no-op.
+    pub fn full_snapshot_attempt(&self, worker_id: u32, session: &str) -> Option<u64> {
+        let sessions = self.report_sessions.lock().unwrap();
+        sessions
+            .get(&worker_id)
+            .filter(|s| s.session == session && s.phase == ReportPhase::Reconciling)
+            .map(|s| s.attempt)
+    }
+
+    /// RC1 P0-2 (gpt56 `d2546338` item 2): apply one report outcome's
+    /// WorkerManager side effects under the VOLATILE guard held across
+    /// the whole apply. The fence rechecks BOTH the registry tag AND the
+    /// reconcile generation captured when the outcome's volatile
+    /// mutations were applied: any newer same-session report (incremental
+    /// page or full reconcile) bumped the generation in between, so this
+    /// outcome is superseded — its WM effects are dropped instead of
+    /// re-ordering after the newer report's (an old `remove_block` would
+    /// clear a fresh delete queue entry; an old `deleted_block` ack would
+    /// release a fresh quarantine). Holding the volatile guard across the
+    /// WM mutation also linearizes the pair: an incremental report needs
+    /// the volatile lock, and a Start/lost transition needs `start_gate`,
+    /// so nothing same-session can interleave inside this window.
+    /// Returns false when the fence dropped the outcome.
+    pub fn apply_outcome_fenced(
+        &self,
+        worker_id: u32,
+        outcome: &CacheIncrOutcome,
+        mut wm_effect: impl FnMut(WmEffect),
+    ) -> bool {
+        if !self.enabled || !self.monitor.is_active() {
+            return false;
+        }
+        let mut volatile = self.lock_volatile();
+        let current_gen = volatile
+            .reconcile_gens
+            .get(&worker_id)
+            .copied()
+            .unwrap_or(0);
+        let fenced = volatile
+            .worker_sessions
+            .get(&worker_id)
+            .is_some_and(|s| s.tag == outcome.session_tag)
+            && outcome.session_tag != 0
+            && current_gen == outcome.gen;
+        if !fenced {
+            log::warn!(
+                "cache report outcome for worker {} dropped: tag {}/gen {} no longer current ({})",
+                worker_id,
+                outcome.session_tag,
+                outcome.gen,
+                current_gen
+            );
+            return false;
+        }
+        for id in &outcome.remove_blocks {
+            wm_effect(WmEffect::RemoveBlock(*id));
+        }
+        for id in &outcome.deleted_acks {
+            let Ok(object_id) = BlockIdCodec::block_owner(*id) else {
+                continue;
+            };
+            if !BlockIdCodec::is_cache_owner(object_id) {
+                continue;
+            }
+            let seq = BlockIdCodec::get_seq(*id);
+            wm_effect(WmEffect::DeletedAck(*id));
+            release_quarantine_identity(
+                &mut volatile,
+                worker_id,
+                outcome.session_tag,
+                object_id,
+                seq,
+            );
+        }
+        true
     }
 
     /// 4d (R7-5): feed one full-report page into the worker's cache
@@ -3779,8 +3966,9 @@ impl CacheService {
         let Some(sess) = sessions.get_mut(&worker_id) else {
             return CacheFullReportOutcome::Skipped;
         };
-        // Foreign session or already terminal: permanently skipped.
-        if sess.invalid || sess.session != session {
+        // Foreign session, already terminal, or an in-flight checkout
+        // (RC1 P0-1): permanently skipped for this call.
+        if sess.invalid || sess.session != session || sess.phase != ReportPhase::Accumulating {
             return CacheFullReportOutcome::Skipped;
         }
         sess.update_time_ms = now;
@@ -3827,9 +4015,14 @@ impl CacheService {
             return CacheFullReportOutcome::Skipped;
         }
         if sess.entries.len() as u64 == sess.total_len {
-            let sess = sessions.remove(&worker_id).expect("entry checked out");
-            let entries = sess
-                .entries
+            // RC1 P0-1: checkout keeps the ROW (as Reconciling, under a
+            // fresh attempt ticket) and hands the entry set out — an
+            // incremental / End / lost landing mid-flight still finds
+            // and terminalizes the row; only the exact-attempt release
+            // returns it to Accumulating.
+            sess.phase = ReportPhase::Reconciling;
+            sess.attempt += 1;
+            let entries = std::mem::take(&mut sess.entries)
                 .into_iter()
                 .map(|(id, (status, block_size, storage_type))| BlockReportInfo {
                     id,
@@ -3858,15 +4051,20 @@ impl CacheService {
         &self,
         worker_id: u32,
         session: &str,
-    ) -> Option<Vec<BlockReportInfo>> {
+    ) -> Option<(Vec<BlockReportInfo>, u64)> {
         let mut sessions = self.report_sessions.lock().unwrap();
         let sess = sessions.get_mut(&worker_id)?;
-        if sess.invalid || sess.session != session {
+        if sess.invalid || sess.session != session || sess.phase != ReportPhase::Accumulating {
             return None;
         }
-        let sess = sessions.remove(&worker_id).expect("entry checked out");
-        let entries = sess
-            .entries
+        // RC1 P0-1: the checkout transitions the ROW to Reconciling
+        // (fresh attempt ticket) instead of removing it — mid-flight
+        // terminalization still reaches the row, and only the
+        // exact-attempt release can return it to Accumulating.
+        sess.phase = ReportPhase::Reconciling;
+        sess.attempt += 1;
+        let attempt = sess.attempt;
+        let entries = std::mem::take(&mut sess.entries)
             .into_iter()
             .map(|(id, (status, block_size, storage_type))| BlockReportInfo {
                 id,
@@ -3875,26 +4073,31 @@ impl CacheService {
                 block_size,
             })
             .collect();
-        Some(entries)
+        Some((entries, attempt))
     }
 
-    /// 4d.3: after a reconcile consumed the accumulator, install a
-    /// FRESH row so the worker's next periodic full report accumulates
-    /// again. Insert-only-when-absent: a TERMINAL row (an incremental
-    /// invalidated the session mid-reconcile) is never resurrected
-    /// (`0b900a2f`), and a row a newer Start installed is never
-    /// overwritten.
-    pub fn reopen_full_accumulator(&self, worker_id: u32, session: &str) {
+    /// 4d.3 / RC1 P0-1: finish one checkout — the ONLY path from a
+    /// `Reconciling` row back to `Accumulating`, as an exact
+    /// `(session, attempt)` CAS on the row that was checked out. A row
+    /// that was TERMINALIZED mid-flight (incremental / End / lost) is
+    /// left terminal (`0b900a2f` — never resurrected); a row a newer
+    /// Start installed (different session) is untouched. There is no
+    /// remove-then-blind-insert anywhere in the lifecycle.
+    pub fn release_full_accumulator(&self, worker_id: u32, session: &str, attempt: u64) {
         let mut sessions = self.report_sessions.lock().unwrap();
-        sessions
-            .entry(worker_id)
-            .or_insert_with(|| CacheReportSession {
-                session: session.to_string(),
-                total_len: 0,
-                entries: HashMap::new(),
-                invalid: false,
-                update_time_ms: LocalTime::mills(),
-            });
+        if let Some(sess) = sessions.get_mut(&worker_id) {
+            if sess.session == session
+                && sess.attempt == attempt
+                && sess.phase == ReportPhase::Reconciling
+            {
+                sess.phase = ReportPhase::Accumulating;
+                sess.entries.clear();
+                sess.total_len = 0;
+                // `invalid` is intentionally NOT cleared: a
+                // terminalization that raced the flight wins.
+                sess.update_time_ms = LocalTime::mills();
+            }
+        }
     }
 
     /// 4d.3 full-report reconcile: apply ONE complete cache snapshot
@@ -3927,6 +4130,37 @@ impl CacheService {
     /// The returned outcome's WorkerManager side effects are applied by
     /// the caller through the same fenced `apply_cache_incr_outcome`
     /// transition as an incremental report.
+    /// #[cfg(test)] 4d.3 test scaffolding (RC1 P0-1): un-terminalize the
+    /// worker's accumulator row, modeling the FRESH row a new Start
+    /// installs before a full report accumulates. Test seeds route
+    /// through `incr_block_report`, which terminalizes the row per
+    /// `0b900a2f` — production would never reconcile against that row
+    /// without an intervening Start. Compiled out outside cfg(test).
+    #[cfg(test)]
+    pub(crate) fn reset_accumulator_for_full_test(&self, worker_id: u32) {
+        let mut sessions = self.report_sessions.lock().unwrap();
+        if let Some(sess) = sessions.get_mut(&worker_id) {
+            sess.invalid = false;
+            sess.entries.clear();
+            sess.total_len = 0;
+            sess.phase = ReportPhase::Accumulating;
+            sess.update_time_ms = LocalTime::mills();
+        }
+    }
+
+    /// RC1 P0-1: is the worker's accumulator row still a live
+    /// (non-terminal) row bound to exactly this session? Called with the
+    /// accumulator guard already held (leaf-before-volatile order).
+    fn accumulator_row_live(
+        sessions: std::sync::MutexGuard<'_, HashMap<u32, CacheReportSession>>,
+        worker_id: u32,
+        session: &str,
+    ) -> bool {
+        sessions
+            .get(&worker_id)
+            .is_some_and(|s| s.session == session && !s.invalid)
+    }
+
     pub fn reconcile_cache_full_report(
         &self,
         worker_id: u32,
@@ -3934,6 +4168,24 @@ impl CacheService {
         entries: &[BlockReportInfo],
     ) -> CommonResult<CacheIncrOutcome> {
         if session.is_empty() || !self.enabled || !self.monitor.is_active() {
+            return Ok(CacheIncrOutcome::default());
+        }
+
+        // RC1 P0-1 (gpt56 `d2546338` item 1): the accumulator row must
+        // still be a NON-TERMINAL same-session row — the checkout keeps
+        // the row in place (Reconciling) precisely so an incremental /
+        // End / lost that WINS the flight can terminalize it (set
+        // `invalid`); a terminalized row means the checked-out snapshot
+        // is no longer authoritative and the whole reconcile is a no-op.
+        // Checked at entry AND re-checked after the seam below (the
+        // accumulator lock is a leaf BEFORE volatile in the declared
+        // order; a terminalization racing the final guard has already
+        // bumped the generation the phase-B fence compares against).
+        if !Self::accumulator_row_live(self.report_sessions.lock().unwrap(), worker_id, session) {
+            log::warn!(
+                "cache full-report reconcile for worker {} dropped: accumulator row terminal or foreign",
+                worker_id
+            );
             return Ok(CacheIncrOutcome::default());
         }
 
@@ -3965,6 +4217,16 @@ impl CacheService {
             hook();
         }
 
+        // RC1 P0-1 post-seam recheck: a terminalization that won the
+        // flight inside the window kills the reconcile here.
+        if !Self::accumulator_row_live(self.report_sessions.lock().unwrap(), worker_id, session) {
+            log::warn!(
+                "cache full-report reconcile for worker {} dropped: accumulator terminalized during classify window",
+                worker_id
+            );
+            return Ok(CacheIncrOutcome::default());
+        }
+
         // Phase B: final guard — session, tag, AND generation must all
         // still hold; then the generation is bumped so any LATER
         // incremental/reconcile capture fences against THIS one.
@@ -3986,7 +4248,11 @@ impl CacheService {
             );
             return Ok(CacheIncrOutcome::default());
         }
-        *volatile.reconcile_gens.entry(worker_id).or_insert(0) += 1;
+        let applied_gen = {
+            let entry = volatile.reconcile_gens.entry(worker_id).or_insert(0);
+            *entry += 1;
+            *entry
+        };
 
         // Apply phase 1: current-tag exact replace — strip this
         // worker's current-tag replicas + live reverse traces that the
@@ -4027,6 +4293,7 @@ impl CacheService {
             volatile.apply_cache_decisions(worker_id, reg_tag, &reg_address, decisions);
         Ok(CacheIncrOutcome {
             session_tag: reg_tag,
+            gen: applied_gen,
             remove_blocks,
             deleted_acks,
         })
@@ -8907,6 +9174,9 @@ mod tests {
             service
                 .incr_block_report(1, "seed-1", &[report(b1, 64), report(b2, 64)])
                 .unwrap();
+            // The incr seed terminalized the accumulator row; model the
+            // fresh row a new Start installs before the full report.
+            service.reset_accumulator_for_full_test(1);
             {
                 let s = service.clone();
                 *FULL_RECONCILE_SEAM.lock().unwrap() = Some(Box::new(move || hook(&s)));
@@ -8935,6 +9205,7 @@ mod tests {
             service
                 .incr_block_report(1, "seed-1", &[report(b1, 64), report(b2, 64)])
                 .unwrap();
+            service.reset_accumulator_for_full_test(1);
             let outcome = service
                 .reconcile_cache_full_report(1, "seed-1", &[report(b1, 64)])
                 .unwrap();
@@ -9088,6 +9359,9 @@ mod tests {
         service
             .incr_block_report(1, "B", &[report(b1, 64), report(b3, 2)])
             .unwrap();
+        // The incr seed terminalized B's accumulator row; model the
+        // fresh row the NEXT Start installs before the full report.
+        service.reset_accumulator_for_full_test(1);
 
         // The full-report snapshot: b1 reported, b2 Deleted, orphan
         // reported, b3 MISSING.
@@ -9150,14 +9424,15 @@ mod tests {
         }
     }
 
-    /// 4d.3 snapshot lifecycle: take_cache_full_snapshot consumes a
-    /// non-terminal same-session row exactly once; a foreign session
-    /// or a TERMINAL row yields None (no authoritative snapshot); and
-    /// reopen_full_accumulator installs a fresh row ONLY when absent —
-    /// it can never resurrect a terminal row (`0b900a2f`) or overwrite
-    /// a newer session's row.
+    /// 4d.3 snapshot lifecycle / RC1 P0-1 (gpt56 `d2546338` item 1): the
+    /// checkout transitions the row IN PLACE to
+    /// Reconciling(attempt) — never a remove — so a mid-flight
+    /// terminalization still reaches the row; the finish is an exact
+    /// `(session, attempt)` CAS back to Accumulating; a terminal row is
+    /// never resurrected (`0b900a2f`); an absent row is never blindly
+    /// inserted — only a new Start opens one.
     #[test]
-    fn test_4d3_snapshot_take_reopen_and_terminal() {
+    fn test_4d3_snapshot_take_release_and_terminal() {
         let service = build_service("4d3-take", chooser(vec![worker(1)]));
         service.begin_cache_session(1, "s1", &worker(1)).unwrap();
 
@@ -9170,16 +9445,27 @@ mod tests {
             service.cache_full_report_page(1, "s1", 5, &[report(701, 64)]),
             CacheFullReportOutcome::Partial
         ));
-        let snap = service.take_cache_full_snapshot(1, "s1").unwrap();
+        let (snap, attempt) = service.take_cache_full_snapshot(1, "s1").unwrap();
         assert_complete_entries(&snap, &[(700, 64), (701, 64)]);
+        assert_eq!(attempt, 1);
 
-        // The row was consumed: further same-session pages are Skipped
-        // until the wiring reopens a fresh accumulator.
+        // In flight (Reconciling): late same-session full pages are
+        // Skipped, and a SECOND checkout of the same row is None.
         assert!(matches!(
             service.cache_full_report_page(1, "s1", 5, &[report(702, 64)]),
             CacheFullReportOutcome::Skipped
         ));
-        service.reopen_full_accumulator(1, "s1");
+        assert!(service.take_cache_full_snapshot(1, "s1").is_none());
+
+        // A WRONG attempt is not a release (attempt CAS fails).
+        service.release_full_accumulator(1, "s1", attempt + 1);
+        assert!(service.take_cache_full_snapshot(1, "s1").is_none());
+        // A foreign session is not a release either.
+        service.release_full_accumulator(1, "other", attempt);
+        assert!(service.take_cache_full_snapshot(1, "s1").is_none());
+
+        // The exact CAS returns the row to Accumulating, fresh.
+        service.release_full_accumulator(1, "s1", attempt);
         assert!(matches!(
             service.cache_full_report_page(1, "s1", 5, &[report(702, 64)]),
             CacheFullReportOutcome::Partial
@@ -9192,11 +9478,14 @@ mod tests {
             Some(("s1".to_string(), false))
         );
 
-        // An incremental terminalizes the row: take -> None; reopen
-        // must NOT resurrect it; the session's pages stay Skipped.
+        // An incremental terminalizes the row MID-FLIGHT: take -> None;
+        // even the exact-attempt release must NOT clear the terminal
+        // flag (`0b900a2f`); the session's pages stay Skipped.
+        let (_, attempt2) = service.take_cache_full_snapshot(1, "s1").unwrap();
+        assert_eq!(attempt2, 2);
         service.invalidate_report_session(1);
         assert!(service.take_cache_full_snapshot(1, "s1").is_none());
-        service.reopen_full_accumulator(1, "s1");
+        service.release_full_accumulator(1, "s1", attempt2);
         assert_eq!(
             service.session_spine_snapshot(1).accumulator,
             Some(("s1".to_string(), true))
@@ -9207,9 +9496,16 @@ mod tests {
         ));
 
         // An absent row (worker with no cache page this report) is
-        // also None; reopen installs a fresh one for the next report.
+        // also None, and release is a NO-OP on it — no blind insert;
+        // only a new Start opens the worker's accumulator.
         assert!(service.take_cache_full_snapshot(2, "s2").is_none());
-        service.reopen_full_accumulator(2, "s2");
+        service.release_full_accumulator(2, "s2", 1);
+        assert!(service.session_spine_snapshot(2).accumulator.is_none());
+        assert!(matches!(
+            service.cache_full_report_page(2, "s2", 1, &[report(800, 64)]),
+            CacheFullReportOutcome::Skipped
+        ));
+        service.begin_cache_session(2, "s2", &worker(2)).unwrap();
         assert!(matches!(
             service.cache_full_report_page(2, "s2", 1, &[report(800, 64)]),
             CacheFullReportOutcome::Complete(_)

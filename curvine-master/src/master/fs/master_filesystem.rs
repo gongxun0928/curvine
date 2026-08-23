@@ -117,6 +117,12 @@ fn snapshot_token_in_subtree(token: &str, subtree_path: &str) -> bool {
 }
 
 struct FullBlockReportState {
+    /// RC1 P0-3 (gpt56 `d2546338` item 3 / `2b83f05d`): the wire session
+    /// every page of this accumulation was authorized against. A Start
+    /// resets the row; a page from any OTHER session is zero-effect
+    /// (zero-create, zero-clear, zero-count, zero-trigger) BEFORE it
+    /// reaches this struct — see `collect_full_block_report`.
+    session: String,
     total_len: u64,
     update_time_ms: u64,
     reported_blocks: HashSet<i64>,
@@ -1267,6 +1273,30 @@ impl MasterFilesystem {
             return None;
         }
 
+        // RC1 P0-3 (gpt56 `d2546338` item 3, tightened `2b83f05d`):
+        // EVERY full page is authorized against the CURRENT registry
+        // wire session BEFORE it can create, switch, clear, or count the
+        // FS trigger row — a stale/foreign page is 零创建、零清空、零计数、
+        // 零触发. Match rules: the page session equals the current
+        // registry session; with no live cache registration only a
+        // legacy EMPTY-session page accumulates; with the cache domain
+        // disabled/inactive the authorization is vacuous (the FS
+        // accumulator must keep working on cache-disabled clusters,
+        // exactly the pre-4d.3 behavior). A stale s1 page after
+        // Start(s2) can therefore neither create the row before s2's
+        // first page nor disturb s2's progress after it.
+        let page_session = list.worker_session_id.clone().unwrap_or_default();
+        if !self
+            .cache_service
+            .authorize_full_report_page(list.worker_id, &page_session)
+        {
+            warn!(
+                "full block report page for worker {} skipped: session {:?} is not the current registry session",
+                list.worker_id, page_session
+            );
+            return None;
+        }
+
         let now = LocalTime::mills();
         let mut reports = self.full_block_reports.lock();
         reports.retain(|_, report| {
@@ -1281,10 +1311,28 @@ impl MasterFilesystem {
         {
             reports.remove(&list.worker_id);
         }
+        // An existing row bound to a DIFFERENT session can only survive
+        // when the registry moved without the Start reset path removing
+        // it (defensive): restart the accumulation bound to THIS
+        // (authorized) page session — old-session state never carries
+        // over.
+        if reports
+            .get(&list.worker_id)
+            .is_some_and(|row| row.session != page_session)
+        {
+            warn!(
+                "full block report for worker {} restarted: row session {:?} superseded by {:?}",
+                list.worker_id,
+                reports.get(&list.worker_id).map(|r| r.session.clone()),
+                page_session
+            );
+            reports.remove(&list.worker_id);
+        }
 
         let report = reports
             .entry(list.worker_id)
             .or_insert_with(|| FullBlockReportState {
+                session: page_session.clone(),
                 total_len: list.total_len,
                 update_time_ms: now,
                 reported_blocks: HashSet::with_capacity(list.total_len as usize),
@@ -1445,17 +1493,21 @@ impl MasterFilesystem {
         }
     }
 
-    /// P0-1 (gpt56 `25d4b51e` item 1): apply one incremental-report
-    /// outcome's WorkerManager side effects under the transition fence.
-    /// The outcome carries the registry tag its decisions were made
-    /// under; the whole WM apply runs while holding `start_gate → WM
-    /// write → volatile`, so a Start/End/lost transition can never
-    /// interleave between the tag recheck and the side effects — an
-    /// outcome computed before a session swap is a LOUD no-op (its
-    /// volatile strip already happened under the old tag's guard; the
-    /// physical reclamation is the full-report reconcile's job), never
-    /// a delete queue entry or a quarantine release against the NEW
-    /// session.
+    /// P0-1 (gpt56 `25d4b51e` item 1) / RC1 P0-2 (gpt56 `d2546338`
+    /// item 2): apply one report outcome's WorkerManager side effects
+    /// under the transition fence. The outcome carries the registry tag
+    /// AND the reconcile generation its volatile mutations were applied
+    /// under; the tag+generation recheck AND the WM remove/ack +
+    /// quarantine-release effects all run inside
+    /// `apply_outcome_fenced`, which holds the VOLATILE guard across
+    /// the whole apply — so neither a Start/End/lost transition (needs
+    /// `start_gate`, held here) nor a same-session report (needs the
+    /// volatile lock) can interleave between the recheck and the side
+    /// effects. An outcome superseded by a newer same-session report
+    /// (generation bumped) is a LOUD drop: its WM effects can never
+    /// re-order after the newer report's (an old `remove_block` would
+    /// clear a fresh delete queue entry; an old `deleted_block` ack
+    /// would release a fresh quarantine).
     fn apply_cache_incr_outcome(
         &self,
         worker_id: u32,
@@ -1468,19 +1520,13 @@ impl MasterFilesystem {
         }
         let _gate = self.start_gate.lock();
         let mut wm = self.worker_manager.write();
-        // Exact-tag recheck under the fence (lock order matches the
-        // heartbeat path: start_gate → WM → volatile).
-        if self.cache_service.cache_session_tag(worker_id) != Some(outcome.session_tag) {
-            warn!(
-                "cache incr outcome for worker {} dropped: session tag changed since decision",
-                worker_id
-            );
-            return;
-        }
         // #[cfg(test)] deterministic seam (4d.2 round-3, gpt56 `f5980e03`
-        // P0-1 / `48dec504` outcome-wins branch): fires AFTER the recheck
-        // passed, with the transition gate held and the WM guard held.
-        // The lost-worker transition also takes `start_gate`, so a lost
+        // P0-1 / `48dec504` outcome-wins branch): fires at ENTRY of the
+        // fenced transition — `start_gate` and the WM write guard are
+        // held, the volatile lock is NOT (existing hooks call
+        // volatile-taking methods such as `cache_session_tag`, which
+        // would self-deadlock under the fenced apply's guard). The
+        // lost-worker transition also takes `start_gate`, so a lost
         // retire arriving in this window must BLOCK — tests prove it via
         // `start_gate.try_lock()` failing here. Compiled out outside
         // cfg(test); never set in production.
@@ -1492,18 +1538,19 @@ impl MasterFilesystem {
         {
             hook();
         }
-        for id in outcome.remove_blocks {
-            wm.remove_block(worker_id, id);
-        }
-        for id in outcome.deleted_acks {
-            wm.deleted_block(worker_id, id);
-            // 4d.2 RC2: the worker-side delete for this identity
-            // completed — release its delete-pending quarantine so a
-            // later Finalized re-report may publish again. P0-1: the
-            // release is exact `(worker, captured tag, seq)`.
-            self.cache_service
-                .ack_cache_deleted(worker_id, outcome.session_tag, id);
-        }
+        // RC1 P0-2: tag AND applied-generation recheck plus the WM
+        // remove/ack + quarantine release, ALL under the volatile guard
+        // held by the fenced apply (lock order matches the heartbeat
+        // path: start_gate → WM → volatile).
+        self.cache_service
+            .apply_outcome_fenced(worker_id, &outcome, |eff| match eff {
+                crate::cache::cache_service::WmEffect::RemoveBlock(id) => {
+                    wm.remove_block(worker_id, id)
+                }
+                crate::cache::cache_service::WmEffect::DeletedAck(id) => {
+                    wm.deleted_block(worker_id, id)
+                }
+            });
     }
 
     /// Process block reports
@@ -1682,23 +1729,57 @@ impl MasterFilesystem {
             // effects ride the same fenced transition as an
             // incremental's.
             let session = list.worker_session_id.clone().unwrap_or_default();
-            let snapshot = cache_complete.take().or_else(|| {
-                self.cache_service
-                    .take_cache_full_snapshot(list.worker_id, &session)
-            });
-            if let Some(entries) = snapshot {
+            // RC1 P0-1: BOTH Complete paths share the ONE checkout state
+            // machine — the self-Complete stash (cache-only worker) reads
+            // back its in-place attempt ticket (stable while the row is
+            // Reconciling: a second checkout is blocked, only the exact
+            // CAS release returns the row), the mixed path consumes the
+            // still-Partial row via the same transition.
+            let snapshot = cache_complete
+                .take()
+                .map(|entries| {
+                    let attempt = self
+                        .cache_service
+                        .full_snapshot_attempt(list.worker_id, &session)
+                        .unwrap_or(0);
+                    (entries, attempt)
+                })
+                .or_else(|| {
+                    self.cache_service
+                        .take_cache_full_snapshot(list.worker_id, &session)
+                });
+            if let Some((entries, attempt)) = snapshot {
+                // #[cfg(test)] deterministic seam (RC1 P0-1, gpt56
+                // `d2546338` item 1): the checkout window — the row is
+                // Reconciling (attempt checked out), the reconcile and
+                // the exact-CAS release have not run. A hook may run an
+                // incremental report or an End/lost retire and WIN the
+                // row (terminalize it in place); the release CAS must
+                // then fail and the row must stay terminal. Compiled out
+                // outside cfg(test); never set in production.
+                #[cfg(test)]
+                if let Some(hook) = crate::master::master_handler::FULL_TRIGGER_SEAM
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                {
+                    hook();
+                }
                 let outcome = self.cache_service.reconcile_cache_full_report(
                     list.worker_id,
                     &session,
                     &entries,
                 )?;
                 self.apply_cache_incr_outcome(list.worker_id, outcome);
-                // Reopen a FRESH accumulator for the next periodic full
-                // report — insert-only-when-absent, so a terminal row
-                // (incremental raced in) or a newer Start's row is
-                // never overwritten/resurrected.
+                // RC1 P0-1 (gpt56 `d2546338` item 1): finish the checkout
+                // — the ONLY path back to Accumulating is an exact
+                // `(session, attempt)` CAS on the in-place row. A row
+                // TERMINALIZED mid-flight (incremental / End / lost raced
+                // the flight) stays terminal (`0b900a2f`); a row a newer
+                // Start installed stays untouched. No remove-then-blind-
+                // insert anywhere in the lifecycle.
                 self.cache_service
-                    .reopen_full_accumulator(list.worker_id, &session);
+                    .release_full_accumulator(list.worker_id, &session, attempt);
             }
 
             // 4d.2: the FS reconcile set covers FS blocks only — cache
@@ -1754,6 +1835,16 @@ impl MasterFilesystem {
             .full_block_reconcile_executor
             .fixed_spawn(worker_id as i64, move || {
                 fs.run_full_block_reconcile(worker_id, replication_handler);
+                // RC1 (gpt56 `d2546338` join-panic note): this task may
+                // hold the LAST `MasterFilesystem` clone, whose Drop
+                // chain releases the last Arc to the executor — and the
+                // executor's Drop JOINS its pool threads. Dropping that
+                // on THIS pool thread is a pthread self-join
+                // (`failed to join thread: Resource deadlock avoided`).
+                // Hand the final clones to a detached thread so the
+                // join happens off-pool. (Task-local drops are moved
+                // into the closure together with `fs`.)
+                std::thread::spawn(move || drop(fs));
             });
         if let Err(e) = &res {
             self.full_block_reconciles.lock().remove(&worker_id);
@@ -2616,6 +2707,589 @@ mod tests {
             fs.cache_service.get(1, "/k", true).unwrap().is_none(),
             "exact replace: missing + deleted identities removed the object"
         );
+    }
+
+    /// RC1 P0-1 (gpt56 `d2546338` item 1): the end-of-report checkout
+    /// keeps the accumulator row IN PLACE (Reconciling + attempt) — an
+    /// incremental or an exact End that WINS the checkout window can
+    /// still terminalize the row, the reconcile no-ops, the release CAS
+    /// never resurrects the terminal row, late same-session full pages
+    /// stay Skipped, and only a new Start reopens the worker.
+    #[test]
+    fn test_4d3_rc1_p01_checkout_window_winners() {
+        let build = |tag: &str| {
+            Master::init_test_metrics();
+            let mut conf = ClusterConf::format();
+            conf.testing = true;
+            conf.journal.enable = false;
+            conf.master.cache_metadata_enabled = true;
+            conf.master.meta_dir = Utils::test_sub_dir(format!(
+                "master-fs-4d3-rc1win/meta-{}-{}",
+                tag,
+                Utils::rand_str(6)
+            ));
+            conf.journal.journal_dir = Utils::test_sub_dir(format!(
+                "master-fs-4d3-rc1win/journal-{}-{}",
+                tag,
+                Utils::rand_str(6)
+            ));
+            let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+            fs.master_monitor
+                .journal_ctl
+                .set_state(curvine_raft::raft::RoleState::Leader);
+            let addr = WorkerAddress {
+                worker_id: 1,
+                hostname: format!("rc1win-{}", tag),
+                ip_addr: "10.0.0.1".into(),
+                rpc_port: 8200,
+                web_port: 8300,
+            };
+            fs.begin_worker_session(&addr, "s1").unwrap();
+            (fs, conf, addr)
+        };
+        let commit_entry = |fs: &MasterFilesystem| {
+            let obj = BlockIdCodec::CACHE_OBJECT_MIN;
+            let lay = crate::master::meta::CacheBlockLayout::derive(obj, 150, 64).unwrap();
+            {
+                let store = fs.fs_dir.read();
+                let rocks = store.get_rocks_store();
+                let mgr = &store.cache;
+                mgr.apply_incarnation_allocate_v2(rocks, token(91, 1), 5, 1, 0)
+                    .unwrap();
+                mgr.apply_id_reserve(rocks, token(1, 1), obj, obj + 100)
+                    .unwrap();
+                let alloc = crate::master::meta::cache::entry::CacheEntry {
+                    generation: 1,
+                    state: crate::master::meta::cache::entry::CacheEntryState::Reserved,
+                    object_id: obj,
+                    len: 0,
+                    ufs_mtime: 0,
+                    block_size: 64,
+                    expire_at: 0,
+                };
+                mgr.apply_allocate(rocks, token(2, 1), 1, "/k", 150, &alloc)
+                    .unwrap();
+                mgr.apply_commit(
+                    rocks,
+                    token(2, 1),
+                    token(2, 2),
+                    1,
+                    "/k",
+                    1,
+                    obj,
+                    150,
+                    777,
+                    0,
+                )
+                .unwrap();
+            }
+            (
+                obj,
+                lay.block_id(1).unwrap(),
+                lay.block_id(2).unwrap(),
+                lay.block_id(3).unwrap(),
+            )
+        };
+        let cfinal = |id: i64, len: i64| {
+            BlockReportInfo::new(id, BlockReportStatus::Finalized, StorageType::Disk, len)
+        };
+
+        // Branch 1 — an incremental WINS the window: the corrupt b2
+        // report terminalizes the in-place row; the pending snapshot
+        // reconcile must no-op and its release must not resurrect.
+        {
+            let (fs, conf, addr) = build("incr");
+            let (obj, b1, b2, b3) = commit_entry(&fs);
+            let list = |session: &str, total: u64, blocks: Vec<BlockReportInfo>| BlockReportList {
+                cluster_id: conf.cluster_id.clone(),
+                worker_id: 1,
+                full_report: true,
+                total_len: total,
+                blocks,
+                worker_session_id: Some(session.into()),
+            };
+
+            fs.block_report(list("s1", 3, vec![cfinal(b1, 64)]), None)
+                .unwrap();
+            assert!(
+                fs.cache_service.get(1, "/k", true).unwrap().is_none(),
+                "still accumulating"
+            );
+
+            {
+                let fs2 = fs.clone();
+                *crate::master::master_handler::FULL_TRIGGER_SEAM
+                    .lock()
+                    .unwrap() = Some(Box::new(move || {
+                    // Same-session corrupt incremental, applied inside
+                    // the checkout window.
+                    let out = fs2
+                        .cache_service
+                        .incr_block_report(
+                            1,
+                            "s1",
+                            &[BlockReportInfo::new(
+                                b2,
+                                BlockReportStatus::Finalized,
+                                StorageType::Disk,
+                                0,
+                            )],
+                        )
+                        .unwrap();
+                    assert_eq!(out.remove_blocks, vec![b2]);
+                    fs2.apply_cache_incr_outcome(1, out);
+                }));
+            }
+            fs.block_report(list("s1", 3, vec![cfinal(b2, 64), cfinal(b3, 22)]), None)
+                .unwrap();
+            *crate::master::master_handler::FULL_TRIGGER_SEAM
+                .lock()
+                .unwrap() = None;
+
+            // The reconciled snapshot was a superseded flight: nothing
+            // published, and the WINNER's effects landed instead.
+            assert!(
+                fs.cache_service.get(1, "/k", true).unwrap().is_none(),
+                "terminalized flight reconciles to a no-op"
+            );
+            let tag = fs.cache_service.cache_session_tag(1).unwrap();
+            assert!(
+                fs.cache_service.quarantine_contains(obj, 1, tag, 2),
+                "the winning incremental's quarantine survives"
+            );
+
+            // The row stayed terminal through the release CAS; a late
+            // same-session full page stays Skipped.
+            assert_eq!(
+                fs.cache_service.session_spine_snapshot(1).accumulator,
+                Some(("s1".to_string(), true)),
+                "release did not resurrect the terminal row"
+            );
+            fs.block_report(list("s1", 3, vec![cfinal(b1, 64)]), None)
+                .unwrap();
+            assert_eq!(
+                fs.cache_service.session_spine_snapshot(1).accumulator,
+                Some(("s1".to_string(), true))
+            );
+
+            // Only a NEW Start reopens the worker's accumulator.
+            fs.begin_worker_session(&addr, "s2").unwrap();
+            fs.block_report(
+                list(
+                    "s2",
+                    3,
+                    vec![cfinal(b1, 64), cfinal(b2, 64), cfinal(b3, 22)],
+                ),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                fs.cache_service.session_spine_snapshot(1).accumulator,
+                Some(("s2".to_string(), false)),
+                "new Start reopens the accumulator"
+            );
+        }
+
+        // Branch 2 — an exact End WINS the window: registry retired, row
+        // terminal, reconcile no-op, only a new Start reopens.
+        {
+            let (fs, conf, addr) = build("end");
+            let (_obj, b1, b2, b3) = commit_entry(&fs);
+            let list = |session: &str, total: u64, blocks: Vec<BlockReportInfo>| BlockReportList {
+                cluster_id: conf.cluster_id.clone(),
+                worker_id: 1,
+                full_report: true,
+                total_len: total,
+                blocks,
+                worker_session_id: Some(session.into()),
+            };
+
+            fs.block_report(list("s1", 3, vec![cfinal(b1, 64)]), None)
+                .unwrap();
+            {
+                let fs2 = fs.clone();
+                *crate::master::master_handler::FULL_TRIGGER_SEAM
+                    .lock()
+                    .unwrap() = Some(Box::new(move || {
+                    fs2.end_worker_session(1, "s1");
+                }));
+            }
+            fs.block_report(list("s1", 3, vec![cfinal(b2, 64), cfinal(b3, 22)]), None)
+                .unwrap();
+            *crate::master::master_handler::FULL_TRIGGER_SEAM
+                .lock()
+                .unwrap() = None;
+
+            assert!(
+                fs.cache_service.get(1, "/k", true).unwrap().is_none(),
+                "ended session's flight reconciles to a no-op"
+            );
+            assert_eq!(
+                fs.cache_service.cache_session_tag(1),
+                None,
+                "exact End retired the registry row"
+            );
+            assert_eq!(
+                fs.cache_service.session_spine_snapshot(1).accumulator,
+                Some(("s1".to_string(), true)),
+                "row terminal, release did not resurrect"
+            );
+
+            // Late same-session page: zero cache effect; only a new
+            // Start reopens.
+            fs.block_report(list("s1", 3, vec![cfinal(b1, 64)]), None)
+                .unwrap();
+            assert_eq!(
+                fs.cache_service.session_spine_snapshot(1).accumulator,
+                Some(("s1".to_string(), true))
+            );
+            fs.begin_worker_session(&addr, "s2").unwrap();
+            fs.block_report(
+                list(
+                    "s2",
+                    3,
+                    vec![cfinal(b1, 64), cfinal(b2, 64), cfinal(b3, 22)],
+                ),
+                None,
+            )
+            .unwrap();
+            let hit = fs
+                .cache_service
+                .get(1, "/k", true)
+                .unwrap()
+                .expect("reopened session publishes");
+            assert_eq!(hit.blocks.len(), 3);
+        }
+    }
+
+    /// RC1 P0-2 (gpt56 `d2546338` item 2): an OLD full-report outcome
+    /// (a Deleted ack) paused at its WM apply must be DROPPED when a NEW
+    /// same-session corrupt incremental completed and applied inside the
+    /// pause — the old ack can neither clear the fresh BlockMap delete
+    /// queue entry nor release the fresh quarantine (no re-ordering).
+    #[test]
+    fn test_4d3_rc1_p02_outcome_generation_reorder() {
+        use curvine_model::{HeartbeatStatus, WorkerCommand};
+
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.cache_metadata_enabled = true;
+        conf.master.meta_dir =
+            Utils::test_sub_dir(format!("master-fs-4d3-rc1gen/meta-{}", Utils::rand_str(6)));
+        conf.journal.journal_dir = Utils::test_sub_dir(format!(
+            "master-fs-4d3-rc1gen/journal-{}",
+            Utils::rand_str(6)
+        ));
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        fs.master_monitor
+            .journal_ctl
+            .set_state(curvine_raft::raft::RoleState::Leader);
+
+        let addr = WorkerAddress {
+            worker_id: 1,
+            hostname: "rc1gen-1".into(),
+            ip_addr: "10.0.0.1".into(),
+            rpc_port: 8200,
+            web_port: 8300,
+        };
+        fs.begin_worker_session(&addr, "s1").unwrap();
+
+        let obj = BlockIdCodec::CACHE_OBJECT_MIN;
+        let lay = crate::master::meta::CacheBlockLayout::derive(obj, 150, 64).unwrap();
+        let b1 = lay.block_id(1).unwrap();
+        let b2 = lay.block_id(2).unwrap();
+        let b3 = lay.block_id(3).unwrap();
+        {
+            let store = fs.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let mgr = &store.cache;
+            mgr.apply_incarnation_allocate_v2(rocks, token(91, 1), 5, 1, 0)
+                .unwrap();
+            mgr.apply_id_reserve(rocks, token(1, 1), obj, obj + 100)
+                .unwrap();
+            let alloc = crate::master::meta::cache::entry::CacheEntry {
+                generation: 1,
+                state: crate::master::meta::cache::entry::CacheEntryState::Reserved,
+                object_id: obj,
+                len: 0,
+                ufs_mtime: 0,
+                block_size: 64,
+                expire_at: 0,
+            };
+            mgr.apply_allocate(rocks, token(2, 1), 1, "/k", 150, &alloc)
+                .unwrap();
+            mgr.apply_commit(
+                rocks,
+                token(2, 1),
+                token(2, 2),
+                1,
+                "/k",
+                1,
+                obj,
+                150,
+                777,
+                0,
+            )
+            .unwrap();
+        }
+
+        let list = |session: &str, total: u64, blocks: Vec<BlockReportInfo>| BlockReportList {
+            cluster_id: conf.cluster_id.clone(),
+            worker_id: 1,
+            full_report: true,
+            total_len: total,
+            blocks,
+            worker_session_id: Some(session.into()),
+        };
+        let cfinal = |id: i64, len: i64| {
+            BlockReportInfo::new(id, BlockReportStatus::Finalized, StorageType::Disk, len)
+        };
+
+        // Publish b1..b3 with a full report.
+        fs.block_report(
+            list(
+                "s1",
+                3,
+                vec![cfinal(b1, 64), cfinal(b2, 64), cfinal(b3, 22)],
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fs.cache_service
+                .get(1, "/k", true)
+                .unwrap()
+                .expect("published")
+                .blocks
+                .len(),
+            3
+        );
+
+        // The OLD full outcome (a Deleted-only snapshot → Deleted ack for
+        // b2). Its WM apply pauses at the INCR_OUTCOME_SEAM; inside the
+        // pause a NEW same-session corrupt incremental completes (gen
+        // bump + quarantine + delete-queue decision). The fresh
+        // outcome's own WM apply is DEFERRED until after the outer
+        // block_report returns — the seam fires with the outer
+        // `start_gate` held, so re-entering apply here would self-
+        // deadlock; only the ordering that matters (the new report
+        // landing BEFORE the old outcome's fence recheck) is inside the
+        // pause.
+        let fresh_outcome: Arc<
+            std::sync::Mutex<Option<crate::cache::cache_service::CacheIncrOutcome>>,
+        > = Arc::new(std::sync::Mutex::new(None));
+        {
+            let fs2 = fs.clone();
+            let fresh_outcome = fresh_outcome.clone();
+            *crate::master::master_handler::INCR_OUTCOME_SEAM
+                .lock()
+                .unwrap() = Some(Box::new(move || {
+                let out2 = fs2
+                    .cache_service
+                    .incr_block_report(
+                        1,
+                        "s1",
+                        &[BlockReportInfo::new(
+                            b2,
+                            BlockReportStatus::Finalized,
+                            StorageType::Disk,
+                            0, // corrupt length → orphan
+                        )],
+                    )
+                    .unwrap();
+                assert_eq!(out2.remove_blocks, vec![b2]);
+                *fresh_outcome.lock().unwrap() = Some(out2);
+            }));
+        }
+        fs.block_report(
+            list("s1", 1, vec![BlockReportInfo::with_deleted(b2, 64)]),
+            None,
+        )
+        .unwrap();
+        // Clear the seam OUTSIDE the hook: the firing `if let` holds the
+        // seam's own guard for the hook's whole body, so re-locking it
+        // inside would self-deadlock.
+        *crate::master::master_handler::INCR_OUTCOME_SEAM
+            .lock()
+            .unwrap() = None;
+        let out2 = fresh_outcome.lock().unwrap().take().unwrap();
+        fs.apply_cache_incr_outcome(1, out2);
+
+        // The old outcome was dropped by the generation fence: b2 is
+        // STILL in the worker's delete queue (heartbeat re-delivers it).
+        let cmds = fs
+            .worker_manager
+            .write()
+            .heartbeat(
+                &conf.cluster_id,
+                HeartbeatStatus::Running,
+                addr.clone(),
+                1,
+                "s1".to_string(),
+                Default::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        let mut queued: Vec<i64> = Vec::new();
+        for cmd in cmds {
+            let WorkerCommand::DeleteBlock(c) = cmd;
+            queued.extend(c.blocks);
+        }
+        assert_eq!(queued, vec![b2], "old ack did not clear the fresh delete");
+
+        // The fresh quarantine survives — no ack inversion.
+        let tag = fs.cache_service.cache_session_tag(1).unwrap();
+        assert!(
+            fs.cache_service.quarantine_contains(obj, 1, tag, 2),
+            "old ack did not release the fresh quarantine"
+        );
+    }
+
+    /// RC1 P0-3 (gpt56 `d2546338` item 3 / tightening `2b83f05d`): a
+    /// stale old-session full page is 零创建、零清空、零计数、零触发 on
+    /// the FS trigger row — before OR after the new session's first
+    /// page — and the new session's own pages complete and reconcile
+    /// correctly.
+    #[test]
+    fn test_4d3_rc1_p03_stale_page_after_restart() {
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.cache_metadata_enabled = true;
+        conf.master.meta_dir =
+            Utils::test_sub_dir(format!("master-fs-4d3-rc1s3/meta-{}", Utils::rand_str(6)));
+        conf.journal.journal_dir = Utils::test_sub_dir(format!(
+            "master-fs-4d3-rc1s3/journal-{}",
+            Utils::rand_str(6)
+        ));
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        fs.master_monitor
+            .journal_ctl
+            .set_state(curvine_raft::raft::RoleState::Leader);
+
+        let addr = WorkerAddress {
+            worker_id: 1,
+            hostname: "rc1s3-1".into(),
+            ip_addr: "10.0.0.1".into(),
+            rpc_port: 8200,
+            web_port: 8300,
+        };
+        fs.begin_worker_session(&addr, "s1").unwrap();
+
+        let obj = BlockIdCodec::CACHE_OBJECT_MIN;
+        let lay = crate::master::meta::CacheBlockLayout::derive(obj, 150, 64).unwrap();
+        let b1 = lay.block_id(1).unwrap();
+        let b2 = lay.block_id(2).unwrap();
+        let b3 = lay.block_id(3).unwrap();
+        {
+            let store = fs.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let mgr = &store.cache;
+            mgr.apply_incarnation_allocate_v2(rocks, token(91, 1), 5, 1, 0)
+                .unwrap();
+            mgr.apply_id_reserve(rocks, token(1, 1), obj, obj + 100)
+                .unwrap();
+            let alloc = crate::master::meta::cache::entry::CacheEntry {
+                generation: 1,
+                state: crate::master::meta::cache::entry::CacheEntryState::Reserved,
+                object_id: obj,
+                len: 0,
+                ufs_mtime: 0,
+                block_size: 64,
+                expire_at: 0,
+            };
+            mgr.apply_allocate(rocks, token(2, 1), 1, "/k", 150, &alloc)
+                .unwrap();
+            mgr.apply_commit(
+                rocks,
+                token(2, 1),
+                token(2, 2),
+                1,
+                "/k",
+                1,
+                obj,
+                150,
+                777,
+                0,
+            )
+            .unwrap();
+        }
+
+        let list = |session: &str, total: u64, blocks: Vec<BlockReportInfo>| BlockReportList {
+            cluster_id: conf.cluster_id.clone(),
+            worker_id: 1,
+            full_report: true,
+            total_len: total,
+            blocks,
+            worker_session_id: Some(session.into()),
+        };
+        let cfinal = |id: i64, len: i64| {
+            BlockReportInfo::new(id, BlockReportStatus::Finalized, StorageType::Disk, len)
+        };
+
+        // s1 begins a full report (1 of 3), then the worker restarts.
+        fs.block_report(list("s1", 3, vec![cfinal(b1, 64)]), None)
+            .unwrap();
+        assert!(fs.cache_service.get(1, "/k", true).unwrap().is_none());
+        fs.begin_worker_session(&addr, "s2").unwrap();
+        assert!(
+            fs.full_block_reports.lock().is_empty(),
+            "Start resets the FS trigger row"
+        );
+
+        // A COMPLETING stale s1 page arrives: zero creation, zero
+        // counting, zero triggering on the FS accumulator; the cache
+        // accumulator (bound to s2) skips it; nothing publishes.
+        fs.block_report(list("s1", 3, vec![cfinal(b2, 64), cfinal(b3, 22)]), None)
+            .unwrap();
+        assert!(
+            fs.full_block_reports.lock().is_empty(),
+            "stale page: zero-create on the FS trigger row"
+        );
+        assert!(fs.cache_service.get(1, "/k", true).unwrap().is_none());
+
+        // s2's first page begins ITS accumulation.
+        fs.block_report(list("s2", 3, vec![cfinal(b1, 64)]), None)
+            .unwrap();
+        {
+            let reports = fs.full_block_reports.lock();
+            let row = reports.get(&1).expect("s2 row");
+            assert_eq!(row.session, "s2");
+            assert_eq!(row.reported_blocks.len(), 1);
+        }
+
+        // Another stale s1 page lands BETWEEN s2's pages: it must not
+        // restart, clear, or advance s2's progress.
+        fs.block_report(list("s1", 3, vec![cfinal(b1, 64)]), None)
+            .unwrap();
+        {
+            let reports = fs.full_block_reports.lock();
+            let row = reports.get(&1).expect("s2 row survives");
+            assert_eq!(row.session, "s2", "stale page did not restart the row");
+            assert_eq!(
+                row.reported_blocks.len(),
+                1,
+                "stale page did not count or clear"
+            );
+        }
+
+        // s2's completing page triggers the reconcile and publishes
+        // exactly s2's snapshot.
+        fs.block_report(list("s2", 3, vec![cfinal(b2, 64), cfinal(b3, 22)]), None)
+            .unwrap();
+        let hit = fs
+            .cache_service
+            .get(1, "/k", true)
+            .unwrap()
+            .expect("s2 report published");
+        assert_eq!(hit.blocks.len(), 3);
+        assert_eq!(hit.blocks[2].block_len, 22);
     }
 
     /// P0-1 (gpt56 `25d4b51e` item 1): an incremental outcome's
