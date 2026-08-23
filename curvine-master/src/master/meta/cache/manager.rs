@@ -30,9 +30,9 @@
 
 use crate::master::meta::block_id::{BlockIdCodec, CacheObjectId};
 use crate::master::meta::cache::entry::{
-    validate_expiry_row, validate_incarnation, CacheEntry, CacheEntryState, ExpiryRow,
-    IncarnationPolicyRow, IncarnationRow, ObjectRow, OpOutcome, OpToken, OutcomeGcGroup,
-    ScopeRemoveVictim, VacuumVictim,
+    key_in_scope, validate_expiry_row, validate_incarnation, CacheEntry, CacheEntryState,
+    ExpiryRow, IncarnationPolicyRow, IncarnationRow, ObjectRow, OpOutcome, OpToken, OutcomeGcGroup,
+    ScopeRemoveVictim, VacuumVictim, MAX_CACHE_KEY_BYTES,
 };
 use crate::master::meta::cache::store::{
     state_tags, validate_page_len, CacheWrite, LocalCacheIndexStore,
@@ -1029,9 +1029,32 @@ impl CacheManager {
     /// Validate a scope-remove page: length bound, strictly ascending keys
     /// (a page of the ordered key scan), adjacent generations, and
     /// cache-domain object ids.
-    fn validate_scope_victims(victims: &[ScopeRemoveVictim]) -> CommonResult<()> {
+    fn validate_scope_victims(scope: &str, victims: &[ScopeRemoveVictim]) -> CommonResult<()> {
         validate_page_len(victims.len()).map_err(cv)?;
+        if scope.len() > MAX_CACHE_KEY_BYTES {
+            return err_box!(
+                "cache scope remove scope exceeds {} bytes: {}",
+                MAX_CACHE_KEY_BYTES,
+                scope.len()
+            );
+        }
         for (i, v) in victims.iter().enumerate() {
+            if v.key.len() > MAX_CACHE_KEY_BYTES {
+                return err_box!(
+                    "cache scope remove victim key exceeds {} bytes: {}",
+                    MAX_CACHE_KEY_BYTES,
+                    v.key.len()
+                );
+            }
+            // Scope membership (review 303fb807 P0-3): a /a scope batch may
+            // never name keys outside /a, whatever the journal claims.
+            if !key_in_scope(&v.key, scope) {
+                return err_box!(
+                    "cache scope remove victim {} is outside scope {}",
+                    v.key,
+                    scope
+                );
+            }
             if v.expected_generation < 1 {
                 return err_box!(
                     "scope remove victim generation must be >= 1: {}",
@@ -1080,7 +1103,7 @@ impl CacheManager {
         if scope.is_empty() {
             return err_box!("cache scope remove scope must be a non-empty prefix path");
         }
-        Self::validate_scope_victims(victims)?;
+        Self::validate_scope_victims(scope, victims)?;
 
         // Apply-time incarnation fence (4b): same terminal semantics as a
         // single-key remove.
@@ -1101,15 +1124,25 @@ impl CacheManager {
                 continue;
             }
             if cur.generation == v.new_generation {
-                if cur.state == CacheEntryState::Tombstoned {
+                // Exact-tombstone-only replay (review 303fb807 P0-3): the
+                // tombstone at the victim's new generation must be THIS
+                // victim's — same object, and a tombstone never carries an
+                // expiry. Any other row at that generation is divergence.
+                if cur.state == CacheEntryState::Tombstoned
+                    && cur.object_id == v.object_id
+                    && cur.expire_at == 0
+                {
                     continue; // already applied
                 }
                 return err_box!(
-                    "cache scope remove replay divergence for ({}, {})@{}: state {:?}",
+                    "cache scope remove replay divergence for ({}, {})@{}: state {:?} object {} expire {} vs victim object {}",
                     incarnation,
                     v.key,
                     v.new_generation,
-                    cur.state
+                    cur.state,
+                    cur.object_id,
+                    cur.expire_at,
+                    v.object_id
                 );
             }
             // Identity CAS at the victim's expected generation: the
@@ -1169,11 +1202,29 @@ impl CacheManager {
     /// Validate a TTL sweep page: length bound, positive deadline, and
     /// strictly ascending frozen `(expire_at, incarnation, object_id)`
     /// positions (a page of the ordered expiry scan).
-    fn validate_ttl_victims(victims: &[ExpiryRow]) -> CommonResult<()> {
+    fn validate_ttl_victims(now: i64, victims: &[ExpiryRow]) -> CommonResult<()> {
         validate_page_len(victims.len()).map_err(cv)?;
         for v in victims {
             validate_expiry_row(v)?;
             validate_incarnation(v.incarnation)?;
+            if v.key.len() > MAX_CACHE_KEY_BYTES {
+                return err_box!(
+                    "ttl sweep victim key exceeds {} bytes: {}",
+                    MAX_CACHE_KEY_BYTES,
+                    v.key.len()
+                );
+            }
+            // Due check (review 303fb807 P0-2): an illegal entry may not
+            // tombstone a future deadline early, regardless of identity.
+            if v.expire_at > now {
+                return err_box!(
+                    "ttl sweep victim ({}, {}) deadline {} is beyond the sweep deadline {}",
+                    v.incarnation,
+                    v.key,
+                    v.expire_at,
+                    now
+                );
+            }
         }
         for i in 1..victims.len() {
             let a = &victims[i - 1];
@@ -1214,7 +1265,7 @@ impl CacheManager {
         if now <= 0 {
             return err_box!("ttl sweep deadline must be positive: {}", now);
         }
-        Self::validate_ttl_victims(victims)?;
+        Self::validate_ttl_victims(now, victims)?;
 
         let mut w = store.cache_write();
         for v in victims {
@@ -1271,10 +1322,26 @@ impl CacheManager {
                     w.put_entry(v.incarnation, &v.key, &new).map_err(cv)?;
                     w.delete_object(v.object_id).map_err(cv)?;
                 }
-                // Missing row, or a later generation already advanced past
-                // the victim: terminal no-op (the expiry row cleanup above
-                // already reclaimed the victim's own index position).
-                _ => continue,
+                // Missing row: terminal no-op (stale victim; the expiry row
+                // cleanup above already reclaimed the victim's own index
+                // position).
+                None => continue,
+                // A later generation already advanced past the victim:
+                // stale terminal no-op.
+                Some(cur) if cur.generation > v.generation => continue,
+                // A victim generation BEYOND the committed row is an
+                // illegal entry (review 303fb807 P0-2): never a legit
+                // race — loud, and the uncommitted batch leaves zero
+                // writes (the staged expiry delete included).
+                Some(cur) => {
+                    return err_box!(
+                        "ttl sweep victim generation {} is beyond the committed row generation {} for ({}, {})",
+                        v.generation,
+                        cur.generation,
+                        v.incarnation,
+                        v.key
+                    )
+                }
             }
         }
         w.commit().map_err(cv)?;
@@ -1286,6 +1353,13 @@ impl CacheManager {
     fn validate_vacuum_victims(victims: &[VacuumVictim]) -> CommonResult<()> {
         validate_page_len(victims.len()).map_err(cv)?;
         for (i, v) in victims.iter().enumerate() {
+            if v.key.len() > MAX_CACHE_KEY_BYTES {
+                return err_box!(
+                    "vacuum victim key exceeds {} bytes: {}",
+                    MAX_CACHE_KEY_BYTES,
+                    v.key.len()
+                );
+            }
             if v.generation < 1 {
                 return err_box!("vacuum victim generation must be >= 1: {}", v.generation);
             }
@@ -2909,7 +2983,7 @@ mod tests {
         // the expiry cleanup stays a no-op and the row is untouched.
         mgr.apply_remove(&store, 1, "/t/c", 1, 2, OBJ + 2).unwrap();
         reopen_committed(&store, &mgr, 1, "/t/c", 2, OBJ + 12, 550, 0);
-        mgr.apply_ttl_sweep(&store, 1500, &[expiry_row(2000, 1, OBJ + 2, "/t/c")])
+        mgr.apply_ttl_sweep(&store, 2500, &[expiry_row(2000, 1, OBJ + 2, "/t/c")])
             .unwrap();
         assert_eq!(
             store
@@ -3430,5 +3504,170 @@ mod tests {
         assert!(!dump_a.contains("O 21 2"));
         assert!(dump_a.contains("O 21 3"));
         assert!(dump_a.contains("W 21 Some(3)"));
+    }
+
+    /// Review `303fb807` P0-3: a scope batch may never name keys outside
+    /// its scope, and the Tombstoned@new_generation replay branch accepts
+    /// ONLY this victim's exact tombstone (same object, no expiry) — a
+    /// forged same-generation tombstone of a different object is loud.
+    #[test]
+    fn test_scope_remove_membership_and_exact_tombstone_replay() {
+        let store = new_store("scope-membership");
+        let mgr = CacheManager::new();
+
+        seed_committed(&store, &mgr, 5, 1, "/a/x", OBJ, 300, 5000);
+        seed_committed(&store, &mgr, 5, 1, "/b/z", OBJ + 1, 400, 6000);
+
+        // Cross-scope victim: loud, zero writes (the /b/z entry and its
+        // expiry row both survive untouched).
+        assert!(mgr
+            .apply_scope_remove(&store, 1, "/a", &[scope_victim("/b/z", 1, OBJ + 1, 6000)])
+            .is_err());
+        assert_eq!(
+            store.cache_get_entry(1, "/b/z").unwrap().unwrap().state,
+            CacheEntryState::Valid
+        );
+        assert_eq!(
+            store.cache_scan_expiry(1_000_000, None, 10).unwrap().len(),
+            2
+        );
+
+        // Real page applies; the row becomes Tombstoned@2 for object OBJ.
+        mgr.apply_scope_remove(&store, 1, "/a", &[scope_victim("/a/x", 1, OBJ, 5000)])
+            .unwrap();
+
+        // Forged replay: same key/generations but a different object at
+        // the tombstone position — loud divergence, zero writes.
+        assert!(mgr
+            .apply_scope_remove(&store, 1, "/a", &[scope_victim("/a/x", 1, OBJ + 9, 5000)])
+            .is_err());
+        let e = store.cache_get_entry(1, "/a/x").unwrap().unwrap();
+        assert_eq!(
+            (e.state, e.generation, e.object_id),
+            (CacheEntryState::Tombstoned, 2, OBJ)
+        );
+
+        // Exact replay stays the idempotent no-op.
+        mgr.apply_scope_remove(&store, 1, "/a", &[scope_victim("/a/x", 1, OBJ, 5000)])
+            .unwrap();
+        assert_eq!(
+            store
+                .cache_get_entry(1, "/a/x")
+                .unwrap()
+                .unwrap()
+                .generation,
+            2
+        );
+    }
+
+    /// Review `303fb807` P0-2: a future deadline may never be swept early,
+    /// and a victim generation BEYOND the committed row is an illegal
+    /// entry — both loud with the whole batch leaving zero writes (the
+    /// staged expiry delete included).
+    #[test]
+    fn test_ttl_sweep_rejects_future_deadline_and_future_generation() {
+        let store = new_store("ttl-illegal");
+        let mgr = CacheManager::new();
+
+        seed_committed(&store, &mgr, 5, 1, "/f/a", OBJ, 300, 1000);
+
+        // Future deadline: reject before any write.
+        assert!(mgr
+            .apply_ttl_sweep(&store, 500, &[expiry_row(1000, 1, OBJ, "/f/a")])
+            .is_err());
+        assert_eq!(
+            store.cache_get_entry(1, "/f/a").unwrap().unwrap().state,
+            CacheEntryState::Valid
+        );
+        assert_eq!(
+            store.cache_scan_expiry(1_000_000, None, 10).unwrap().len(),
+            1
+        );
+
+        // Future-generation victim (gen 5 vs committed gen 1): loud, and
+        // the victim's own expiry row must still be there afterwards.
+        assert!(mgr
+            .apply_ttl_sweep(
+                &store,
+                2000,
+                &[ExpiryRow {
+                    expire_at: 1000,
+                    incarnation: 1,
+                    object_id: OBJ,
+                    key: "/f/a".into(),
+                    generation: 5,
+                }]
+            )
+            .is_err());
+        assert_eq!(
+            store.cache_get_entry(1, "/f/a").unwrap().unwrap().state,
+            CacheEntryState::Valid
+        );
+        let left = store.cache_scan_expiry(1_000_000, None, 10).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!((left[0].key.as_str(), left[0].generation), ("/f/a", 1));
+    }
+
+    /// Review `303fb807` bounded gate: the victim COUNT cap is not a byte
+    /// bound — scope and every victim key are hard-capped at
+    /// `MAX_CACHE_KEY_BYTES` at the apply boundary (4096 passes
+    /// validation as a missing row no-op; 4097 is loud), across all three
+    /// key-carrying variants.
+    #[test]
+    fn test_mutation_key_and_scope_byte_caps() {
+        let store = new_store("byte-caps");
+        let mgr = CacheManager::new();
+
+        let wide_scope = format!("/{}", "a".repeat(MAX_CACHE_KEY_BYTES - 1));
+        assert_eq!(wide_scope.len(), MAX_CACHE_KEY_BYTES);
+        let too_wide_scope = format!("/{}", "a".repeat(MAX_CACHE_KEY_BYTES));
+
+        let key_at_cap = format!("/a/{}", "k".repeat(MAX_CACHE_KEY_BYTES - 3));
+        assert_eq!(key_at_cap.len(), MAX_CACHE_KEY_BYTES);
+        let key_over_cap = format!("/a/{}", "k".repeat(MAX_CACHE_KEY_BYTES - 2));
+
+        // Scope at/over the cap.
+        assert!(mgr
+            .apply_scope_remove(
+                &store,
+                1,
+                &too_wide_scope,
+                &[scope_victim(&wide_scope, 1, OBJ, 0)]
+            )
+            .is_err());
+        // Scope at cap, victim key at cap (the scope's own path, which is
+        // in-scope by definition): legal shape, missing row no-op.
+        mgr.apply_scope_remove(
+            &store,
+            1,
+            &wide_scope,
+            &[scope_victim(&wide_scope, 1, OBJ, 0)],
+        )
+        .unwrap();
+        // Victim key at cap under a normal scope: legal shape no-op;
+        // over the cap: loud.
+        mgr.apply_scope_remove(&store, 1, "/a", &[scope_victim(&key_at_cap, 1, OBJ, 0)])
+            .unwrap();
+        assert!(mgr
+            .apply_scope_remove(&store, 1, "/a", &[scope_victim(&key_over_cap, 1, OBJ, 0)])
+            .is_err());
+
+        // TTL and vacuum victim keys carry the same bound.
+        assert!(mgr
+            .apply_ttl_sweep(
+                &store,
+                1000,
+                &[ExpiryRow {
+                    expire_at: 1,
+                    incarnation: 1,
+                    object_id: OBJ,
+                    key: key_over_cap.clone(),
+                    generation: 1,
+                }]
+            )
+            .is_err());
+        assert!(mgr
+            .apply_vacuum(&store, 1, 5, &[vacuum_victim(&key_over_cap, 1, OBJ, 0)])
+            .is_err());
     }
 }

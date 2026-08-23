@@ -81,7 +81,9 @@ pub const MAX_COMMIT_BLOCKS: usize = 1 << 16;
 pub const MAX_LOCATIONS_PER_BLOCK: usize = 16;
 
 /// Hard cap on the UTF-8 size of a cache key across all cache RPCs.
-pub const MAX_KEY_BYTES: usize = 4096;
+/// References the authoritative meta-layer constant so the service
+/// boundary and every 4c.2 apply path enforce the same byte bound.
+pub const MAX_KEY_BYTES: usize = crate::master::meta::cache::entry::MAX_CACHE_KEY_BYTES;
 
 /// Conservative cap on the serialized byte size of an Allocate response
 /// plan (65536 blocks x 16 workers x variable-length addresses can exceed
@@ -1497,6 +1499,31 @@ impl CacheService {
     // re-invokes with the returned cursor until `done`; per-call work is
     // bounded by `max_pages`. ----
 
+    /// Derive the journaled victims of one raw scope-scan page. Only rows
+    /// that are NOT already Tombstoned produce victims (review
+    /// `303fb807` P0-1): a committed scope-remove leaves `Tombstoned@g+1`
+    /// primary rows in place, so re-deriving from an unchanged cursor
+    /// (leader proposed, response lost, caller retried the same `after`)
+    /// must yield ZERO victims for those rows — the retry journals
+    /// nothing and never inflates the generation again.
+    fn scope_page_victims(page: &[(String, CacheEntry)]) -> CommonResult<Vec<ScopeRemoveVictim>> {
+        page.iter()
+            .filter(|(_, e)| e.state != CacheEntryState::Tombstoned)
+            .map(|(k, e)| {
+                Ok(ScopeRemoveVictim {
+                    key: k.clone(),
+                    expected_generation: e.generation,
+                    new_generation: e
+                        .generation
+                        .checked_add(1)
+                        .ok_or_else(|| cm_err("cache scope remove generation overflow"))?,
+                    object_id: e.object_id,
+                    expire_at: e.expire_at,
+                })
+            })
+            .collect()
+    }
+
     /// Prefix-scope remove (4c.2): page the scope with the 4c.1 scoped
     /// scan, journal one bounded `CacheScopeRemove` batch per page. The
     /// committed apply runs the per-victim exact CAS; this driver only
@@ -1513,6 +1540,13 @@ impl CacheService {
         self.require_leader()?;
         if scope.is_empty() {
             return err_box!("cache scope remove scope must be a non-empty prefix path");
+        }
+        if scope.len() > MAX_KEY_BYTES {
+            return err_box!(
+                "cache scope remove scope exceeds {} bytes: {}",
+                MAX_KEY_BYTES,
+                scope.len()
+            );
         }
         let max_pages = max_pages.clamp(1, MUTATION_MAX_PAGES_PER_CALL);
         if let Some(a) = after {
@@ -1541,34 +1575,29 @@ impl CacheService {
                     processed,
                 });
             }
-            let victims: Vec<ScopeRemoveVictim> = page
-                .iter()
-                .map(|(k, e)| {
-                    Ok(ScopeRemoveVictim {
-                        key: k.clone(),
-                        expected_generation: e.generation,
-                        new_generation: e
-                            .generation
-                            .checked_add(1)
-                            .ok_or_else(|| cm_err("cache scope remove generation overflow"))?,
-                        object_id: e.object_id,
-                        expire_at: e.expire_at,
-                    })
-                })
-                .collect::<CommonResult<_>>()?;
+            // Raw-page cursor + done (a stale page still advances); only
+            // live rows are journaled — an all-tombstone page proposes
+            // nothing and the loop continues (response-loss re-derive
+            // stability, review `303fb807` P0-1).
+            let victims = Self::scope_page_victims(&page)?;
             let last_key = page.last().unwrap().0.clone();
-            let op_id = self.fs_dir.read().next_op_id();
-            let entry = JournalEntry::CacheScopeRemove(CacheScopeRemoveEntry {
-                op_id,
-                rpc_id,
-                incarnation,
-                scope: scope.to_string(),
-                victims,
-            });
-            self.journal_writer
-                .sync_propose_cache(entry)
-                .map_err(fs_err)?;
-            processed += page.len();
+            let journaled = victims.len();
+            if !victims.is_empty() {
+                let op_id = self.fs_dir.read().next_op_id();
+                let entry = JournalEntry::CacheScopeRemove(CacheScopeRemoveEntry {
+                    op_id,
+                    rpc_id,
+                    incarnation,
+                    scope: scope.to_string(),
+                    victims,
+                });
+                self.journal_writer
+                    .sync_propose_cache(entry)
+                    .map_err(fs_err)?;
+            }
+            // Counts journaled victims only: an all-tombstone (already
+            // applied) page journals nothing.
+            processed += journaled;
             cursor = Some(last_key);
             if page.len() < MUTATION_PAGE_CAP {
                 return Ok(ScopeRemoveProgress {
@@ -4340,5 +4369,76 @@ mod tests {
         assert!(disabled.sweep_ttl(7, 1000, None, 4).is_err());
         assert!(disabled.vacuum_incarnation(7, 5, 1, None, 4).is_err());
         assert!(disabled.gc_outcomes(7, None, 4).is_err());
+    }
+
+    /// Review `303fb807` P0-1: after a committed scope-remove page whose
+    /// progress response was lost, the caller retries with the SAME
+    /// cursor. The driver re-scans the same raw page (the tombstone row
+    /// is still there), but re-derivation must yield ZERO victims — no
+    /// second journal entry is proposed and the committed generation
+    /// stays frozen (the manager apply stands in for the committed
+    /// propose; the raft barrier itself fails closed in unit tests).
+    #[test]
+    fn test_scope_remove_response_loss_rederive_stable() {
+        let service = build_service("scope-rederive", chooser(vec![worker(1)]));
+        committed_entry(&service, token(51, 1), token(52, 1), "/a/x", OBJ, 300, 5000);
+
+        let scan = |after: Option<&str>| -> Vec<(String, CacheEntry)> {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            rocks
+                .cache_scan_entries_in_scope(1, "/a", after, 64)
+                .unwrap()
+        };
+
+        // First call: page the raw scope, derive one live victim, and the
+        // propose commits (apply stand-in) — then the response is lost.
+        let page1 = scan(None);
+        assert_eq!(page1.len(), 1);
+        let victims = CacheService::scope_page_victims(&page1).unwrap();
+        assert_eq!(victims.len(), 1);
+        assert_eq!(victims[0].expected_generation, 1);
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            store
+                .cache
+                .apply_scope_remove(rocks, 1, "/a", &victims)
+                .unwrap();
+        }
+        let applied = service
+            .fs_dir
+            .read()
+            .get_rocks_store()
+            .cache_get_entry(1, "/a/x")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (applied.state, applied.generation),
+            (CacheEntryState::Tombstoned, 2)
+        );
+
+        // Retry with the SAME cursor: the raw page still yields the row
+        // (cursor/done stay raw-page semantics), but the tombstone
+        // derives no victim — nothing is journaled again and the
+        // generation does not advance a second time.
+        let retry_page = scan(None);
+        assert_eq!(retry_page.len(), 1);
+        let rederived = CacheService::scope_page_victims(&retry_page).unwrap();
+        assert!(
+            rederived.is_empty(),
+            "response-loss re-derive must not re-journal a tombstone"
+        );
+        let frozen = service
+            .fs_dir
+            .read()
+            .get_rocks_store()
+            .cache_get_entry(1, "/a/x")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (frozen.state, frozen.generation),
+            (CacheEntryState::Tombstoned, 2)
+        );
     }
 }

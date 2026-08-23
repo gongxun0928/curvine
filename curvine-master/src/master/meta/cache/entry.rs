@@ -434,6 +434,14 @@ pub fn key_in_scope(key: &str, scope: &str) -> bool {
 /// every creating store write entry reject values outside `1..=` this.
 pub const MAX_ALLOCATABLE_INCARNATION: u64 = u64::MAX - 1;
 
+/// Hard cap on the UTF-8 byte size of a cache key (and a scope-remove
+/// scope prefix) enforced at BOTH the service boundary and every 4c.2
+/// bounded-mutation apply path: the per-page victim COUNT cap
+/// (`MUTATION_PAGE_CAP`) alone is not a byte bound — unbounded key
+/// strings would let one journal entry carry an unbounded payload
+/// (review `303fb807`, bounded gate).
+pub const MAX_CACHE_KEY_BYTES: usize = 4096;
+
 /// Validate an incarnation before it is persisted by any creating write
 /// (entry rows, reverse rows, expiry rows, incarnation rows, mount
 /// pointers). Deletes of corrupt rows remain allowed.
