@@ -1373,6 +1373,50 @@ impl MasterFilesystem {
         self.cache_service.retire_worker_session(worker_id, session);
     }
 
+    /// 4d.2 round-4 (gpt56 `36f4e28b` P0-1): the CONTIGUOUS lost-worker
+    /// transition — the WM expired removal AND the exact cache-session
+    /// retire (accumulator + volatile domains) complete inside ONE
+    /// `start_gate` hold, with the WM write guard held throughout, so an
+    /// incremental-report outcome's tag recheck and its WM/ack side
+    /// effects are linearized against the WHOLE transition (either the
+    /// transition wins first and the outcome's recheck sees the tag gone,
+    /// or the outcome wins first and the transition blocks on the gate
+    /// until the side effects land). The caller's expiry scan ran under
+    /// an earlier gate hold, so the row is re-verified here: it must
+    /// still be the exact session the scan flagged AND still be expired
+    /// — a Start/Running that re-registered in between survives
+    /// untouched. Only the long FS location cleanup + replication report
+    /// are left async by the caller. Returns the removed worker on an
+    /// actual removal.
+    pub fn lost_worker_transition(
+        &self,
+        worker_id: u32,
+        session: &str,
+        lost_ms: u64,
+    ) -> Option<WorkerInfo> {
+        let _gate = self.start_gate.lock();
+        let mut wm = self.worker_manager.write();
+        // Exact-row re-verification: session mismatch = the flagged row
+        // was already superseded (Start + Running re-registration).
+        let row = wm.get_worker(worker_id)?;
+        if row.worker_session_id != session {
+            return None;
+        }
+        // Expiry re-verification under the gate: a fresh Running beat
+        // since the scan refreshes last_update and must survive.
+        if LocalTime::mills() <= row.last_update + lost_ms {
+            return None;
+        }
+        let worker = wm.remove_expired_worker(worker_id)?;
+        // Inline retire INSIDE the same gate hold (round-4 P0-1): the
+        // session snapshot comes from the row just removed, so the cache
+        // registry retire is exact — a worker that restarted in between
+        // keeps its new session untouched (retire_worker_session no-ops
+        // on a session mismatch).
+        self.end_worker_session(worker_id, &worker.worker_session_id);
+        Some(worker)
+    }
+
     fn invalidate_full_block_report_session(&self, worker_id: u32) {
         let now = LocalTime::mills();
         let mut reports = self.full_block_reports.lock();
@@ -2544,21 +2588,26 @@ mod tests {
         assert!(fs.cache_service.live_contains(1, obj, 2));
     }
 
-    /// Round-3 P0-1 (gpt56 `f5980e03` + `48dec504`): the lost-worker
-    /// transition (WM removal + exact cache retire) and the fenced
-    /// outcome apply share one `start_gate`, so they are LINEARIZED —
-    /// dual-branch deterministic matrix:
+    /// Round-4 P0-1 (gpt56 `36f4e28b`): the lost-worker transition runs
+    /// as ONE contiguous production primitive (`lost_worker_transition`
+    /// — WM expired removal + exact cache retire inside a single
+    /// `start_gate` hold), so it and the fenced outcome apply are
+    /// LINEARIZED. Real threads cover BOTH winners:
     ///
-    /// - lost-wins: the outcome's decision exists but has not taken the
-    ///   gate; lost completes the exact retire first; the apply's tag
-    ///   recheck then sees the registry gone and drops the outcome with
-    ///   zero WM/ack side effects.
-    /// - outcome-wins: the apply holds the gate and has passed the
-    ///   recheck; a lost transition arriving in that window must BLOCK
-    ///   on the gate (proved via `try_lock` failing at the seam); the
-    ///   side effects land; only then can the retire proceed.
+    /// - lost-wins: a real thread runs the production primitive to
+    ///   completion BEFORE the apply takes the gate; the apply's tag
+    ///   recheck sees the registry gone and drops the outcome with zero
+    ///   WM/ack side effects.
+    /// - outcome-wins: the apply (main thread) holds the gate and has
+    ///   passed the recheck when a real thread enters the primitive;
+    ///   the thread BLOCKS on the gate (proved: it has not finished
+    ///   while the hook holds the gate); the side effects land; only
+    ///   after the apply releases the gate does the primitive complete.
+    /// - re-verification: the primitive refuses a row whose session no
+    ///   longer matches the scan's snapshot, and refuses a row that is
+    ///   no longer expired — nothing is removed on either refusal.
     #[test]
-    fn test_4d2_r3_lost_fence_dual_branch() {
+    fn test_4d2_r4_lost_fence_dual_branch_contiguous() {
         use curvine_model::{HeartbeatStatus, WorkerCommand};
 
         // Shared scaffold: fs with a Leader monitor, worker 1 session
@@ -2630,9 +2679,36 @@ mod tests {
             (fs, conf, addr, b1)
         };
 
-        // -- Branch A (lost-wins): retire precedes the gated apply. --
+        // Installs the WM row for worker 1 under session `session` (the
+        // Running heartbeat arm), so the production lost primitive has a
+        // row to re-verify against.
+        let insert_row =
+            |fs: &MasterFilesystem, cluster_id: &str, addr: &WorkerAddress, session: &str| {
+                fs.worker_manager
+                    .write()
+                    .heartbeat(
+                        cluster_id,
+                        HeartbeatStatus::Running,
+                        addr.clone(),
+                        1,
+                        session.to_string(),
+                        Default::default(),
+                        String::new(),
+                        0,
+                        vec![],
+                        None,
+                    )
+                    .unwrap();
+                // The primitive re-verifies `now > last_update + lost_ms`
+                // with lost_ms = 0 — guarantee the millisecond has ticked.
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            };
+
+        // -- Branch A (lost-wins): a REAL thread runs the production
+        // primitive to completion before the apply takes the gate. --
         let (fs, conf, addr, b1) = build("a");
         let cluster_id = conf.cluster_id.clone();
+        insert_row(&fs, &cluster_id, &addr, "s1");
         let stale = fs
             .cache_service
             .incr_block_report(
@@ -2648,10 +2724,16 @@ mod tests {
             .unwrap();
         assert_eq!(stale.remove_blocks.clone(), vec![b1]);
 
-        // The lost-worker exact retire completes before the outcome
-        // takes the gate (the checker path holds start_gate for its
-        // whole transition; here it has already finished).
-        fs.end_worker_session(1, "s1");
+        // The contiguous lost transition (WM removal + exact cache
+        // retire under ONE gate hold) completes on a separate thread
+        // before the outcome reaches the gate.
+        let fs_a = fs.clone();
+        let lost_a = std::thread::spawn(move || fs_a.lost_worker_transition(1, "s1", 0));
+        let removed_worker = lost_a.join().unwrap();
+        assert!(
+            removed_worker.is_some(),
+            "contiguous primitive removed the row"
+        );
         assert!(
             fs.cache_service.cache_session_tag(1).is_none(),
             "lost retire removed the registry row"
@@ -2686,9 +2768,13 @@ mod tests {
             "lost-wins: stale outcome must have zero WM side effects"
         );
 
-        // -- Branch B (outcome-wins): the apply is inside the gate past
-        // the recheck when lost arrives; lost must BLOCK. --
+        // -- Branch B (outcome-wins): the apply (main thread) is inside
+        // the gate past the recheck when a REAL thread enters the
+        // production primitive; the primitive must BLOCK on the gate
+        // until the side effects land. --
         let (fs, conf, addr, b1) = build("b");
+        let cluster_id = conf.cluster_id.clone();
+        insert_row(&fs, &cluster_id, &addr, "s1");
         let fresh = fs
             .cache_service
             .incr_block_report(
@@ -2706,26 +2792,51 @@ mod tests {
         let fresh_tag = fresh.session_tag;
 
         // The seam fires between the passed recheck and the WM side
-        // effects, with start_gate and the WM write guard held. A lost
-        // transition in that window can only BLOCK on the gate — its
-        // try_lock must fail — and the registry tag cannot have swapped
-        // mid-apply.
+        // effects, with start_gate and the WM write guard held. Inside
+        // the seam a real thread enters `lost_worker_transition` — it
+        // can only BLOCK on the gate. It must NOT have finished while
+        // the apply still holds the gate.
         let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let lost_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let lost_handle: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
         {
             let fired = fired.clone();
-            let fs_probe = fs.clone();
+            let lost_done = lost_done.clone();
+            let lost_handle = lost_handle.clone();
+            let fs_lost = fs.clone();
             *crate::master::master_handler::INCR_OUTCOME_SEAM
                 .lock()
                 .unwrap() = Some(Box::new(move || {
                 fired.store(true, std::sync::atomic::Ordering::SeqCst);
                 assert!(
-                    fs_probe.start_gate.try_lock().is_none(),
-                    "outcome-wins: lost transition must block on the gate"
+                    fs_lost.start_gate.try_lock().is_none(),
+                    "outcome-wins: the apply holds the transition gate"
                 );
                 assert_eq!(
-                    fs_probe.cache_service.cache_session_tag(1),
+                    fs_lost.cache_service.cache_session_tag(1),
                     Some(fresh_tag),
                     "no session swap between recheck and side effects"
+                );
+                // Real thread through the production primitive — the
+                // same contiguous code path the heartbeat checker runs.
+                let fs_t = fs_lost.clone();
+                let lost_done_t = lost_done.clone();
+                *lost_handle.lock().unwrap() = Some(std::thread::spawn(move || {
+                    let removed = fs_t.lost_worker_transition(1, "s1", 0);
+                    assert!(
+                        removed.is_some(),
+                        "blocked transition completes once the gate frees"
+                    );
+                    lost_done_t.store(true, std::sync::atomic::Ordering::SeqCst);
+                }));
+                // The blocked primitive cannot finish while the apply
+                // still holds the gate (generous window: it would only
+                // need microseconds to run if the gate were free).
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                assert!(
+                    !lost_done.load(std::sync::atomic::Ordering::SeqCst),
+                    "lost transition must BLOCK on the gate until the apply completes"
                 );
             }));
         }
@@ -2734,10 +2845,17 @@ mod tests {
             .lock()
             .unwrap() = None;
         assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
+        let handle = lost_handle.lock().unwrap().take().unwrap();
+        handle.join().unwrap();
+        assert!(
+            lost_done.load(std::sync::atomic::Ordering::SeqCst),
+            "the primitive completed after the apply released the gate"
+        );
 
-        // The side effects landed under the still-live tag: b1 reached
-        // the BlockMap delete queue (heartbeat re-delivers pending).
-        assert_eq!(fs.cache_service.cache_session_tag(1), Some(fresh_tag));
+        // The side effects landed under the still-live tag BEFORE the
+        // retire could proceed: b1 reached the BlockMap delete queue
+        // (heartbeat re-delivers pending)...
+        assert_eq!(fs.cache_service.cache_session_tag(1), None);
         let cmds = fs
             .worker_manager
             .write()
@@ -2761,9 +2879,27 @@ mod tests {
         }
         assert_eq!(queued, vec![b1], "outcome-wins: side effects completed");
 
-        // ...and only THEN can the lost retire proceed (the gate is
-        // free again — the checker path would now run to completion).
-        fs.end_worker_session(1, "s1");
+        // -- Branch C (re-verification): the primitive refuses a
+        // superseded or no-longer-expired row — nothing is removed. --
+        let (fs, _conf, addr, _b1) = build("c");
+        let cluster_id = _conf.cluster_id.clone();
+        insert_row(&fs, &cluster_id, &addr, "s1");
+
+        // Session mismatch (the scan's snapshot is stale — a Start +
+        // Running re-registered in between): refused, row survives.
+        assert!(fs.lost_worker_transition(1, "s0", 0).is_none());
+        assert!(fs.worker_manager.read().get_worker(1).is_some());
+        assert!(fs.cache_service.cache_session_tag(1).is_some());
+
+        // No longer expired (lost_ms far in the future): refused, row
+        // survives, registry untouched.
+        assert!(fs.lost_worker_transition(1, "s1", 10_000).is_none());
+        assert!(fs.worker_manager.read().get_worker(1).is_some());
+        assert!(fs.cache_service.cache_session_tag(1).is_some());
+
+        // The exact, still-expired row: removed and retired.
+        assert!(fs.lost_worker_transition(1, "s1", 0).is_some());
+        assert!(fs.worker_manager.read().get_worker(1).is_none());
         assert!(fs.cache_service.cache_session_tag(1).is_none());
     }
 }

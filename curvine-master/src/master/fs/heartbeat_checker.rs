@@ -64,18 +64,13 @@ impl LoopTask for HeartbeatChecker {
         }
 
         let mut blacklisted_workers = Vec::new();
-        let mut removed_workers = Vec::new();
+        // 4d.2 round-4 (gpt56 `36f4e28b` P0-1): the scan only FLAGS
+        // candidates; the actual removal + cache retire run inside the
+        // contiguous `lost_worker_transition` primitive (ONE start_gate
+        // hold), so the session snapshot below is only the exactness
+        // token the primitive re-verifies under the gate.
+        let mut lost_candidates = Vec::new();
         {
-            // 4d.2 round-3 (gpt56 `f5980e03` P0-1): the lost-worker
-            // transition — WM expired removal below and the exact cache
-            // retire in the spawned task — shares the outcome apply's
-            // transition gate (`start_gate`), so an incremental-report
-            // outcome's tag recheck and its WM/ack side effects are
-            // linearized against the retire: either the retire wins first
-            // (the outcome's recheck sees the tag gone and drops it) or
-            // the apply wins first (the retire blocks until the side
-            // effects land). Lock order matches the heartbeat path
-            // (start_gate → WM write).
             let _gate = self.fs.start_gate.lock();
             let mut wm = self.fs.worker_manager.write();
             let workers = wm.get_last_heartbeat();
@@ -90,18 +85,15 @@ impl LoopTask for HeartbeatChecker {
                 }
 
                 if now > last_update + self.worker_lost_ms {
-                    // Heartbeat timeout
-                    if let Some(worker) = wm.remove_expired_worker(id) {
-                        // 4d (R9-2): snapshot the worker's wire session id
-                        // BEFORE the WorkerInfo is discarded, so the async
-                        // cleanup can retire the CACHE session exactly — a
-                        // worker that restarted in between keeps its new
-                        // session untouched.
-                        removed_workers.push((
+                    // Heartbeat timeout — flag for the contiguous
+                    // transition below. The session is snapshotted under
+                    // this gate hold; the primitive re-verifies it.
+                    if let Some(worker) = wm.get_worker(id) {
+                        lost_candidates.push((
                             id,
-                            worker.address,
+                            worker.address.clone(),
                             worker.last_update,
-                            worker.worker_session_id,
+                            worker.worker_session_id.clone(),
                         ));
                     }
                 }
@@ -115,31 +107,33 @@ impl LoopTask for HeartbeatChecker {
             );
         }
 
-        for (id, address, last_update, worker_session_id) in removed_workers {
+        for (id, _scan_address, _scan_last_update, worker_session_id) in lost_candidates {
+            // 4d.2 round-4 (gpt56 `36f4e28b` P0-1): the CONTIGUOUS
+            // lost-worker transition — WM expired removal + exact cache
+            // accumulator/volatile retire inside ONE gate hold. The
+            // primitive re-verifies the row (exact session + still
+            // expired), so a re-registration between this scan and the
+            // transition survives untouched. Returns None = superseded,
+            // nothing removed.
+            let worker =
+                match self
+                    .fs
+                    .lost_worker_transition(id, &worker_session_id, self.worker_lost_ms)
+                {
+                    Some(worker) => worker,
+                    None => continue,
+                };
             warn!(
                 "Worker {} ({}) last heartbeat {} has exceeded lost timeout {} ms and will be removed",
-                id, address, last_update, self.worker_lost_ms
+                id, worker.address, worker.last_update, self.worker_lost_ms
             );
-            // Asynchronously delete all block location data.
+            // Only the long FS location cleanup + replication report are
+            // async — the transition critical section is already complete,
+            // so this (possibly long) delete never stretches it.
             let fs = self.fs.clone();
             let rm = self.replication_manager.clone();
             let res = self.executor.spawn(move || {
                 let spend = TimeSpent::new();
-                // 4d (R9-2): retire the lost worker's CACHE session
-                // first and exactly — the volatile registry callback
-                // verifies the recorded session still matches before
-                // moving the live reverse set to the retired drain; a
-                // Start that landed in between makes this a no-op.
-                // Round-3 P0-1: the retire takes the same transition
-                // gate as the fenced outcome apply, closing the
-                // recheck→side-effect window against a concurrent
-                // incremental-report outcome. The gate is dropped before
-                // the FS location cleanup so the (possibly long) delete
-                // never stretches the transition critical section.
-                {
-                    let _gate = fs.start_gate.lock();
-                    fs.end_worker_session(id, &worker_session_id);
-                }
                 let cleanup = match fs.delete_locations(id) {
                     Err(e) => {
                         warn!("{}", curvine_core_error::err_msg!(e));

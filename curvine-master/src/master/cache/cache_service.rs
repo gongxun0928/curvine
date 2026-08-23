@@ -82,7 +82,7 @@ use curvine_core_error::{err_box, err_msg, CommonError, CommonResult};
 use curvine_model::{BlockReportInfo, BlockReportStatus, StorageType, WorkerAddress};
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::sync::ArcRwLock;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 /// Object ids per durable reserve segment. Reserves are rare (one per
@@ -354,10 +354,14 @@ impl CacheGcQueue {
 /// End/lost-worker retired it session-exactly). Drained boundedly from
 /// the queue front. RC2-round2 shape (gpt56 `25d4b51e` P0-2): entries
 /// are object-keyed (`object_id → seqs`) so removing a whole object's
-/// trace is one O(1) map drop — never a seq materialization.
+/// trace is one map drop — never a seq materialization. Round-4 shape
+/// (gpt56 `36f4e28b` P0-2): the entries are ORDERED (`BTreeMap`/
+/// `BTreeSet`) so the drain advances by first-entry/pop-first with an
+/// explicit per-slot budget — a HashMap iterator's worst-case
+/// O(capacity) traversal can never re-walk a sparse map head.
 struct RetiredSession {
     tag: u64,
-    entries: HashMap<i64, HashSet<i64>>,
+    entries: BTreeMap<i64, BTreeSet<i64>>,
 }
 
 impl RetiredSession {
@@ -372,13 +376,15 @@ impl RetiredSession {
 /// 4d (R8-2): per-worker reverse view of the published locations.
 /// `live` holds the block identities published under the worker's
 /// CURRENT session tag; a Start moves live into a retired session
-/// record in O(1) instead of swapping hash sets. RC2-round2 shape: the
+/// record in O(1) instead of swapping sets. RC2-round2 shape: the
 /// live set is object-keyed (`object_id → seqs`) so an object-level
-/// drop is one O(1) map removal per holder — the pre-P0-2 flat
-/// `(object_id, seq)` set forced a full identity walk.
+/// drop is one map removal per holder — the pre-P0-2 flat
+/// `(object_id, seq)` set forced a full identity walk. Round-4 (gpt56
+/// `36f4e28b` P0-2): same ordered shape as `RetiredSession` so the
+/// retire stays a pure O(1) move into the drained structure.
 #[derive(Default)]
 struct WorkerRev {
-    live: HashMap<i64, HashSet<i64>>,
+    live: BTreeMap<i64, BTreeSet<i64>>,
     retired: VecDeque<RetiredSession>,
 }
 
@@ -404,7 +410,7 @@ impl WorkerRev {
     }
 
     /// Remove ONE identity, dropping the object row once the worker
-    /// holds none of its blocks (bounded hygiene, O(1)).
+    /// holds none of its blocks (bounded hygiene, O(log n)).
     fn live_remove_identity(&mut self, object_id: i64, seq: i64) {
         if let Some(seqs) = self.live.get_mut(&object_id) {
             seqs.remove(&seq);
@@ -785,7 +791,7 @@ impl CacheVolatile {
         }
     }
 
-    /// 4d.2 (R8-2/R9-1, RC3 fairness, round-3 bounded form): bounded
+    /// 4d.2 (R8-2/R9-1, RC3 fairness, round-4 bounded form): bounded
     /// METADATA-ONLY drain of retired-session reverse entries. For each
     /// retired `(object_id, seq)` identity the holding worker's replica
     /// row is removed from the published locations — the current-tag
@@ -799,12 +805,13 @@ impl CacheVolatile {
     /// the back while unfinished, so one worker's large queue can never
     /// starve another's. A record stays at the front of its deque until
     /// fully visited. Round-3 (gpt56 `f5980e03` P0-2): the visit NEVER
-    /// pre-counts the front record (`entries_total()` walked every
-    /// object row — a million single-seq objects made one 256-identity
-    /// tick O(million)); `take` is now `min(budget, quantum)` consumed
-    /// lazily through the flat-map iterator, and popping a degenerate
-    /// EMPTY record costs one budget unit so a long empty history
-    /// cannot be walked for free in a single tick.
+    /// pre-counts the front record, and popping a degenerate EMPTY
+    /// record costs one budget unit. Round-4 (gpt56 `36f4e28b` P0-2):
+    /// the visit POPS identities ordered — `iter_mut().next()` /
+    /// `BTreeSet::pop_first()` on the first entry — so every consumed
+    /// budget unit is a concrete removal and the traversal NEVER
+    /// restarts from a sparse map head (a HashMap iterator's worst-case
+    /// O(capacity) scan is structurally impossible here).
     fn drain_retired(&mut self) -> usize {
         let mut budget = RETIRED_DRAIN_PER_TICK;
         let mut removed = 0usize;
@@ -812,12 +819,12 @@ impl CacheVolatile {
             let Some(worker_id) = self.retired_rr.front().copied() else {
                 break;
             };
-            // Snapshot what this visit drains (tag + identities) without
-            // holding the WorkerRev borrow across the locations mutation.
-            // Leading empty records (which the live-only object drop can
-            // leave behind) are popped at one budget unit each — bounded
-            // deque traversal even for degenerate histories.
-            let snapshot: Option<(u64, Vec<(i64, i64)>)> = {
+            // Pop this visit's identities (tag + drained) without holding
+            // the WorkerRev borrow across the locations mutation. Leading
+            // empty records (which the live-only object drop can leave
+            // behind) are popped at one budget unit each — bounded deque
+            // traversal even for degenerate histories.
+            let popped: Option<(u64, Vec<(i64, i64)>)> = {
                 let Some(rev) = self.by_worker.get_mut(&worker_id) else {
                     self.retired_rr.pop_front();
                     self.retired_rr_set.remove(&worker_id);
@@ -834,20 +841,34 @@ impl CacheVolatile {
                             }
                         }
                         Some(front) => {
-                            let take = budget.min(RETIRED_DRAIN_QUANTUM);
+                            // Round-4 P0-2: ordered pop-first drain. Each
+                            // iteration removes exactly one identity from
+                            // the record's first non-empty entry (and the
+                            // emptied object key with it); the visit stops
+                            // at the quantum/budget cap. No iteration
+                            // scouts ahead, so every consumed unit of
+                            // budget is one popped slot.
+                            let visit_cap = budget.min(RETIRED_DRAIN_QUANTUM);
                             let tag = front.tag;
-                            let drained: Vec<(i64, i64)> = front
-                                .entries
-                                .iter()
-                                .flat_map(|(obj, seqs)| seqs.iter().map(move |s| (*obj, *s)))
-                                .take(take)
-                                .collect();
+                            let mut drained: Vec<(i64, i64)> = Vec::with_capacity(visit_cap);
+                            while drained.len() < visit_cap {
+                                let Some((&object_id, seqs)) = front.entries.iter_mut().next()
+                                else {
+                                    break;
+                                };
+                                if let Some(seq) = seqs.pop_first() {
+                                    drained.push((object_id, seq));
+                                }
+                                if seqs.is_empty() {
+                                    front.entries.remove(&object_id);
+                                }
+                            }
                             break Some((tag, drained));
                         }
                     }
                 }
             };
-            let Some((front_tag, drained)) = snapshot else {
+            let Some((front_tag, drained)) = popped else {
                 // No non-empty record was reachable within this tick's
                 // budget. Dequeue the worker when its retired deque is
                 // fully empty; otherwise rotate it so the remainder is
@@ -866,16 +887,6 @@ impl CacheVolatile {
             };
             let take = drained.len();
             for (object_id, seq) in drained {
-                if let Some(rev) = self.by_worker.get_mut(&worker_id) {
-                    if let Some(front) = rev.retired.front_mut() {
-                        if let Some(seqs) = front.entries.get_mut(&object_id) {
-                            seqs.remove(&seq);
-                            if seqs.is_empty() {
-                                front.entries.remove(&object_id);
-                            }
-                        }
-                    }
-                }
                 if let Some(locs) = self.locations.get_mut(&object_id) {
                     if let Some(replicas) = locs.blocks.get_mut(&seq) {
                         // R7-3 conditional remove: only the retired
@@ -8794,7 +8805,7 @@ mod tests {
             block_size: 64,
             blocks: HashMap::new(),
         };
-        let mut entries: HashMap<i64, HashSet<i64>> = HashMap::new();
+        let mut entries: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
         for seq in 1..=total {
             locs.blocks.insert(
                 seq as i64,
@@ -8809,7 +8820,7 @@ mod tests {
         volatile.by_worker.insert(
             7,
             WorkerRev {
-                live: HashMap::new(),
+                live: BTreeMap::new(),
                 retired: VecDeque::from([RetiredSession { tag: 7, entries }]),
             },
         );
@@ -9172,12 +9183,12 @@ mod tests {
         volatile.locations.insert(OBJ + 1, small_locs);
         {
             let rev = volatile.by_worker.entry(7).or_default();
-            let seqs: HashSet<i64> = (1..=big).map(|seq| seq as i64).collect();
+            let seqs: BTreeSet<i64> = (1..=big).map(|seq| seq as i64).collect();
             rev.live.insert(OBJ, seqs);
         }
         {
             let rev = volatile.by_worker.entry(8).or_default();
-            let seqs: HashSet<i64> = (1..=3).map(|seq| seq as i64).collect();
+            let seqs: BTreeSet<i64> = (1..=3).map(|seq| seq as i64).collect();
             rev.live.insert(OBJ + 1, seqs);
         }
         volatile.retire_live(7, 7);
@@ -9342,10 +9353,10 @@ mod tests {
             for _ in 0..EMPTY_RECORDS {
                 rev.retired.push_back(RetiredSession {
                     tag: 1,
-                    entries: HashMap::new(),
+                    entries: BTreeMap::new(),
                 });
             }
-            let mut tail: HashMap<i64, HashSet<i64>> = HashMap::new();
+            let mut tail: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
             tail.entry(OBJ).or_default().insert(1);
             rev.retired.push_back(RetiredSession {
                 tag: 1,
@@ -9378,26 +9389,77 @@ mod tests {
 
         // -- Part 2: many-object single-seq front record — the visit
         // takes min(budget, quantum) identities per worker turn without
-        // counting the whole record first. --
+        // counting the whole record first. Round-4 (gpt56 `36f4e28b`
+        // P0-2): the drain advances by POP (first-entry / pop-first), so
+        // every consumed budget unit is a concrete slot removal — the
+        // object-key count of the record shrinks by EXACTLY the number
+        // of identities drained per tick (a scouting-then-restart
+        // traversal could not guarantee that against a shrinking
+        // structure). --
         let mut volatile = CacheVolatile::default();
         const OBJS: i64 = 3000;
         {
             let rev = volatile.by_worker.entry(9).or_default();
-            let mut entries = HashMap::new();
+            let mut entries = BTreeMap::new();
             for o in 0..OBJS {
                 entries
                     .entry(OBJ + o)
-                    .or_insert_with(HashSet::new)
+                    .or_insert_with(BTreeSet::new)
                     .insert(1);
             }
             rev.retired.push_back(RetiredSession { tag: 1, entries });
         }
         volatile.retired_rr.push_back(9);
         volatile.retired_rr_set.insert(9);
+        let keys_before = volatile.by_worker[&9].retired[0].entries.len();
         let removed = volatile.drain_retired();
         assert_eq!(removed, RETIRED_DRAIN_PER_TICK);
         let left = volatile.by_worker[&9].retired[0].entries_total();
         assert_eq!(left, (OBJS as usize) - RETIRED_DRAIN_PER_TICK);
+        // Visited-slot accounting: single-seq-per-object keys removed ==
+        // identities drained — each budget unit popped one slot.
+        let keys_after = volatile.by_worker[&9].retired[0].entries.len();
+        assert_eq!(
+            keys_before - keys_after,
+            removed,
+            "per-tick object-key removals must equal identities drained"
+        );
+        // Later ticks drain the remainder the same way — every tick pops
+        // exactly what it budgets, until the record is gone.
+        let mut ticks = 0;
+        loop {
+            if volatile.by_worker[&9].retired.is_empty() {
+                break;
+            }
+            let front = volatile.by_worker[&9].retired.front().unwrap();
+            if front.entries.is_empty() {
+                break;
+            }
+            let keys_before = front.entries.len();
+            let removed_n = volatile.drain_retired();
+            let keys_after = volatile.by_worker[&9]
+                .retired
+                .front()
+                .map(|r| r.entries.len())
+                .unwrap_or(0);
+            assert_eq!(
+                keys_before - keys_after,
+                removed_n,
+                "each tick pops exactly what it budgets"
+            );
+            ticks += 1;
+            assert!(ticks < 10, "drain must converge");
+        }
+        assert!(volatile.by_worker[&9]
+            .retired
+            .iter()
+            .all(|r| r.entries.is_empty()));
+        volatile.drain_retired();
+        assert!(
+            volatile.by_worker[&9].retired.is_empty(),
+            "fully drained record is popped"
+        );
+        assert!(!volatile.retired_rr_set.contains(&9));
     }
 
     /// Round-3 P0-3 (gpt56 `f5980e03` item 3): `drop_object_state` is
@@ -9413,10 +9475,10 @@ mod tests {
         volatile.location_holders.insert(OBJ, HashSet::from([1]));
         {
             let rev = volatile.by_worker.entry(1).or_default();
-            rev.live.insert(OBJ, HashSet::from([1, 2, 3]));
+            rev.live.insert(OBJ, BTreeSet::from([1, 2, 3]));
             for gen in 0..GENERATIONS {
-                let mut entries = HashMap::new();
-                entries.insert(OBJ, HashSet::from([1, 2, 3]));
+                let mut entries = BTreeMap::new();
+                entries.insert(OBJ, BTreeSet::from([1, 2, 3]));
                 rev.retired.push_back(RetiredSession {
                     tag: 10 + gen as u64,
                     entries,
