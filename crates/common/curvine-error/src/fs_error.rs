@@ -73,6 +73,7 @@ pub enum ErrorKind {
     TransferStoreUnavailable = 34,
     TransferAlreadyRunning = 35,
     TransferTargetConflict = 36,
+    CacheIncarnationFenced = 37,
 
     #[num_enum(default)]
     Common = 10000,
@@ -226,6 +227,14 @@ pub enum FsError {
     #[error("{0}")]
     TransferTargetConflict(ErrorImpl<StringError>),
 
+    // The cache mount incarnation named by the request is revoked or stale
+    // (a newer incarnation owns the mount). Terminal for that incarnation:
+    // the client must re-resolve the mount and use a fresh incarnation.
+    // Typed on the wire (unlike Common) so cache clients can branch on the
+    // kind instead of parsing the message string.
+    #[error("{0}")]
+    CacheIncarnationFenced(ErrorImpl<StringError>),
+
     // Other errors that are not defined.
     #[error("{0}")]
     Common(ErrorImpl<StringError>),
@@ -310,6 +319,14 @@ impl FsError {
 
     pub fn transfer_target_conflict(msg: impl Into<String>) -> Self {
         Self::TransferTargetConflict(ErrorImpl::with_source(msg.into().into()))
+    }
+
+    pub fn cache_incarnation_fenced(incarnation: u64) -> Self {
+        let msg = format!(
+            "cache incarnation {} is revoked or stale: terminal, the mount namespace moved on (re-resolve the mount)",
+            incarnation
+        );
+        Self::CacheIncarnationFenced(ErrorImpl::with_source(msg.into()))
     }
 
     pub fn file_exists(path: impl AsRef<str>) -> Self {
@@ -456,6 +473,7 @@ impl FsError {
             FsError::TransferStoreUnavailable(_) => ErrorKind::TransferStoreUnavailable,
             FsError::TransferAlreadyRunning(_) => ErrorKind::TransferAlreadyRunning,
             FsError::TransferTargetConflict(_) => ErrorKind::TransferTargetConflict,
+            FsError::CacheIncarnationFenced(_) => ErrorKind::CacheIncarnationFenced,
             FsError::Common(_) => ErrorKind::Common,
         }
     }
@@ -473,7 +491,15 @@ impl From<String> for FsError {
 
 impl From<CommonError> for FsError {
     fn from(value: CommonError) -> Self {
-        FsError::Common(ErrorImpl::with_source(value.into()))
+        // Service layers return CommonResult (Box<dyn Error>). A typed
+        // FsError boxed inside must keep its kind across the handler `?`
+        // boundary so the wire encode carries the machine-recognizable
+        // ErrorKind (e.g. CacheIncarnationFenced) instead of flattening
+        // everything to Common. Anything else is still a plain Common.
+        match value.downcast::<FsError>() {
+            Ok(typed) => *typed,
+            Err(value) => FsError::Common(ErrorImpl::with_source(value.into())),
+        }
     }
 }
 
@@ -604,6 +630,7 @@ impl ErrorExt for FsError {
             FsError::TransferStoreUnavailable(e) => FsError::TransferStoreUnavailable(e.ctx(ctx)),
             FsError::TransferAlreadyRunning(e) => FsError::TransferAlreadyRunning(e.ctx(ctx)),
             FsError::TransferTargetConflict(e) => FsError::TransferTargetConflict(e.ctx(ctx)),
+            FsError::CacheIncarnationFenced(e) => FsError::CacheIncarnationFenced(e.ctx(ctx)),
             FsError::Common(e) => FsError::Common(e.ctx(ctx)),
         }
     }
@@ -646,6 +673,7 @@ impl ErrorExt for FsError {
             FsError::TransferStoreUnavailable(e) => e.encode(ErrorKind::TransferStoreUnavailable),
             FsError::TransferAlreadyRunning(e) => e.encode(ErrorKind::TransferAlreadyRunning),
             FsError::TransferTargetConflict(e) => e.encode(ErrorKind::TransferTargetConflict),
+            FsError::CacheIncarnationFenced(e) => e.encode(ErrorKind::CacheIncarnationFenced),
             FsError::Common(e) => e.encode(ErrorKind::Common),
         }
     }
@@ -693,6 +721,7 @@ impl ErrorExt for FsError {
             }
             ErrorKind::TransferAlreadyRunning => FsError::TransferAlreadyRunning(de.into_string()),
             ErrorKind::TransferTargetConflict => FsError::TransferTargetConflict(de.into_string()),
+            ErrorKind::CacheIncarnationFenced => FsError::CacheIncarnationFenced(de.into_string()),
             ErrorKind::Common => FsError::Common(de.into_string()),
         }
     }
@@ -706,7 +735,37 @@ impl ErrorExt for FsError {
 mod tests {
     use super::ErrorKind;
     use crate::FsError;
-    use curvine_core_error::{ErrorExt, ErrorImpl};
+    use curvine_core_error::{CommonError, ErrorExt, ErrorImpl};
+
+    #[test]
+    pub fn cache_incarnation_fenced_wire_round_trip_test() {
+        let error = FsError::cache_incarnation_fenced(7);
+        assert!(matches!(error.kind(), ErrorKind::CacheIncarnationFenced));
+        assert!(error.to_string().contains('7'));
+
+        // Wire round trip: the kind must survive encode/decode so cache
+        // clients can branch on it without parsing the message string.
+        let decoded = FsError::decode(error.encode());
+        assert!(matches!(decoded.kind(), ErrorKind::CacheIncarnationFenced));
+        assert!(decoded.to_string().contains('7'));
+    }
+
+    #[test]
+    pub fn common_error_downcast_preserves_typed_fs_error_test() {
+        // Service layers return CommonResult (Box<dyn Error>); the handler
+        // `?` converts via From<CommonError>. A boxed typed FsError must
+        // keep its kind; anything else still flattens to Common.
+        let boxed: CommonError = FsError::cache_incarnation_fenced(3).into();
+        let preserved = FsError::from(boxed);
+        assert!(matches!(
+            preserved.kind(),
+            ErrorKind::CacheIncarnationFenced
+        ));
+
+        let plain: CommonError = "some generic failure".into();
+        let flattened = FsError::from(plain);
+        assert!(matches!(flattened.kind(), ErrorKind::Common));
+    }
 
     #[test]
     pub fn error_test() {

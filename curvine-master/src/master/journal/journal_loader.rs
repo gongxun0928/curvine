@@ -1825,6 +1825,7 @@ mod tests {
     ///    V2 entry and the policy row.
     /// 3. Response-loss retry: the SAME token resolves the SAME incarnation
     ///    from the recorded outcome without a second journal entry.
+    ///
     /// Phase 2 (fresh process, journal replay):
     /// 4. Restart idempotency: the SAME token still resolves incarnation 1
     ///    from the replayed outcome, without minting or proposing.

@@ -315,12 +315,14 @@ impl CacheService {
         }
     }
 
-    /// Terminal revoked/stale diagnostic shared by every fenced path.
+    /// Terminal revoked/stale diagnostic shared by every fenced path
+    /// (get/allocate/commit/invalidate). TYPED: a boxed
+    /// FsError::CacheIncarnationFenced, so the handler `?` (From<
+    /// CommonError> downcasts and preserves the FsError) and the wire
+    /// encode/decode keep a machine-recognizable ErrorKind — clients
+    /// branch on the kind, never on the message string.
     fn fenced(incarnation: u64) -> CommonError {
-        cm_err(format!(
-            "cache incarnation {} is revoked or stale: terminal, the mount namespace moved on (re-resolve the mount)",
-            incarnation
-        ))
+        curvine_error::FsError::cache_incarnation_fenced(incarnation).into()
     }
 
     /// Arm the one-shot post-barrier fault-injection seam (test-only).
@@ -1504,7 +1506,27 @@ impl CacheService {
                         other
                     )
                 }
-                None => (),
+                None => {
+                    // Outcome-window expiry (b27b6bad P0-1): the issuance
+                    // outcome may have been evicted from the bounded
+                    // outcome window while the client watermark survives.
+                    // A token at or below the watermark is TERMINAL —
+                    // re-proposing would journal a no-op V2 entry on every
+                    // late retry. Mirror the Allocate/Commit watermark
+                    // gate: zero propose, terminal Expired.
+                    let watermark = rocks
+                        .cache_client_watermark(token.client_id)
+                        .map_err(fs_err)?;
+                    if let Some(hw) = watermark {
+                        if token.op_seq <= hw {
+                            return err_box!(
+                                "cache incarnation allocate token {:?} is expired (client watermark {}): terminal, re-issue with a fresh token",
+                                token,
+                                hw
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -2027,11 +2049,13 @@ fn cm_err(msg: impl Into<String>) -> CommonError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::master::meta::cache::store::CacheWrite;
     use crate::master::meta::FsDir;
     use crate::master::quota::eviction::evictor::{Evictor, LRUEvictor};
     use crate::master::quota::eviction::EvictionConf;
     use crate::master::Master;
     use curvine_config::{ClusterConf, JournalConf, MasterConf};
+    use curvine_core_error::ErrorExt;
     use curvine_model::{AccessMode, MountOptions, WriteType};
     use curvine_raft::raft::{RaftClient, RoleState};
     use curvine_runtime::sync::StateCtl;
@@ -3348,6 +3372,42 @@ mod tests {
             "{}",
             msg
         );
+
+        // Wire-typed fence (b27b6bad P0-2): every fenced result is a boxed
+        // FsError::CacheIncarnationFenced. The handler boundary is exactly
+        // From<CommonError> (the handler `?`), so exercising that
+        // conversion plus the FsError wire encode/decode here proves the
+        // kind survives service -> handler -> wire -> client for all four
+        // fenced paths; clients branch on the kind, not the string.
+        for err in [
+            service.get(1, "/k", false).unwrap_err(),
+            service
+                .allocate(token(3, 1), 7, 1, "/x", 64, 64)
+                .unwrap_err(),
+            service.invalidate(7, 1, "/k", 1, OBJ).unwrap_err(),
+            service
+                .commit(commit_params(token(2, 1), token(3, 2), vec![]))
+                .unwrap_err(),
+        ] {
+            let wire_err = curvine_error::FsError::from(err);
+            assert!(
+                matches!(
+                    wire_err.kind(),
+                    curvine_error::ErrorKind::CacheIncarnationFenced
+                ),
+                "handler conversion must preserve the typed fence: {}",
+                wire_err
+            );
+            let decoded = curvine_error::FsError::decode(wire_err.encode());
+            assert!(
+                matches!(
+                    decoded.kind(),
+                    curvine_error::ErrorKind::CacheIncarnationFenced
+                ),
+                "the wire round trip must preserve the typed fence: {}",
+                decoded
+            );
+        }
     }
 
     /// 4b P0-3: commit expiry derivation. The deadline comes from the
@@ -3596,6 +3656,60 @@ mod tests {
             "{}",
             msg
         );
+
+        // Outcome-window expiry (b27b6bad P0-1): the issuance outcome was
+        // evicted from the bounded outcome window but the client watermark
+        // survives. The same token is TERMINAL — the service watermark gate
+        // fires before any mount lookup or propose, so no no-op V2 entry is
+        // journaled, no incarnation/row/HW/pointer state moves.
+        {
+            let expired = token(6, 3);
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            store
+                .cache
+                .apply_incarnation_allocate_v2(rocks, expired, 5, 4, 3_600_000)
+                .unwrap();
+            // Evict the outcome row the same way the bounded window does;
+            // the watermark row survives.
+            let mut w = rocks.cache_write();
+            w.delete_outcome(expired).unwrap();
+            w.commit().unwrap();
+        }
+        let err = service.allocate_incarnation(token(6, 3), 7, 5).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("expired (client watermark"), "{}", msg);
+        assert!(!msg.contains("raft"), "must not reach the barrier: {}", msg);
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            // Nothing moved: the setup apply left row 4 + watermark 4 +
+            // pointer 5→4, and the expired retry may not touch any of it.
+            assert_eq!(
+                rocks
+                    .cache_get_incarnation(4)
+                    .unwrap()
+                    .map(|r| (r.mount_id, r.revoked)),
+                Some((5, false)),
+                "the expired retry may not alter the incarnation row"
+            );
+            assert!(
+                rocks.cache_get_outcome(token(6, 3)).unwrap().is_none(),
+                "no outcome may reappear for the expired retry"
+            );
+            assert_eq!(
+                rocks
+                    .cache_get_state(state_tags::CACHE_INCARNATION)
+                    .unwrap(),
+                Some(4),
+                "the durable incarnation watermark must stay at 4"
+            );
+            assert_eq!(
+                rocks.cache_current_incarnation(5).unwrap(),
+                Some(4),
+                "the mount pointer must stay unchanged"
+            );
+        }
     }
 
     /// 4b gate 4 apply side: the V2 journal apply re-verifies the frozen
