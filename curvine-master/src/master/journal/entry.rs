@@ -212,7 +212,10 @@ pub struct CacheIdReserveEntry {
 }
 
 /// Identity-producing: allocate a never-reused mount incarnation and point
-/// `mount_id` at it.
+/// `mount_id` at it. Legacy 4a layout — frozen: appending fields would break
+/// bincode decode of journals written before 4b (positional encoding, see
+/// the compatibility note near `deserialize_compat`). 4b writers use
+/// [`CacheIncarnationAllocateV2Entry`]; this variant only replays.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct CacheIncarnationAllocateEntry {
     pub(crate) op_id: u64,
@@ -220,6 +223,27 @@ pub struct CacheIncarnationAllocateEntry {
     pub(crate) token: OpToken,
     pub(crate) mount_id: u32,
     pub(crate) incarnation: u64,
+}
+
+/// Identity-producing (4b): allocate a never-reused mount incarnation with
+/// the frozen policy snapshot. `ttl_ms` freezes the VERIFIED mount TTL at
+/// allocation time: commits under this incarnation derive `expire_at` from
+/// the durable policy row, never from the client and never from a later
+/// mutable mount table entry. `cache_write` records the verified capability
+/// (write_cache-enabled mount) at allocation; apply re-verifies it against
+/// the persisted mount table and the issuer re-reads it post-barrier.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct CacheIncarnationAllocateV2Entry {
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
+    pub(crate) token: OpToken,
+    pub(crate) mount_id: u32,
+    pub(crate) incarnation: u64,
+    /// 0 = no TTL. Frozen from the verified mount properties.
+    pub(crate) ttl_ms: i64,
+    /// Capability snapshot: the mount was verified write-cache-enabled
+    /// (cache mode, read-write access) when this allocation was issued.
+    pub(crate) cache_write: bool,
 }
 
 /// Conditional: revoke a mount incarnation (unmount fence). The
@@ -323,6 +347,7 @@ pub enum JournalEntry {
     CacheAllocate(CacheAllocateEntry),
     CacheCommit(CacheCommitEntry),
     CacheRemove(CacheRemoveEntry),
+    CacheIncarnationAllocateV2(CacheIncarnationAllocateV2Entry),
 }
 
 impl JournalEntry {
@@ -352,6 +377,7 @@ impl JournalEntry {
             JournalEntry::CacheAllocate(e) => e.op_id,
             JournalEntry::CacheCommit(e) => e.op_id,
             JournalEntry::CacheRemove(e) => e.op_id,
+            JournalEntry::CacheIncarnationAllocateV2(e) => e.op_id,
         }
     }
 
@@ -381,6 +407,7 @@ impl JournalEntry {
             JournalEntry::CacheAllocate(e) => e.rpc_id,
             JournalEntry::CacheCommit(e) => e.rpc_id,
             JournalEntry::CacheRemove(e) => e.rpc_id,
+            JournalEntry::CacheIncarnationAllocateV2(e) => e.rpc_id,
         }
     }
 
@@ -428,7 +455,8 @@ impl JournalEntry {
             | JournalEntry::CacheIncarnationRevoke(_)
             | JournalEntry::CacheAllocate(_)
             | JournalEntry::CacheCommit(_)
-            | JournalEntry::CacheRemove(_) => Vec::new(),
+            | JournalEntry::CacheRemove(_)
+            | JournalEntry::CacheIncarnationAllocateV2(_) => Vec::new(),
         }
     }
 
@@ -454,6 +482,7 @@ impl JournalEntry {
                 | JournalEntry::CacheAllocate(_)
                 | JournalEntry::CacheCommit(_)
                 | JournalEntry::CacheRemove(_)
+                | JournalEntry::CacheIncarnationAllocateV2(_)
         )
     }
 }
@@ -661,6 +690,140 @@ mod tests {
 
     fn dir() -> InodeDir {
         InodeDir::new(1, 1)
+    }
+
+    /// Frozen hex fixture helpers (4b compat gate, review msgs 2b88a96c /
+    /// 5883932e): bytes written before the V2 variants existed must keep
+    /// decoding at HEAD, V2 must roundtrip, and mixed batches must not
+    /// crosswalk variants.
+    fn hex_decode(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|x| format!("{:02x}", x)).collect()
+    }
+
+    fn legacy_allocate_fixture() -> CacheIncarnationAllocateEntry {
+        CacheIncarnationAllocateEntry {
+            op_id: 41,
+            rpc_id: -7,
+            token: OpToken {
+                client_id: 99,
+                op_seq: 7,
+            },
+            mount_id: 3,
+            incarnation: 12,
+        }
+    }
+
+    fn v2_allocate_fixture() -> CacheIncarnationAllocateV2Entry {
+        CacheIncarnationAllocateV2Entry {
+            op_id: 41,
+            rpc_id: -7,
+            token: OpToken {
+                client_id: 99,
+                op_seq: 7,
+            },
+            mount_id: 3,
+            incarnation: 12,
+            ttl_ms: 3_600_000,
+            cache_write: true,
+        }
+    }
+
+    #[test]
+    fn test_frozen_7e3f8a02_journal_bytes_decode_at_head() {
+        // Frozen bytes of the legacy CacheIncarnationAllocate journal entry.
+        // Provenance: serialized from the legacy struct at 4a HEAD 7e3f8a02
+        // layout; the diff since then is additive-only (V2 variant appended
+        // at the enum tail), so any journal segment written by 4a decodes
+        // bit-identically here.
+        const LEGACY_HEX: &str = "130000002900000000000000f9ffffffffffffff63000000000000000700000000000000030000000c00000000000000";
+        let entry: JournalEntry = SerdeUtils::deserialize(&hex_decode(LEGACY_HEX)).unwrap();
+        match entry {
+            JournalEntry::CacheIncarnationAllocate(e) => {
+                assert_eq!(e.op_id, 41);
+                assert_eq!(e.rpc_id, -7);
+                assert_eq!(e.token.client_id, 99);
+                assert_eq!(e.token.op_seq, 7);
+                assert_eq!(e.mount_id, 3);
+                assert_eq!(e.incarnation, 12);
+            }
+            other => panic!("legacy bytes crosswalked to {:?}", other),
+        }
+        // Re-encoding the decoded legacy entry reproduces the frozen bytes
+        // (no silent layout drift).
+        assert_eq!(
+            hex_encode(
+                &SerdeUtils::serialize(&JournalEntry::CacheIncarnationAllocate(
+                    legacy_allocate_fixture()
+                ))
+                .unwrap()
+            ),
+            LEGACY_HEX
+        );
+    }
+
+    #[test]
+    fn test_incarnation_allocate_v2_roundtrip() {
+        const V2_HEX: &str = "180000002900000000000000f9ffffffffffffff63000000000000000700000000000000030000000c0000000000000080ee36000000000001";
+        let bytes = SerdeUtils::serialize(&JournalEntry::CacheIncarnationAllocateV2(
+            v2_allocate_fixture(),
+        ))
+        .unwrap();
+        assert_eq!(hex_encode(&bytes), V2_HEX);
+        let entry: JournalEntry = SerdeUtils::deserialize(&bytes).unwrap();
+        match entry {
+            JournalEntry::CacheIncarnationAllocateV2(e) => {
+                assert_eq!(e.op_id, 41);
+                assert_eq!(e.ttl_ms, 3_600_000);
+                assert!(e.cache_write);
+            }
+            other => panic!("v2 bytes crosswalked to {:?}", other),
+        }
+        // The V2 discriminant (0x18 = 24) sits strictly above every legacy
+        // variant: old binaries fail loudly on V2 instead of misdecoding.
+        assert!(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) > 23);
+    }
+
+    #[test]
+    fn test_mixed_legacy_v2_journal_batch_no_crosswalk() {
+        // A journal segment mixing pre-4b and 4b entries must decode each
+        // entry to its own variant.
+        let mixed = vec![
+            JournalEntry::CacheIdReserve(CacheIdReserveEntry {
+                op_id: 1,
+                rpc_id: 0,
+                token: token(),
+                start: 1,
+                end: 2,
+            }),
+            JournalEntry::CacheIncarnationAllocate(legacy_allocate_fixture()),
+            JournalEntry::CacheIncarnationAllocateV2(v2_allocate_fixture()),
+            JournalEntry::CacheRemove(CacheRemoveEntry {
+                op_id: 2,
+                rpc_id: 0,
+                incarnation: 12,
+                key: "/k".into(),
+                expected_generation: 1,
+                new_generation: 2,
+                expected_object_id: crate::master::meta::cache::BlockIdCodec::CACHE_OBJECT_MIN,
+            }),
+        ];
+        let bytes = SerdeUtils::serialize(&mixed).unwrap();
+        let back: Vec<JournalEntry> = SerdeUtils::deserialize(&bytes).unwrap();
+        assert_eq!(back.len(), 4);
+        assert!(matches!(back[0], JournalEntry::CacheIdReserve(_)));
+        assert!(matches!(back[1], JournalEntry::CacheIncarnationAllocate(_)));
+        assert!(matches!(
+            back[2],
+            JournalEntry::CacheIncarnationAllocateV2(_)
+        ));
+        assert!(matches!(back[3], JournalEntry::CacheRemove(_)));
     }
 
     fn token() -> OpToken {
@@ -918,6 +1081,20 @@ mod tests {
                     expected_object_id: crate::master::meta::cache::BlockIdCodec::CACHE_OBJECT_MIN,
                 }),
                 23,
+            ),
+            // 4b append: V2 incarnation allocation at the tail. Everything
+            // above keeps its discriminant byte (frozen-bytes compat gate).
+            (
+                JournalEntry::CacheIncarnationAllocateV2(CacheIncarnationAllocateV2Entry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    token: token(),
+                    mount_id: 1,
+                    incarnation: 1,
+                    ttl_ms: 0,
+                    cache_write: true,
+                }),
+                24,
             ),
         ];
 

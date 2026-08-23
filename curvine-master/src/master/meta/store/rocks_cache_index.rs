@@ -18,8 +18,8 @@
 
 use crate::master::meta::cache::entry::{
     decode_key, encode_key, validate_entry, validate_expiry_row, validate_incarnation,
-    validate_object_row, CacheEntry, ExpiryRow, IncarnationRow, ObjectRow, OpOutcome, OpToken,
-    MAX_ALLOCATABLE_INCARNATION,
+    validate_object_row, CacheEntry, ExpiryRow, IncarnationPolicyRow, IncarnationRow, ObjectRow,
+    OpOutcome, OpToken, MAX_ALLOCATABLE_INCARNATION,
 };
 use crate::master::meta::cache::store::CacheWrite;
 use crate::master::meta::cache::store::LocalCacheIndexStore;
@@ -65,6 +65,9 @@ impl RocksInodeStore {
     pub const IDEMPOTENCY_TAG_WATERMARK: u8 = 0x02;
     pub const MOUNT_TAG_CURRENT: u8 = 0x01;
     pub const MOUNT_TAG_INCARNATION: u8 = 0x02;
+    /// 4b option A: policy snapshot under a separate key so the legacy
+    /// IncarnationRow bytes stay decodable.
+    pub const MOUNT_TAG_POLICY: u8 = 0x03;
 
     fn entry_key(incarnation: u64, key: &str) -> Vec<u8> {
         let mut buf = Vec::with_capacity(8 + key.len());
@@ -106,6 +109,13 @@ impl RocksInodeStore {
     fn incarnation_row_key(incarnation: u64) -> [u8; 9] {
         let mut key = [0u8; 9];
         key[0] = Self::MOUNT_TAG_INCARNATION;
+        key[1..9].copy_from_slice(&incarnation.to_be_bytes());
+        key
+    }
+
+    fn incarnation_policy_key(incarnation: u64) -> [u8; 9] {
+        let mut key = [0u8; 9];
+        key[0] = Self::MOUNT_TAG_POLICY;
         key[1..9].copy_from_slice(&incarnation.to_be_bytes());
         key
     }
@@ -197,6 +207,29 @@ impl CacheWrite for RocksCacheWrite<'_> {
         self.put_cf(
             RocksInodeStore::CF_CACHE_MOUNT,
             RocksInodeStore::incarnation_row_key(incarnation),
+            value,
+        )
+    }
+
+    /// 4b option A: policy snapshot under a separate key, written once with
+    /// the allocation and never mutated (readers treat a missing row as
+    /// `ttl_ms == 0`, i.e. pre-4b allocations had no TTL).
+    fn put_incarnation_policy(
+        &mut self,
+        incarnation: u64,
+        row: IncarnationPolicyRow,
+    ) -> FsResult<()> {
+        validate_incarnation(incarnation).map_err(FsError::from)?;
+        if row.ttl_ms < 0 {
+            return Err(FsError::from(CommonError::from(err_msg!(
+                "mount ttl_ms must be non-negative: {}",
+                row.ttl_ms
+            ))));
+        }
+        let value = Serde::serialize(&row)?;
+        self.put_cf(
+            RocksInodeStore::CF_CACHE_MOUNT,
+            RocksInodeStore::incarnation_policy_key(incarnation),
             value,
         )
     }
@@ -412,6 +445,20 @@ impl LocalCacheIndexStore for RocksInodeStore {
             Self::current_incarnation_key(mount_id),
         )? {
             None => Ok(None),
+            Some(bytes) => Ok(Some(Serde::deserialize(&bytes)?)),
+        }
+    }
+
+    fn cache_get_incarnation_policy(
+        &self,
+        incarnation: u64,
+    ) -> FsResult<Option<IncarnationPolicyRow>> {
+        match self.db.get_cf(
+            Self::CF_CACHE_MOUNT,
+            Self::incarnation_policy_key(incarnation),
+        )? {
+            // Pre-4b allocations carry no policy row: no TTL.
+            None => Ok(Some(IncarnationPolicyRow { ttl_ms: 0 })),
             Some(bytes) => Ok(Some(Serde::deserialize(&bytes)?)),
         }
     }

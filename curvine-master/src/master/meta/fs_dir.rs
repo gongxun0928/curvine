@@ -982,9 +982,39 @@ impl FsDir {
             JournalEntry::CacheIdReserve(e) => {
                 self.cache.apply_id_reserve(store, e.token, e.start, e.end)
             }
+            // Legacy 4a replay only: 4b issuers write the V2 variant.
             JournalEntry::CacheIncarnationAllocate(e) => {
                 self.cache
                     .apply_incarnation_allocate(store, e.token, e.mount_id, e.incarnation)
+            }
+            JournalEntry::CacheIncarnationAllocateV2(e) => {
+                // Apply-time capability verification (4b gate 4): the
+                // policy snapshot frozen in the entry must match the
+                // PERSISTED mount table at apply time (leader and follower
+                // replay the same log, so this is deterministic). A mount
+                // that vanished, lost write-cache capability, or changed
+                // TTL between issuance and apply is loud divergence.
+                let mounts = self.get_mount_table()?;
+                match mounts.iter().find(|m| m.mount_id == e.mount_id) {
+                    Some(m)
+                        if m.write_cache_enabled() == e.cache_write && m.ttl_ms == e.ttl_ms => {}
+                    other => {
+                        return err_box!(
+                            "cache incarnation allocate V2 for mount {} failed apply-time policy verification (entry cache_write {} ttl {}, persisted {:?})",
+                            e.mount_id,
+                            e.cache_write,
+                            e.ttl_ms,
+                            other.map(|m| (m.write_cache_enabled(), m.ttl_ms))
+                        )
+                    }
+                }
+                self.cache.apply_incarnation_allocate_v2(
+                    store,
+                    e.token,
+                    e.mount_id,
+                    e.incarnation,
+                    e.ttl_ms,
+                )
             }
             JournalEntry::CacheIncarnationRevoke(e) => {
                 self.cache

@@ -266,7 +266,8 @@ impl JournalLoader {
                 | JournalEntry::CacheIncarnationRevoke(_)
                 | JournalEntry::CacheAllocate(_)
                 | JournalEntry::CacheCommit(_)
-                | JournalEntry::CacheRemove(_) => (),
+                | JournalEntry::CacheRemove(_)
+                | JournalEntry::CacheIncarnationAllocateV2(_) => (),
 
                 _ => has_ufs_affecting = true,
             }
@@ -1074,9 +1075,9 @@ mod tests {
     use crate::master::{MasterMonitor, MetaRaftJournal, SyncFsDir, SyncWorkerManager};
     use curvine_config::{ClusterConf, JournalConf, MasterConf};
     use curvine_model::state::{WorkerAddress, WorkerStatus};
-    use curvine_model::WorkerInfo;
+    use curvine_model::{AccessMode, MountOptions, WorkerInfo, WriteType};
     use curvine_raft::raft::RoleMonitor;
-    use curvine_runtime::common::{FileUtils, SerdeUtils, Utils};
+    use curvine_runtime::common::{FileUtils, LocalTime, SerdeUtils, Utils};
     use curvine_runtime::sync::StateCtl;
     use std::sync::Arc;
 
@@ -1520,6 +1521,8 @@ mod tests {
             journal,
             master: MasterConf {
                 meta_dir,
+                // 4b gate 5: tests enable the cache capability explicitly.
+                cache_metadata_enabled: true,
                 ..Default::default()
             },
             ..Default::default()
@@ -1806,6 +1809,141 @@ mod tests {
         let _ = FileUtils::delete_path(&base, true);
     }
 
+    /// Real single-voter Raft coverage for the 4b incarnation lifecycle,
+    /// all through the REAL propose/apply barrier:
+    ///
+    /// 1. The REAL issuer path: a persisted write-cache mount table entry
+    ///    (gate 4) plus `allocate_incarnation` minting incarnation 1 with
+    ///    the mount's TTL frozen into the V2 entry and the policy row.
+    /// 2. Allocate + commit under the incarnation: the commit deadline is
+    ///    derived from the frozen policy (now + ttl), never from the client.
+    /// 3. Revoke is Applied, the retry is idempotent AlreadyApplied, and
+    ///    revoking an unknown incarnation proposes nothing.
+    /// 4. The fenced namespace: get is a plain miss, allocate and commit
+    ///    are terminal fenced errors — with no journal entries for any of
+    ///    them (the parent asserts the exact entry count).
+    #[test]
+    fn real_raft_incarnation_revoke_fence() {
+        let leader_mode_env = "CURVINE_TEST_CACHE_INC_LEADER";
+        let meta_dir_env = "CURVINE_TEST_CACHE_INC_META_DIR";
+        let journal_dir_env = "CURVINE_TEST_CACHE_INC_JOURNAL_DIR";
+
+        if std::env::var(leader_mode_env).is_ok() {
+            real_raft_incarnation_lifetime(meta_dir_env, journal_dir_env);
+            return;
+        }
+
+        // Parent: fresh dirs, spawn the leader process on them, wait.
+        Master::init_test_metrics();
+        let base = Utils::cur_dir_sub(format!(
+            "../target/testing/real-raft-inc-{}-{}",
+            std::process::id(),
+            Utils::rand_str(6)
+        ));
+        let meta_dir = format!("{}/meta", base);
+        let journal_dir = format!("{}/journal", base);
+        let _ = FileUtils::delete_path(&base, true);
+
+        let exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("master::journal::journal_loader::tests::real_raft_incarnation_revoke_fence")
+            .env(leader_mode_env, "1")
+            .env(meta_dir_env, &meta_dir)
+            .env(journal_dir_env, &journal_dir)
+            .output()
+            .expect("spawn incarnation-leader test process");
+        assert!(
+            output.status.success(),
+            "leader lifetime failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let conf = || {
+            let mut journal = JournalConf::with_test();
+            journal.enable = true;
+            journal.journal_dir = journal_dir.clone();
+            ClusterConf {
+                testing: true,
+                format_master: false,
+                journal,
+                master: MasterConf {
+                    meta_dir: meta_dir.clone(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        };
+
+        // Exactly the expected committed data entries: incarnation V2
+        // allocate, id reserve, allocate /a, commit /a, incarnation revoke.
+        // The revoke retry, the unknown-incarnation revoke, and every
+        // fenced call must propose NOTHING.
+        {
+            let log_store = RocksLogStorage::from_conf(&conf().journal, false);
+            let last = log_store.read().last_index();
+            assert!(last >= 1, "journal log must exist after leader exit");
+            let entries = log_store.scan_entries(1, last + 1).unwrap();
+            drop(log_store);
+            let data_entries: Vec<Entry> = entries
+                .into_iter()
+                .filter(|e| e.get_entry_type() == EntryType::EntryNormal && !e.data.is_empty())
+                .collect();
+            assert_eq!(data_entries.len(), 5, "unexpected journal entry count");
+        }
+
+        // Durable committed state: the revoked row is preserved forever,
+        // the frozen policy row, the V2 issuer outcome, the preserved
+        // incarnation watermark, and the Valid /a row carrying its
+        // policy-derived deadline.
+        {
+            let rocks = RocksInodeStore::new(conf().db_conf(), false).unwrap();
+            let row = rocks.cache_get_incarnation(1).unwrap().expect("row 1");
+            assert_eq!(row.mount_id, 5);
+            assert!(row.revoked, "revoke marks the row, never deletes it");
+            assert_eq!(
+                rocks
+                    .cache_get_incarnation_policy(1)
+                    .unwrap()
+                    .map(|p| p.ttl_ms),
+                Some(3_600_000)
+            );
+            assert_eq!(
+                rocks
+                    .cache_get_state(state_tags::CACHE_INCARNATION)
+                    .unwrap(),
+                Some(1),
+                "revoke preserves the incarnation watermark"
+            );
+            match rocks
+                .cache_get_outcome(OpToken {
+                    client_id: 0,
+                    op_seq: 1,
+                })
+                .unwrap()
+                .unwrap()
+            {
+                OpOutcome::IncarnationAllocatedV2 {
+                    incarnation,
+                    mount_id,
+                    ttl_ms,
+                } => {
+                    assert_eq!(incarnation, 1);
+                    assert_eq!(mount_id, 5);
+                    assert_eq!(ttl_ms, 3_600_000);
+                }
+                other => panic!("issuer outcome: {:?}", other),
+            }
+            let a = rocks.cache_get_entry(1, "/a").unwrap().expect("/a row");
+            assert_eq!(a.state, CacheEntryState::Valid);
+            assert_eq!(a.generation, 1);
+            assert!(a.expire_at > 0, "policy-derived deadline is durable");
+        }
+
+        let _ = FileUtils::delete_path(&base, true);
+    }
+
     /// The leader lifetime for the barrier tests: a REAL single-voter
     /// raft node (production writer, apply worker) with one live worker
     /// registered, driving CacheService through the full propose/apply
@@ -1824,6 +1962,8 @@ mod tests {
             journal,
             master: MasterConf {
                 meta_dir,
+                // 4b gate 5: tests enable the cache capability explicitly.
+                cache_metadata_enabled: true,
                 ..Default::default()
             },
             ..Default::default()
@@ -1859,6 +1999,28 @@ mod tests {
         // advances on role transitions, and the cache service under test.
         let epoch_ctl = role_monitor.epoch_ctl();
         let cache = fs.cache_service.clone();
+
+        // 4b: grant incarnation 1 an active row so the apply/service
+        // fences admit the allocates below (the real issuer path —
+        // persisted mount table + barrier — is covered by the 4b
+        // incarnation real-raft test).
+        {
+            let store = fs_dir.read();
+            let rocks = store.get_rocks_store();
+            store
+                .cache
+                .apply_incarnation_allocate_v2(
+                    rocks,
+                    OpToken {
+                        client_id: 91,
+                        op_seq: 1,
+                    },
+                    5,
+                    1,
+                    0,
+                )
+                .unwrap();
+        }
 
         // One live worker so the production PolicyWorkerChooser can plan.
         let mut worker = WorkerInfo::new(
@@ -2095,6 +2257,240 @@ mod tests {
             },
             "same-token retry after a fenced commit stays terminal Superseded"
         );
+
+        std::process::exit(0);
+    }
+
+    /// The leader lifetime for the 4b incarnation test: a REAL single-voter
+    /// raft node (production writer, apply worker) with one live worker
+    /// registered and a persisted write-cache mount, driving the REAL
+    /// issuer, TTL-bearing commit, revoke, and fenced paths through the
+    /// full propose/apply barrier.
+    fn real_raft_incarnation_lifetime(meta_dir_env: &str, journal_dir_env: &str) {
+        Master::init_test_metrics();
+        let meta_dir = std::env::var(meta_dir_env).unwrap();
+        let journal_dir = std::env::var(journal_dir_env).unwrap();
+
+        let mut journal = JournalConf::with_test();
+        journal.enable = true;
+        journal.journal_dir = journal_dir;
+        let conf = ClusterConf {
+            testing: true,
+            format_master: true,
+            journal,
+            master: MasterConf {
+                meta_dir,
+                // 4b gate 5: tests enable the cache capability explicitly.
+                cache_metadata_enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let rt = conf.journal.create_runtime();
+        let log_store = RocksLogStorage::from_conf(&conf.journal, true);
+        let role_monitor = RoleMonitor::new();
+        let master_monitor = MasterMonitor::with_epoch(
+            role_monitor.read_ctl(),
+            StateCtl::new(0),
+            role_monitor.epoch_ctl(),
+        );
+
+        let client = RaftClient::from_conf(rt.clone(), &conf.journal);
+        let journal_writer = Arc::new(JournalWriter::new(false, client, &conf.journal).unwrap());
+
+        let ttl_bucket_list =
+            Arc::new(TtlBucketList::new(conf.master.ttl_bucket_interval_ms() as i64).unwrap());
+        let eviction_conf = EvictionConf::from_conf(&conf);
+        let evictor: Arc<dyn Evictor> = Arc::new(LRUEvictor::new(eviction_conf.clone()));
+        let fs_dir = SyncFsDir::new(
+            FsDir::new(&conf, journal_writer.clone(), ttl_bucket_list, evictor).unwrap(),
+        );
+
+        // 4b gate 4: persist the write-cache mount (1h TTL) BEFORE any
+        // issuance — the issuer and the apply-time verification trust this
+        // durable table, never request input.
+        let mount = MountOptions::builder()
+            .write_type(WriteType::CacheMode)
+            .access_mode(AccessMode::ReadWrite)
+            .write_cache(true)
+            .ttl_ms(3_600_000)
+            .build()
+            .to_info(5, "/mnt/a", "file:///tmp/curvine-inc-a");
+        fs_dir.write().unprotected_store_mount(mount).unwrap();
+
+        let fs = MasterFilesystem::new(
+            &conf,
+            fs_dir.clone(),
+            SyncWorkerManager::new(WorkerManager::new(&conf).unwrap()),
+            master_monitor,
+        )
+        .unwrap();
+        let cache = fs.cache_service.clone();
+
+        // One live worker so the production PolicyWorkerChooser can plan.
+        let mut worker = WorkerInfo::new(
+            WorkerAddress {
+                worker_id: 1,
+                ..Default::default()
+            },
+            1,
+        );
+        worker.status = WorkerStatus::Live;
+        worker.capacity = 1 << 30;
+        worker.available = 1 << 30;
+        fs.add_test_worker(worker);
+
+        let mount_manager = Arc::new(MountManager::new(fs.clone()));
+        let job_manager = Arc::new(JobManager::from_cluster_conf(
+            fs,
+            mount_manager.clone(),
+            rt.clone(),
+            &conf,
+        ));
+
+        let loader = JournalLoader::new(
+            rt.clone(),
+            fs_dir.clone(),
+            mount_manager,
+            &conf.journal,
+            job_manager,
+            log_store.clone(),
+            journal_writer.clone(),
+        )
+        .unwrap();
+        let raft = MetaRaftJournal::new(
+            rt.clone(),
+            log_store,
+            loader.clone(),
+            conf.journal.clone(),
+            role_monitor,
+        );
+        let mut listener = rt.block_on(raft.run()).unwrap();
+        rt.block_on(listener.wait_leader()).unwrap();
+
+        // 1. REAL issuer: incarnation 1 for the write-cache mount, with the
+        //    mount TTL frozen into the V2 entry and the durable policy row.
+        let inc = cache.allocate_incarnation(21, 5).unwrap();
+        assert_eq!(inc, 1);
+        {
+            let store = fs_dir.read();
+            let rocks = store.get_rocks_store();
+            assert_eq!(
+                rocks
+                    .cache_get_incarnation_policy(1)
+                    .unwrap()
+                    .map(|p| p.ttl_ms),
+                Some(3_600_000)
+            );
+        }
+
+        // 2. Allocate + commit under the incarnation: the deadline is
+        //    derived ONCE from the frozen policy (now + ttl), never from
+        //    the client (ttl_ms must be 0 on the wire).
+        let a = cache
+            .allocate(
+                OpToken {
+                    client_id: 9,
+                    op_seq: 1,
+                },
+                22,
+                1,
+                "/a",
+                128,
+                64,
+            )
+            .unwrap();
+        let now = LocalTime::mills() as i64;
+        let status = cache
+            .commit(CacheCommitParams {
+                token: OpToken {
+                    client_id: 9,
+                    op_seq: 2,
+                },
+                load_token: OpToken {
+                    client_id: 9,
+                    op_seq: 1,
+                },
+                rpc_id: 22,
+                incarnation: 1,
+                key: "/a",
+                generation: 1,
+                object_id: a.object_id,
+                len: 128,
+                ufs_mtime: 777,
+                ttl_ms: 0,
+                blocks: a.blocks.clone(),
+            })
+            .unwrap();
+        assert_eq!(status, CacheOpStatus::Applied);
+        {
+            let store = fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let row = rocks.cache_get_entry(1, "/a").unwrap().expect("/a row");
+            assert_eq!(row.state, CacheEntryState::Valid);
+            assert!(
+                row.expire_at >= now + 3_600_000
+                    && row.expire_at <= LocalTime::mills() as i64 + 3_600_000,
+                "deadline must be now + frozen ttl exactly once: {}",
+                row.expire_at
+            );
+        }
+
+        // 3. Revoke: Applied, the retry is idempotent AlreadyApplied, and
+        //    revoking an unknown incarnation resolves without a propose.
+        assert_eq!(
+            cache.revoke_incarnation(23, 5, 1).unwrap(),
+            CacheOpStatus::Applied
+        );
+        assert_eq!(
+            cache.revoke_incarnation(23, 5, 1).unwrap(),
+            CacheOpStatus::AlreadyApplied
+        );
+        assert_eq!(
+            cache.revoke_incarnation(23, 5, 99).unwrap(),
+            CacheOpStatus::AlreadyApplied
+        );
+
+        // 4. Fenced namespace: get is a plain miss, mutations are terminal
+        //    fenced errors — none of them propose.
+        assert!(cache.get(1, "/a", false).unwrap().is_none());
+        let err = cache
+            .allocate(
+                OpToken {
+                    client_id: 9,
+                    op_seq: 3,
+                },
+                22,
+                1,
+                "/y",
+                64,
+                64,
+            )
+            .unwrap_err();
+        assert!(format!("{}", err).contains("terminal"), "{}", err);
+        let err = cache
+            .commit(CacheCommitParams {
+                token: OpToken {
+                    client_id: 9,
+                    op_seq: 4,
+                },
+                load_token: OpToken {
+                    client_id: 9,
+                    op_seq: 1,
+                },
+                rpc_id: 22,
+                incarnation: 1,
+                key: "/a",
+                generation: 1,
+                object_id: a.object_id,
+                len: 128,
+                ufs_mtime: 777,
+                ttl_ms: 0,
+                blocks: a.blocks.clone(),
+            })
+            .unwrap_err();
+        assert!(format!("{}", err).contains("terminal"), "{}", err);
 
         std::process::exit(0);
     }

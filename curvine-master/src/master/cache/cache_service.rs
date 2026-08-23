@@ -46,12 +46,13 @@
 use crate::master::fs::policy::ChooseContext;
 use crate::master::fs::WorkerManager;
 use crate::master::journal::{
-    CacheAllocateEntry, CacheCommitEntry, CacheIdReserveEntry, CacheRemoveEntry, JournalEntry,
-    JournalWriter,
+    CacheAllocateEntry, CacheCommitEntry, CacheIdReserveEntry, CacheIncarnationAllocateV2Entry,
+    CacheIncarnationRevokeEntry, CacheRemoveEntry, JournalEntry, JournalWriter,
 };
 use crate::master::meta::cache::entry::{CacheEntry, CacheEntryState, OpOutcome, OpToken};
 use crate::master::meta::cache::state_tags;
 use crate::master::meta::cache::LocalCacheIndexStore;
+use crate::master::meta::cache::MAX_ISSUABLE_INCARNATION;
 use crate::master::meta::{BlockIdCodec, CacheBlockLayout};
 use crate::master::{MasterMonitor, SyncFsDir};
 use curvine_core_error::{err_box, err_msg, CommonError, CommonResult};
@@ -242,6 +243,11 @@ pub struct CacheService {
     journal_writer: Arc<JournalWriter>,
     monitor: MasterMonitor,
     chooser: Arc<dyn CacheWorkerChooser>,
+    /// Production-default-false capability gate (4b gate 5): every cache
+    /// entry point rejects until `master.cache_metadata_enabled` is flipped
+    /// (the atomic flip lands with task #6). Tests construct the service
+    /// with the gate explicitly enabled.
+    enabled: bool,
     /// Serializes the reserve+issue critical section so concurrent
     /// allocates consume strictly monotonic, unique ids.
     issue_lock: Mutex<()>,
@@ -265,12 +271,14 @@ impl CacheService {
         journal_writer: Arc<JournalWriter>,
         monitor: MasterMonitor,
         chooser: Arc<dyn CacheWorkerChooser>,
+        enabled: bool,
     ) -> Self {
         Self {
             fs_dir,
             journal_writer,
             monitor,
             chooser,
+            enabled,
             issue_lock: Mutex::new(()),
             segment: Mutex::new(None),
             plans: Mutex::new(HashMap::new()),
@@ -278,6 +286,41 @@ impl CacheService {
             #[cfg(test)]
             barrier_hook: Mutex::new(None),
         }
+    }
+
+    /// Capability gate (4b gate 5): default-off in production, every cache
+    /// entry point rejects until explicitly enabled.
+    fn require_enabled(&self) -> CommonResult<()> {
+        if !self.enabled {
+            return err_box!(
+                "cache metadata capability is disabled (master.cache_metadata_enabled=false)"
+            );
+        }
+        Ok(())
+    }
+
+    /// Service-side incarnation fence read (4b P0-1/P0-2): mirrors the
+    /// apply-time fence. `Ok(false)` = revoked or stale (a newer incarnation
+    /// owns the mount): terminal for the caller, never retried against the
+    /// same incarnation.
+    fn incarnation_active(&self, incarnation: u64) -> CommonResult<bool> {
+        let store = self.fs_dir.read();
+        let rocks = store.get_rocks_store();
+        match rocks.cache_get_incarnation(incarnation).map_err(fs_err)? {
+            Some(row) if !row.revoked => Ok(rocks
+                .cache_current_incarnation(row.mount_id)
+                .map_err(fs_err)?
+                == Some(incarnation)),
+            _ => Ok(false),
+        }
+    }
+
+    /// Terminal revoked/stale diagnostic shared by every fenced path.
+    fn fenced(incarnation: u64) -> CommonError {
+        cm_err(format!(
+            "cache incarnation {} is revoked or stale: terminal, the mount namespace moved on (re-resolve the mount)",
+            incarnation
+        ))
     }
 
     /// Arm the one-shot post-barrier fault-injection seam (test-only).
@@ -316,7 +359,14 @@ impl CacheService {
         key: &str,
         need_locations: bool,
     ) -> CommonResult<Option<CacheGetResult>> {
+        self.require_enabled()?;
         validate_key(key)?;
+        // Incarnation gate first (4b P0-2, no-token path): a revoked or
+        // stale namespace is a plain miss — the caller falls back to the
+        // UFS and re-resolves the mount.
+        if !self.incarnation_active(incarnation)? {
+            return Ok(None);
+        }
         let store = self.fs_dir.read();
         let rocks = store.get_rocks_store();
         let entry = rocks.cache_get_entry(incarnation, key).map_err(fs_err)?;
@@ -385,6 +435,7 @@ impl CacheService {
         file_len: i64,
         block_size: i64,
     ) -> CommonResult<CacheAllocateResult> {
+        self.require_enabled()?;
         self.require_leader_or_burn()?;
         validate_key(key)?;
         validate_client_token(token)?;
@@ -506,6 +557,15 @@ impl CacheService {
             }
         }
 
+        // Incarnation gate (4b P0-2): ordered AFTER the token outcome read
+        // — an exact recorded retry resolves from history even when the
+        // namespace has since moved on — and BEFORE any row classification
+        // or identity issuance. A revoked/stale incarnation is terminal for
+        // this allocate.
+        if !self.incarnation_active(incarnation)? {
+            return Err(Self::fenced(incarnation));
+        }
+
         // Fast-fail entry-state check and generation selection. The
         // committed apply re-checks the absolute transition, so a racing
         // mutation between here and the propose fails loudly there.
@@ -605,6 +665,14 @@ impl CacheService {
             .sync_propose_cache(journal_entry)
             .map_err(fs_err)?;
 
+        // Barrier readback: if a revoke/remount fenced the incarnation
+        // while the barrier ran, the apply was a deterministic no-op and
+        // no outcome exists — report the terminal fence, not a generic
+        // readback failure.
+        if !self.incarnation_active(incarnation)? {
+            return Err(Self::fenced(incarnation));
+        }
+
         // Resolve the RPC from committed state only: the answer is the
         // committed outcome itself, never the locally issued id — if the
         // FSM recorded a different identity (an already-applied earlier
@@ -623,6 +691,23 @@ impl CacheService {
                 generation: out_generation,
                 ..
             }) if out_inc == incarnation && out_key == key && out_generation == generation => {
+                // P2-1 (4a review): never trust the locally issued identity
+                // for the wire answer or the volatile plan. If the durable
+                // outcome records a different object id (an earlier
+                // execution of this token already won it), re-derive the
+                // block layout from the committed identity — same geometry,
+                // same chosen worker sets — so no block id can reference
+                // the burned local id.
+                let blocks = if object_id == issued {
+                    planned_blocks
+                } else {
+                    Self::rebuild_blocks_for_identity(
+                        planned_blocks,
+                        object_id,
+                        file_len,
+                        block_size,
+                    )?
+                };
                 self.plans.lock().unwrap().insert(
                     token,
                     LoadPlan {
@@ -631,13 +716,13 @@ impl CacheService {
                         file_len,
                         block_size,
                         replicas,
-                        blocks: planned_blocks.clone(),
+                        blocks: blocks.clone(),
                     },
                 );
                 Ok(CacheAllocateResult {
                     object_id,
                     generation: out_generation,
-                    blocks: planned_blocks,
+                    blocks,
                 })
             }
             other => err_box!(
@@ -690,6 +775,31 @@ impl CacheService {
         Ok(blocks)
     }
 
+    /// P2-1 (4a review): re-derive the block layout of a plan from a
+    /// committed object identity, preserving the chosen worker sets and
+    /// geometry. The volatile `issued` identity is never trusted for the
+    /// wire answer or the stored plan when the durable outcome records a
+    /// different (earlier, winning) identity.
+    fn rebuild_blocks_for_identity(
+        planned: Vec<CacheBlockLocation>,
+        object_id: i64,
+        file_len: i64,
+        block_size: i64,
+    ) -> CommonResult<Vec<CacheBlockLocation>> {
+        let committed = CacheBlockLayout::derive(object_id, file_len, block_size)?;
+        let mut rebuilt = Vec::with_capacity(planned.len());
+        for (index, mut loc) in planned.into_iter().enumerate() {
+            loc.block_id = committed.block_id((index + 1) as i64)?;
+            loc.block_len = if (index + 1) as i64 == committed.block_count {
+                committed.last_len
+            } else {
+                committed.block_size
+            };
+            rebuilt.push(loc);
+        }
+        Ok(rebuilt)
+    }
+
     /// Commit the loaded object: `Reserved@g` -> `Valid` with the final
     /// `(len, ufs_mtime)` and the locations that actually succeeded. The
     /// reported locations must match the allocate plan bound to the load
@@ -709,6 +819,7 @@ impl CacheService {
             ttl_ms,
             blocks,
         } = params;
+        self.require_enabled()?;
         self.require_leader()?;
         validate_key(key)?;
         validate_client_token(token)?;
@@ -720,9 +831,32 @@ impl CacheService {
             );
         }
 
-        // 4a pins ttl_ms to 0, so the journaled expire_at is always 0;
-        // 4b will compute a real deadline and bind it here the same way.
-        let expire_at = 0i64;
+        // 4b P0-3: the expiry deadline is derived ONCE, here, from the
+        // incarnation's frozen durable policy — never from the client and
+        // never from a later mutable mount table entry. An exact outcome
+        // retry below reuses the recorded absolute value bit-exactly
+        // instead of recomputing.
+        let policy_ttl_ms = {
+            let store = self.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            rocks
+                .cache_get_incarnation_policy(incarnation)
+                .map_err(fs_err)?
+                .map(|p| p.ttl_ms)
+                .unwrap_or(0)
+        };
+        let mut expire_at = if policy_ttl_ms == 0 {
+            0
+        } else {
+            (LocalTime::mills() as i64)
+                .checked_add(policy_ttl_ms)
+                .ok_or_else(|| {
+                    cm_err(format!(
+                        "cache commit expire_at overflow: now + ttl {} ms",
+                        policy_ttl_ms
+                    ))
+                })?
+        };
 
         // Commit-token durable idempotency first: a retry after a lost
         // response resolves to its recorded Committed outcome. The outcome
@@ -735,6 +869,12 @@ impl CacheService {
         // entry after this commit recorded its outcome, the row (missing /
         // Tombstoned / advanced) answers Superseded; only a same-generation
         // exact Valid row answers AlreadyApplied.
+        //
+        // 4b P0-3: the recorded absolute `expire_at` is authoritative — an
+        // exact retry reuses it bit-exactly (the fresh computation above is
+        // discarded) so the deadline can never drift across retries, and
+        // the comparison deliberately excludes it (a recomputed value that
+        // differs only by retry latency is still an exact replay).
         let mut committed_outcome_exact = false;
         {
             let store = self.fs_dir.read();
@@ -757,9 +897,9 @@ impl CacheService {
                         && out_load_token == load_token
                         && out_len == len
                         && out_mtime == ufs_mtime
-                        && out_expire_at == expire_at
                     {
                         committed_outcome_exact = true;
+                        expire_at = out_expire_at;
                     } else {
                         return err_box!(
                         "cache commit token {:?} replayed with different parameters: committed ({}, {})@{} object {} load {:?} len {} mtime {} expire_at {}",
@@ -797,6 +937,18 @@ impl CacheService {
                     }
                 }
             }
+        }
+
+        // Incarnation gate (4b P0-2): ordered AFTER the token outcome read
+        // — divergence is detected from the recorded outcome first (a token
+        // replayed with different parameters is loud divergence, never a
+        // generic fenced error) — and BEFORE the load binding / row
+        // classification. In a live namespace the classification below
+        // resolves an exact recorded retry (Superseded/AlreadyApplied) from
+        // durable state; under a revoked or stale incarnation the load is
+        // terminal and dies with its namespace.
+        if !self.incarnation_active(incarnation)? {
+            return Err(Self::fenced(incarnation));
         }
 
         // Load binding: the durable Allocated outcome must record exactly
@@ -900,20 +1052,22 @@ impl CacheService {
                 Some(cur) if cur.state == CacheEntryState::Valid => {
                     // Same generation and object: only this load's commit
                     // could have written it.
-                    if cur.len == len && cur.ufs_mtime == ufs_mtime {
+                    if cur.len == len && cur.ufs_mtime == ufs_mtime && cur.expire_at == expire_at {
                         drop(store);
                         self.plans.lock().unwrap().remove(&load_token);
                         return Ok(CacheOpStatus::AlreadyApplied);
                     }
                     return err_box!(
-                        "cache commit parameter divergence for ({}, {})@{}: committed len {} mtime {} vs request len {} mtime {}",
+                        "cache commit parameter divergence for ({}, {})@{}: committed len {} mtime {} expire_at {} vs request len {} mtime {} expire_at {}",
                         incarnation,
                         key,
                         generation,
                         cur.len,
                         cur.ufs_mtime,
+                        cur.expire_at,
                         len,
-                        ufs_mtime
+                        ufs_mtime,
+                        expire_at
                     );
                 }
                 Some(_) if committed_outcome_exact => {
@@ -988,6 +1142,15 @@ impl CacheService {
         // deterministically here, before the terminal readback.
         self.fire_barrier_hook();
 
+        // Barrier readback: if a revoke/remount fenced the incarnation
+        // while the barrier ran, the apply was a deterministic no-op (the
+        // entry stays Reserved) — report the terminal fence, never a
+        // generic readback failure a client would keep retrying.
+        if !self.incarnation_active(incarnation)? {
+            self.plans.lock().unwrap().remove(&load_token);
+            return Err(Self::fenced(incarnation));
+        }
+
         // Readback from committed state, re-classified from the committed
         // row: another mutation (invalidate, a later allocation) may have
         // fenced the entry between our propose barrier and this read.
@@ -1005,16 +1168,18 @@ impl CacheService {
                 && cur.generation == generation
                 && cur.object_id == object_id
             {
-                if cur.len != len || cur.ufs_mtime != ufs_mtime {
+                if cur.len != len || cur.ufs_mtime != ufs_mtime || cur.expire_at != expire_at {
                     return err_box!(
-                        "cache commit readback divergence for ({}, {})@{}: committed len {} mtime {} vs request len {} mtime {}",
+                        "cache commit readback divergence for ({}, {})@{}: committed len {} mtime {} expire_at {} vs request len {} mtime {} expire_at {}",
                         incarnation,
                         key,
                         generation,
                         cur.len,
                         cur.ufs_mtime,
+                        cur.expire_at,
                         len,
-                        ufs_mtime
+                        ufs_mtime,
+                        expire_at
                     );
                 }
                 // Exact Valid readback (this propose or an identical
@@ -1072,8 +1237,15 @@ impl CacheService {
         expected_generation: u64,
         expected_object_id: i64,
     ) -> CommonResult<CacheOpStatus> {
+        self.require_enabled()?;
         self.require_leader()?;
         validate_key(key)?;
+        // Incarnation gate first (4b P0-2, no-token path): a revoked or
+        // stale namespace is terminal — the entry dies with its namespace
+        // and no fence is proposed.
+        if !self.incarnation_active(incarnation)? {
+            return Err(Self::fenced(incarnation));
+        }
         let new_generation = expected_generation
             .checked_add(1)
             .ok_or_else(|| cm_err("cache invalidate generation overflow: entry is terminal"))?;
@@ -1189,6 +1361,13 @@ impl CacheService {
         // deterministically here, before the terminal readback.
         self.fire_barrier_hook();
 
+        // Barrier readback: a revoke/remount that fenced the incarnation
+        // while the barrier ran turned the apply into a deterministic
+        // no-op — report the terminal fence.
+        if !self.incarnation_active(incarnation)? {
+            return Err(Self::fenced(incarnation));
+        }
+
         // Readback from committed state, re-classified from the committed
         // row: another mutation may have fenced past ours between the
         // propose barrier and this read. `generation >= new` is NOT enough
@@ -1229,6 +1408,175 @@ impl CacheService {
                 "cache invalidate barrier readback failed for ({}, {}): {:?}",
                 incarnation,
                 key,
+                other
+            ),
+        }
+    }
+
+    /// 4b: allocate the next never-reused mount incarnation for `mount_id`.
+    ///
+    /// Capability is verified against the PERSISTED mount table (gate 4):
+    /// the mount must exist and be write-cache-enabled, and the TTL +
+    /// capability snapshot frozen into the V2 journal entry come from that
+    /// durable `MountInfo` — never from the request and never from a later
+    /// mutable mount entry. Issuance is serialized under the issue lock
+    /// with a durable issuer token (committed watermark + 1), so restarts
+    /// and concurrent callers can never collide or regress; the committed
+    /// apply re-verifies the snapshot (fs_dir dispatch) and the service
+    /// re-reads the persisted mount table after the barrier.
+    pub fn allocate_incarnation(&self, rpc_id: i64, mount_id: u32) -> CommonResult<u64> {
+        self.require_enabled()?;
+        self.require_leader()?;
+        let _guard = self.issue_lock.lock().unwrap();
+
+        // Policy snapshot from the persisted mount table.
+        let (ttl_ms, cache_write) = {
+            let fs = self.fs_dir.read();
+            let mounts = fs.get_mount_table()?;
+            let m = mounts
+                .iter()
+                .find(|m| m.mount_id == mount_id)
+                .ok_or_else(|| {
+                    cm_err(format!(
+                        "cache incarnation allocation: mount {} not found in the persisted table",
+                        mount_id
+                    ))
+                })?;
+            if !m.write_cache_enabled() {
+                return err_box!(
+                    "cache incarnation allocation: mount {} is not write-cache-enabled (cache mode + read-write access required)",
+                    mount_id
+                );
+            }
+            (m.ttl_ms, true)
+        };
+
+        // Durable issuer token (watermark + 1) and the next incarnation
+        // (durable watermark + 1); both strictly monotonic under the issue
+        // lock.
+        let token = self.next_issuer_token()?;
+        let incarnation = {
+            let store = self.fs_dir.read();
+            let hw = store
+                .get_rocks_store()
+                .cache_get_state(state_tags::CACHE_INCARNATION)
+                .map_err(fs_err)?
+                .map(|h| h as u64)
+                .unwrap_or(0);
+            hw.checked_add(1)
+                .filter(|&i| i <= MAX_ISSUABLE_INCARNATION)
+                .ok_or_else(|| cm_err("cache incarnation space exhausted (i64 watermark bound)"))?
+        };
+
+        let op_id = self.fs_dir.read().next_op_id();
+        let entry = JournalEntry::CacheIncarnationAllocateV2(CacheIncarnationAllocateV2Entry {
+            op_id,
+            rpc_id,
+            token,
+            mount_id,
+            incarnation,
+            ttl_ms,
+            cache_write,
+        });
+        self.journal_writer
+            .sync_propose_cache(entry)
+            .map_err(fs_err)?;
+
+        // Post-barrier capability recheck (gate 4): the mount must still be
+        // write-cache-enabled with the same frozen TTL. A mount update that
+        // raced the barrier is reported loudly; the allocated incarnation
+        // stays durable (revoked) history — commits under it derive their
+        // deadline from the frozen policy row, never from the mutable
+        // table. Mount-id reuse across unmount/remount is fenced by task
+        // #6's atomic switch, out of 4b scope.
+        {
+            let fs = self.fs_dir.read();
+            let mounts = fs.get_mount_table()?;
+            match mounts.iter().find(|m| m.mount_id == mount_id) {
+                Some(m) if m.write_cache_enabled() && m.ttl_ms == ttl_ms => {}
+                other => {
+                    return err_box!(
+                        "cache incarnation allocation for mount {} raced a mount table change (post-barrier state {:?}): the incarnation is durable but its policy snapshot no longer matches the persisted mount",
+                        mount_id,
+                        other.map(|m| (m.write_cache_enabled(), m.ttl_ms))
+                    )
+                }
+            }
+        }
+
+        // Resolve from the committed outcome only.
+        let outcome = {
+            let store = self.fs_dir.read();
+            store
+                .get_rocks_store()
+                .cache_get_outcome(token)
+                .map_err(fs_err)?
+        };
+        match outcome {
+            Some(OpOutcome::IncarnationAllocatedV2 {
+                incarnation: out,
+                mount_id: out_mount,
+                ttl_ms: out_ttl,
+            }) if out == incarnation && out_mount == mount_id && out_ttl == ttl_ms => Ok(out),
+            other => err_box!(
+                "cache incarnation allocate barrier readback failed for mount {} incarnation {}: {:?}",
+                mount_id,
+                incarnation,
+                other
+            ),
+        }
+    }
+
+    /// 4b: revoke a mount incarnation (unmount fence). The row is kept
+    /// forever (marked revoked); the mount pointer is cleared only if it
+    /// still names this incarnation. Idempotent: revoking a missing or
+    /// already-revoked incarnation is AlreadyApplied.
+    pub fn revoke_incarnation(
+        &self,
+        rpc_id: i64,
+        mount_id: u32,
+        incarnation: u64,
+    ) -> CommonResult<CacheOpStatus> {
+        self.require_enabled()?;
+        self.require_leader()?;
+
+        // Classify from the committed row first.
+        {
+            let store = self.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            match rocks.cache_get_incarnation(incarnation).map_err(fs_err)? {
+                None => return Ok(CacheOpStatus::AlreadyApplied),
+                Some(row) if row.revoked => return Ok(CacheOpStatus::AlreadyApplied),
+                Some(row) if row.mount_id != mount_id => {
+                    return err_box!(
+                        "cache incarnation revoke: incarnation {} belongs to mount {}, revoke says mount {}",
+                        incarnation,
+                        row.mount_id,
+                        mount_id
+                    )
+                }
+                Some(_) => (),
+            }
+        }
+
+        let op_id = self.fs_dir.read().next_op_id();
+        let entry = JournalEntry::CacheIncarnationRevoke(CacheIncarnationRevokeEntry {
+            op_id,
+            rpc_id,
+            mount_id,
+            incarnation,
+        });
+        self.journal_writer
+            .sync_propose_cache(entry)
+            .map_err(fs_err)?;
+
+        let store = self.fs_dir.read();
+        let rocks = store.get_rocks_store();
+        match rocks.cache_get_incarnation(incarnation).map_err(fs_err)? {
+            Some(row) if row.revoked => Ok(CacheOpStatus::Applied),
+            other => err_box!(
+                "cache incarnation revoke barrier readback failed for incarnation {}: {:?}",
+                incarnation,
                 other
             ),
         }
@@ -1607,6 +1955,7 @@ mod tests {
     use crate::master::quota::eviction::EvictionConf;
     use crate::master::Master;
     use curvine_config::{ClusterConf, JournalConf, MasterConf};
+    use curvine_model::{AccessMode, MountOptions, WriteType};
     use curvine_raft::raft::{RaftClient, RoleState};
     use curvine_runtime::sync::StateCtl;
 
@@ -1678,6 +2027,17 @@ mod tests {
     }
 
     fn build_service(name: &str, chooser: Arc<dyn CacheWorkerChooser>) -> CacheService {
+        build_service_enabled(name, chooser, true)
+    }
+
+    /// 4b gate 5: `enabled=false` mirrors a production master started with
+    /// `master.cache_metadata_enabled=false` (the default); the dedicated
+    /// disabled test uses this to assert every entry point rejects.
+    fn build_service_enabled(
+        name: &str,
+        chooser: Arc<dyn CacheWorkerChooser>,
+        enabled: bool,
+    ) -> CacheService {
         let mut journal = JournalConf::with_test();
         journal.enable = true;
         let mut conf = ClusterConf {
@@ -1707,7 +2067,32 @@ mod tests {
         // burn logic; the raft barrier itself fails closed in testing mode
         // (no cluster) and is covered by the journal fault tests / 4e.
         monitor.journal_ctl.set_state(RoleState::Leader);
-        CacheService::new(fs_dir, writer, monitor, chooser)
+        // 4b gate 5: production defaults the capability OFF; tests enable
+        // it explicitly (a dedicated test covers the disabled rejection).
+        CacheService::new(fs_dir, writer, monitor, chooser, enabled)
+    }
+
+    /// Grants `incarnation` an active incarnation row with a frozen TTL
+    /// (unit-test stand-in for the 4b issuer: the real path verifies a
+    /// persisted write-cache-enabled mount table and crosses a raft
+    /// barrier). One call per incarnation; the token derives from the
+    /// incarnation so repeated calls never collide.
+    fn mount_incarnation(service: &CacheService, incarnation: u64, ttl_ms: i64) {
+        let store = service.fs_dir.read();
+        let rocks = store.get_rocks_store();
+        store
+            .cache
+            .apply_incarnation_allocate_v2(
+                rocks,
+                OpToken {
+                    client_id: 91,
+                    op_seq: incarnation,
+                },
+                5,
+                incarnation,
+                ttl_ms,
+            )
+            .unwrap();
     }
 
     /// Writes a committed entry straight through the manager apply path
@@ -1725,6 +2110,17 @@ mod tests {
         let store = service.fs_dir.read();
         let rocks = store.get_rocks_store();
         let mgr = &store.cache;
+        mgr.apply_incarnation_allocate_v2(
+            rocks,
+            OpToken {
+                client_id: 91,
+                op_seq: 1,
+            },
+            5,
+            1,
+            0,
+        )
+        .unwrap();
         mgr.apply_id_reserve(rocks, token(1, 1), OBJ, OBJ + 100)
             .unwrap();
         let alloc = CacheEntry {
@@ -1824,6 +2220,7 @@ mod tests {
     #[test]
     fn test_get_is_whole_object() {
         let service = build_service("get-whole-object", chooser(vec![worker(1), worker(2)]));
+        mount_incarnation(&service, 1, 0);
         let len = 150; // 3 blocks of 64: 64, 64, 22
         committed_entry(&service, token(2, 1), token(2, 2), "/k", OBJ, len, 0);
         let lay = layout(OBJ, len);
@@ -1874,6 +2271,7 @@ mod tests {
     #[test]
     fn test_get_miss_on_expired_entry() {
         let service = build_service("get-expired", chooser(vec![worker(1)]));
+        mount_incarnation(&service, 1, 0);
         // Expire in the past (passive expiry; active scan lands in 4c).
         committed_entry(&service, token(2, 1), token(2, 2), "/k", OBJ, 64, 1);
         service
@@ -1890,6 +2288,7 @@ mod tests {
     #[test]
     fn test_allocate_pre_barrier_validation() {
         let service = build_service("allocate-validation", chooser(vec![worker(1), worker(2)]));
+        mount_incarnation(&service, 1, 0);
         committed_entry(&service, token(2, 1), token(2, 2), "/k", OBJ, 64, 0);
 
         // Forged issuer identity.
@@ -1936,6 +2335,7 @@ mod tests {
         // A fully valid allocate reaches the sync-propose barrier, which
         // fails closed in testing mode: the reserve is never skipped.
         let service = build_service("allocate-barrier", chooser(vec![worker(1), worker(2)]));
+        mount_incarnation(&service, 1, 0);
         let err = service
             .allocate(token(3, 8), 7, 1, "/new", 128, 64)
             .unwrap_err();
@@ -1955,6 +2355,7 @@ mod tests {
     #[test]
     fn test_allocate_token_retry_and_expired() {
         let service = build_service("allocate-retry", chooser(vec![worker(1)]));
+        mount_incarnation(&service, 1, 0);
         // A committed allocate outcome written by a previous leader
         // (file_len 128 = 2 blocks of 64).
         {
@@ -2022,6 +2423,7 @@ mod tests {
     #[test]
     fn test_allocate_len0_replan_is_empty() {
         let service = build_service("allocate-len0", chooser(vec![worker(1)]));
+        mount_incarnation(&service, 1, 0);
         {
             let store = service.fs_dir.read();
             let rocks = store.get_rocks_store();
@@ -2058,6 +2460,7 @@ mod tests {
     #[test]
     fn test_segment_burn_rules() {
         let service = build_service("segment-burn", chooser(vec![worker(1)]));
+        mount_incarnation(&service, 1, 0);
         let epoch = service.monitor.journal_epoch();
 
         // Install a fresh segment: ids are consumed in order.
@@ -2115,6 +2518,7 @@ mod tests {
     #[test]
     fn test_issuer_seq_is_durable_watermark() {
         let service = build_service("issuer-seq", chooser(vec![worker(1)]));
+        mount_incarnation(&service, 1, 0);
         assert_eq!(service.next_issuer_token().unwrap(), token(0, 1));
         {
             let store = service.fs_dir.read();
@@ -2140,6 +2544,7 @@ mod tests {
     #[test]
     fn test_leader_gate_burns_segment() {
         let service = build_service("leader-burn", chooser(vec![worker(1)]));
+        mount_incarnation(&service, 1, 0);
         let epoch = service.monitor.journal_epoch();
         *service.segment.lock().unwrap() = Some(Segment {
             next: OBJ,
@@ -2157,6 +2562,7 @@ mod tests {
     #[test]
     fn test_commit_requires_plan() {
         let service = build_service("commit-plan-mandatory", chooser(vec![worker(1)]));
+        mount_incarnation(&service, 1, 0);
         // Reserved row + recorded load outcome exist, but no volatile plan
         // for the load token.
         {
@@ -2202,6 +2608,7 @@ mod tests {
     #[test]
     fn test_commit_outcome_retry_already_applied() {
         let service = build_service("commit-retry", chooser(vec![worker(1)]));
+        mount_incarnation(&service, 1, 0);
         committed_entry(&service, token(2, 1), token(2, 2), "/k", OBJ, 130, 0);
 
         // Same-generation exact Valid row: the recorded-outcome retry is
@@ -2307,6 +2714,7 @@ mod tests {
     #[test]
     fn test_commit_superseded_retry_without_plan() {
         let service = build_service("commit-superseded-retry", chooser(vec![worker(1)]));
+        mount_incarnation(&service, 1, 0);
         // Reserved row + recorded load allocation.
         {
             let store = service.fs_dir.read();
@@ -2383,6 +2791,7 @@ mod tests {
     #[test]
     fn test_commit_rejects_malformed_evidence() {
         let service = build_service("commit-evidence", chooser(vec![worker(1), worker(2)]));
+        mount_incarnation(&service, 1, 0);
         {
             let store = service.fs_dir.read();
             let rocks = store.get_rocks_store();
@@ -2497,6 +2906,7 @@ mod tests {
             "commit-replica-policy",
             chooser_with_policy(vec![worker(1), worker(2)], 2),
         );
+        mount_incarnation(&service, 1, 0);
         {
             let store = service.fs_dir.read();
             let rocks = store.get_rocks_store();
@@ -2555,6 +2965,7 @@ mod tests {
     #[test]
     fn test_invalidate_classification() {
         let service = build_service("invalidate-classify", chooser(vec![worker(1)]));
+        mount_incarnation(&service, 1, 0);
         // Missing entry.
         assert_eq!(
             service.invalidate(7, 1, "/missing", 1, OBJ).unwrap(),
@@ -2619,6 +3030,7 @@ mod tests {
     #[test]
     fn test_invalidate_forged_object_identity() {
         let service = build_service("invalidate-forged-id", chooser(vec![worker(1)]));
+        mount_incarnation(&service, 1, 0);
         // Object A committed then removed: row is Tombstoned@2.
         committed_entry(&service, token(2, 1), token(2, 2), "/k", OBJ, 64, 0);
         {
@@ -2668,6 +3080,7 @@ mod tests {
     #[test]
     fn test_invalidate_superseded_cleanup_verified_only() {
         let service = build_service("invalidate-superseded-cleanup", chooser(vec![worker(1)]));
+        mount_incarnation(&service, 1, 0);
         // Row fenced twice: Tombstoned@3.
         committed_entry(&service, token(2, 1), token(2, 2), "/k", OBJ, 64, 0);
         {
@@ -2721,6 +3134,7 @@ mod tests {
         let mut big = worker(1);
         big.hostname = "h".repeat(200);
         let service = build_service("allocate-wire-cap", chooser(vec![big]));
+        mount_incarnation(&service, 1, 0);
         let block_size: i64 = 64;
 
         // 65536 blocks x (fixed overhead + 200-byte hostname) far exceeds
@@ -2742,5 +3156,385 @@ mod tests {
             "under-cap plan must proceed to the barrier: {}",
             err
         );
+    }
+
+    /// 4b gate 5: with the capability disabled (the production default),
+    /// every cache entry point rejects before touching any state.
+    #[test]
+    fn test_service_disabled_rejects_all_entry_points() {
+        let service = build_service_enabled("disabled-gate", chooser(vec![worker(1)]), false);
+
+        let expect_disabled = |err: _| {
+            let msg = format!("{}", err);
+            assert!(
+                msg.contains("cache metadata capability is disabled"),
+                "{}",
+                msg
+            );
+        };
+
+        expect_disabled(service.get(1, "/k", false).unwrap_err());
+        expect_disabled(
+            service
+                .allocate(token(3, 1), 7, 1, "/k", 64, 64)
+                .unwrap_err(),
+        );
+        expect_disabled(
+            service
+                .commit(commit_params(token(2, 1), token(2, 2), vec![]))
+                .unwrap_err(),
+        );
+        expect_disabled(service.invalidate(7, 1, "/k", 1, OBJ).unwrap_err());
+        expect_disabled(service.allocate_incarnation(7, 5).unwrap_err());
+        expect_disabled(service.revoke_incarnation(7, 5, 1).unwrap_err());
+    }
+
+    /// 4b P0-2 fenced paths: once the incarnation is revoked, the
+    /// no-token paths are terminal (get = plain miss, mutations = fenced
+    /// error), while an exact recorded allocate retry still resolves from
+    /// durable history BEFORE the gate (lost-response replay must return
+    /// the committed identity even though the namespace has since died).
+    #[test]
+    fn test_fenced_incarnation_paths() {
+        let service = build_service("fenced-paths", chooser(vec![worker(1)]));
+        mount_incarnation(&service, 1, 0);
+        committed_entry(&service, token(2, 1), token(2, 2), "/k", OBJ, 130, 0);
+
+        // Revoke the namespace directly through the manager apply (the
+        // unit-test stand-in for the service revoke, which needs a raft
+        // barrier).
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            store.cache.apply_incarnation_revoke(rocks, 5, 1).unwrap();
+        }
+
+        // get is a plain miss — the caller falls back to the UFS.
+        assert!(service.get(1, "/k", false).unwrap().is_none());
+
+        // Mutations are fenced terminal errors naming the incarnation.
+        let fenced = |err: _| {
+            let msg = format!("{}", err);
+            assert!(
+                msg.contains("terminal") && msg.contains("incarnation 1"),
+                "{}",
+                msg
+            );
+        };
+        fenced(
+            service
+                .allocate(token(3, 1), 7, 1, "/x", 64, 64)
+                .unwrap_err(),
+        );
+        fenced(service.invalidate(7, 1, "/k", 1, OBJ).unwrap_err());
+        // A fresh commit token: no outcome, watermark clear -> the gate is
+        // reached and fences.
+        fenced(
+            service
+                .commit(commit_params(token(2, 1), token(3, 2), vec![]))
+                .unwrap_err(),
+        );
+        // An exact recorded commit retry: divergence check passes (exact
+        // match), then the gate still fences — the load dies with its
+        // namespace; the durable Committed outcome answers any later
+        // classification only in a live namespace.
+        fenced(
+            service
+                .commit(commit_params(token(2, 1), token(2, 2), vec![]))
+                .unwrap_err(),
+        );
+
+        // BUT the exact recorded allocate retry resolves BEFORE the gate.
+        let res = service.allocate(token(2, 1), 7, 1, "/k", 130, 64).unwrap();
+        assert_eq!(res.object_id, OBJ);
+        assert_eq!(res.generation, 1);
+    }
+
+    /// 4b P0-3: commit expiry derivation. The deadline comes from the
+    /// incarnation's frozen policy row, computed once at the leader; an
+    /// exact recorded retry reuses the durable absolute value bit-exactly
+    /// (a recomputation would drift by the retry latency, and the
+    /// row-comparison would then report divergence); an unsatisfiable
+    /// deadline (now + ttl overflow) fails closed before any propose.
+    #[test]
+    fn test_commit_ttl_derivation_reuse_and_overflow() {
+        let service = build_service("commit-ttl", chooser(vec![worker(1)]));
+        // Incarnation 1 with a 1h TTL, and a committed row whose recorded
+        // expire_at is a fixed constant far away from now + 3_600_000.
+        mount_incarnation(&service, 1, 3_600_000);
+        const E: i64 = 1_234_567;
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let mgr = &store.cache;
+            mgr.apply_id_reserve(rocks, token(1, 1), OBJ, OBJ + 100)
+                .unwrap();
+            let alloc = CacheEntry {
+                generation: 1,
+                state: CacheEntryState::Reserved,
+                object_id: OBJ,
+                len: 0,
+                ufs_mtime: 0,
+                block_size: 64,
+                expire_at: 0,
+            };
+            mgr.apply_allocate(rocks, token(2, 1), 1, "/k", 130, &alloc)
+                .unwrap();
+            mgr.apply_commit(
+                rocks,
+                token(2, 1),
+                token(2, 2),
+                1,
+                "/k",
+                1,
+                OBJ,
+                130,
+                777,
+                E,
+            )
+            .unwrap();
+        }
+
+        // Exact retry resolves AlreadyApplied reusing the recorded E: had
+        // the retry recomputed now + ttl (or compared that recomputation
+        // against the row) this would diverge, because E != now + 3_600_000.
+        assert_eq!(
+            service
+                .commit(commit_params(token(2, 1), token(2, 2), vec![]))
+                .unwrap(),
+            CacheOpStatus::AlreadyApplied
+        );
+
+        // Overflow fail-closed: a policy ttl of i64::MAX cannot produce a
+        // deadline; rejected pre-barrier, before the outcome read. Mount a
+        // second incarnation with the unsatisfiable ttl (the manager apply
+        // only validates ttl >= 0 — the deadline math is commit-time).
+        mount_incarnation(&service, 2, i64::MAX);
+        let params = CacheCommitParams {
+            token: token(4, 2),
+            load_token: token(4, 1),
+            rpc_id: 7,
+            incarnation: 2,
+            key: "/k2",
+            generation: 1,
+            object_id: OBJ,
+            len: 130,
+            ufs_mtime: 777,
+            ttl_ms: 0,
+            blocks: vec![],
+        };
+        let err = service.commit(params).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("overflow"), "{}", msg);
+        assert!(!msg.contains("raft"), "{}", msg);
+    }
+
+    /// 4b gate 4: incarnation issuance verifies the PERSISTED mount table.
+    /// An unknown or non-write-cache mount never mints an incarnation; a
+    /// valid write-cache mount proceeds to the (fail-closed) raft barrier.
+    #[test]
+    fn test_issuer_capability_gates() {
+        let service = build_service("issuer-gates", chooser(vec![worker(1)]));
+
+        // Nothing persisted at all.
+        let err = service.allocate_incarnation(7, 5).unwrap_err();
+        assert!(format!("{}", err).contains("not found"), "{}", err);
+
+        // Persist mounts: 5 = write-cache enabled (1h ttl), 6 = cache mode
+        // but read-only, 7 = fs mode. Written straight to rocks (no
+        // journaling) — this is the persisted table the issuer must trust.
+        let write_cache_mount = MountOptions::builder()
+            .write_type(WriteType::CacheMode)
+            .access_mode(AccessMode::ReadWrite)
+            .write_cache(true)
+            .ttl_ms(3_600_000)
+            .build()
+            .to_info(5, "/mnt/a", "file:///tmp/curvine-a");
+        let read_only_mount = MountOptions::builder()
+            .write_type(WriteType::CacheMode)
+            .access_mode(AccessMode::ReadOnly)
+            .write_cache(true)
+            .build()
+            .to_info(6, "/mnt/b", "file:///tmp/curvine-b");
+        let fs_mount = MountOptions::builder()
+            .write_type(WriteType::FsMode)
+            .access_mode(AccessMode::ReadWrite)
+            .write_cache(false)
+            .build()
+            .to_info(7, "/mnt/c", "file:///tmp/curvine-c");
+        service
+            .fs_dir
+            .write()
+            .unprotected_store_mount(write_cache_mount)
+            .unwrap();
+        service
+            .fs_dir
+            .write()
+            .unprotected_store_mount(read_only_mount)
+            .unwrap();
+        service
+            .fs_dir
+            .write()
+            .unprotected_store_mount(fs_mount)
+            .unwrap();
+
+        // Unknown id still not found (the table is keyed by mount id).
+        let err = service.allocate_incarnation(7, 99).unwrap_err();
+        assert!(format!("{}", err).contains("not found"), "{}", err);
+
+        // Capability gates: read-only cache mode and fs mode are rejected
+        // before any token or id is minted.
+        let err = service.allocate_incarnation(7, 6).unwrap_err();
+        assert!(
+            format!("{}", err).contains("not write-cache-enabled"),
+            "{}",
+            err
+        );
+        let err = service.allocate_incarnation(7, 7).unwrap_err();
+        assert!(
+            format!("{}", err).contains("not write-cache-enabled"),
+            "{}",
+            err
+        );
+
+        // Valid mount: passes the capability gates and reaches the
+        // fail-closed raft barrier (rejected there only because unit tests
+        // have no cluster).
+        let err = service.allocate_incarnation(7, 5).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("raft"), "{}", msg);
+        assert!(
+            !msg.contains("not found") && !msg.contains("write-cache-enabled"),
+            "{}",
+            msg
+        );
+    }
+
+    /// 4b gate 4 apply side: the V2 journal apply re-verifies the frozen
+    /// policy snapshot against the persisted mount table — leader and
+    /// follower replay the same deterministic check. A vanished mount, a
+    /// TTL change, or a capability change between issuance and apply is
+    /// loud divergence, never a silently mis-policy'd namespace.
+    #[test]
+    fn test_incarnation_allocate_v2_apply_time_policy_verification() {
+        let service = build_service("apply-v2-verify", chooser(vec![worker(1)]));
+        let mount = MountOptions::builder()
+            .write_type(WriteType::CacheMode)
+            .access_mode(AccessMode::ReadWrite)
+            .write_cache(true)
+            .ttl_ms(3_600_000)
+            .build()
+            .to_info(5, "/mnt/a", "file:///tmp/curvine-a");
+        service
+            .fs_dir
+            .write()
+            .unprotected_store_mount(mount)
+            .unwrap();
+
+        let v2 = |ttl_ms: i64, cache_write: bool, mount_id: u32| {
+            JournalEntry::CacheIncarnationAllocateV2(CacheIncarnationAllocateV2Entry {
+                op_id: 1,
+                rpc_id: 7,
+                token: token(91, 1),
+                mount_id,
+                incarnation: 1,
+                ttl_ms,
+                cache_write,
+            })
+        };
+
+        // Exact snapshot applies and the frozen policy row is durable.
+        service
+            .fs_dir
+            .read()
+            .apply_cache_journal_entry(&v2(3_600_000, true, 5))
+            .unwrap();
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            assert_eq!(
+                rocks
+                    .cache_get_incarnation_policy(1)
+                    .unwrap()
+                    .map(|p| p.ttl_ms),
+                Some(3_600_000)
+            );
+        }
+
+        // TTL mismatch: loud divergence before the manager apply.
+        let err = service
+            .fs_dir
+            .read()
+            .apply_cache_journal_entry(&v2(9, true, 5))
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("apply-time policy verification"),
+            "{}",
+            err
+        );
+
+        // Capability mismatch: loud divergence.
+        let err = service
+            .fs_dir
+            .read()
+            .apply_cache_journal_entry(&v2(3_600_000, false, 5))
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("apply-time policy verification"),
+            "{}",
+            err
+        );
+
+        // Vanished mount: loud divergence.
+        let err = service
+            .fs_dir
+            .read()
+            .apply_cache_journal_entry(&v2(3_600_000, true, 99))
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("apply-time policy verification"),
+            "{}",
+            err
+        );
+    }
+
+    /// P2-1 (4a review): when the barrier readback reveals the durable
+    /// outcome recorded a different (earlier, winning) object identity, the
+    /// locally planned block ids are re-derived from the committed identity
+    /// — same geometry, same chosen worker sets, no block id left pointing
+    /// at the burned local id.
+    #[test]
+    fn test_rebuild_blocks_for_identity() {
+        let issued = OBJ;
+        let committed = OBJ + 37;
+        let lay = layout(issued, 130); // 3 blocks of 64: 64, 64, 2
+        assert_eq!(lay.block_count, 3);
+
+        let planned = full_locations(&lay);
+        let rebuilt =
+            CacheService::rebuild_blocks_for_identity(planned.clone(), committed, 130, 64).unwrap();
+        let committed_lay = layout(committed, 130);
+        for (index, (p, r)) in planned.iter().zip(rebuilt.iter()).enumerate() {
+            // Worker sets preserved exactly as chosen.
+            assert_eq!(p.workers, r.workers);
+            // Block ids re-derived from the committed identity.
+            assert_eq!(
+                r.block_id,
+                committed_lay.block_id(index as i64 + 1).unwrap()
+            );
+            // Geometry preserved: full blocks except the short tail.
+            assert_eq!(
+                r.block_len,
+                if index as i64 + 1 == committed_lay.block_count {
+                    committed_lay.last_len
+                } else {
+                    committed_lay.block_size
+                }
+            );
+        }
+        // No rebuilt id still references the burned identity.
+        assert!(rebuilt
+            .iter()
+            .all(|r| r.block_id != layout(issued, 130).block_id(1).unwrap()));
     }
 }

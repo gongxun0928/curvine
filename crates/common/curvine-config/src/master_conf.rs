@@ -140,6 +140,12 @@ pub struct MasterConf {
     /// explicitly configured).
     pub compatibility: CompatibilityConf,
 
+    /// Cache metadata capability switch (task #4 phase 4b). Default OFF in
+    /// production: every cache handler/service entry rejects until this is
+    /// explicitly enabled; the atomic flip to ON lands with task #6.
+    #[serde(default)]
+    pub cache_metadata_enabled: bool,
+
     #[serde(default = "MasterConf::rocksdb_default")]
     pub rocksdb: DBConf,
 }
@@ -342,6 +348,8 @@ impl Default for MasterConf {
             global_limit: 4096,
 
             compatibility: Default::default(),
+
+            cache_metadata_enabled: false,
 
             rocksdb,
         };

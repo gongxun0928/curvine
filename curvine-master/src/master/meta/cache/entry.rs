@@ -49,9 +49,12 @@
 //! CF_CACHE_MOUNT
 //!   key   = 0x01 ++ mount_id:u32     (current incarnation pointer)
 //!         | 0x02 ++ incarnation:u64  (incarnation row)
+//!         | 0x03 ++ incarnation:u64  (4b policy row, option A)
 //!   value = incarnation:u64 | IncarnationRow {mount_id, revoked}
+//!         | IncarnationPolicyRow {ttl_ms}
 //!   life  = incarnation rows are durable forever (cheap, monotonic);
-//!           the pointer row is deleted on revoke.
+//!           the pointer row is deleted on revoke. Policy rows are written
+//!           with the allocation and never mutated.
 //!
 //! CF_CACHE_STATE
 //!   key   = static tag (&str)
@@ -111,11 +114,26 @@ pub struct ExpiryRow {
 }
 
 /// Durable mount incarnation row. `mount_id` is a reusable routing id;
-/// `incarnation` is never reused.
+/// `incarnation` is never reused. The row layout is frozen at 4a (bincode
+/// positional encoding cannot absorb appended fields — see journal/entry.rs);
+/// the 4b policy snapshot lives in a separate [`IncarnationPolicyRow`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IncarnationRow {
     pub mount_id: u32,
     pub revoked: bool,
+}
+
+/// 4b policy snapshot for an incarnation, stored under a separate
+/// CF_CACHE_MOUNT key (`0x03 ++ incarnation:u64`) so the legacy
+/// [`IncarnationRow`] bytes stay decodable. `ttl_ms` freezes the VERIFIED
+/// mount properties' TTL at allocation time: commits under this incarnation
+/// derive `expire_at` from this durable value, never from the client and
+/// never from a later mutable mount table entry. Rows written before 4b
+/// have no policy row; readers treat a missing policy row as `ttl_ms == 0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IncarnationPolicyRow {
+    /// 0 = no TTL for entries committed under this incarnation.
+    pub ttl_ms: i64,
 }
 
 /// Persistent operation token, decoupled from transport rpc ids: carried
@@ -133,7 +151,10 @@ pub struct OpToken {
 pub enum OpOutcome {
     /// Global cache-object-id segment reservation `[start, end)`.
     Reserved { start: i64, end: i64 },
-    /// Mount incarnation allocation.
+    /// Mount incarnation allocation (4a legacy shape: incarnation only).
+    /// Kept byte-compatible for journals/outcomes written before 4b; it can
+    /// only be produced by replaying the legacy journal entry, and a new
+    /// issuer never matches against it as an exact parameter binding.
     IncarnationAllocated { incarnation: u64 },
     /// Per-key load allocation: the object id identity must be recoverable,
     /// and the exact request geometry is recorded so a retry (including a
@@ -162,6 +183,15 @@ pub enum OpOutcome {
         len: i64,
         ufs_mtime: i64,
         expire_at: i64,
+    },
+    /// 4b incarnation allocation with the full frozen request bound: a
+    /// token replayed with any different parameter (mount id, TTL,
+    /// incarnation) is divergence, never AlreadyApplied. Appended at the
+    /// enum tail so 4a `IncarnationAllocated` bytes keep decoding.
+    IncarnationAllocatedV2 {
+        incarnation: u64,
+        mount_id: u32,
+        ttl_ms: i64,
     },
 }
 
@@ -339,6 +369,86 @@ pub fn validate_incarnation(incarnation: u64) -> CommonResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hex_decode(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn test_frozen_7e3f8a02_row_and_outcome_bytes_decode_at_head() {
+        // Frozen bytes of the 4a (7e3f8a02) IncarnationRow and legacy
+        // IncarnationAllocated outcome. The legacy layouts are unchanged
+        // since (4b stores the policy snapshot under a separate key and the
+        // full binding in a V2 outcome variant), so RocksDB rows written by
+        // 4a must keep decoding bit-identically.
+        const ROW_HEX: &str = "0300000000";
+        let row: IncarnationRow =
+            curvine_runtime::common::SerdeUtils::deserialize(&hex_decode(ROW_HEX)).unwrap();
+        assert_eq!(
+            row,
+            IncarnationRow {
+                mount_id: 3,
+                revoked: false
+            }
+        );
+
+        const ROW_REVOKED_HEX: &str = "0400000001";
+        let row: IncarnationRow =
+            curvine_runtime::common::SerdeUtils::deserialize(&hex_decode(ROW_REVOKED_HEX)).unwrap();
+        assert_eq!(
+            row,
+            IncarnationRow {
+                mount_id: 4,
+                revoked: true
+            }
+        );
+
+        // Legacy outcome: incarnation only, discriminant 1. A V2 request
+        // (mount + ttl bound) can never equal it, so a replay with the same
+        // token is loud divergence rather than a false AlreadyApplied.
+        const OUTCOME_LEGACY_HEX: &str = "010000000c00000000000000";
+        let oc: OpOutcome =
+            curvine_runtime::common::SerdeUtils::deserialize(&hex_decode(OUTCOME_LEGACY_HEX))
+                .unwrap();
+        assert_eq!(oc, OpOutcome::IncarnationAllocated { incarnation: 12 });
+        assert_ne!(
+            oc,
+            OpOutcome::IncarnationAllocatedV2 {
+                incarnation: 12,
+                mount_id: 0,
+                ttl_ms: 0
+            }
+        );
+
+        // V2 outcome roundtrip: discriminant 4 (enum tail), full binding.
+        const OUTCOME_V2_HEX: &str = "040000000c000000000000000300000080ee360000000000";
+        let bytes =
+            curvine_runtime::common::SerdeUtils::serialize(&OpOutcome::IncarnationAllocatedV2 {
+                incarnation: 12,
+                mount_id: 3,
+                ttl_ms: 3_600_000,
+            })
+            .unwrap();
+        assert_eq!(
+            bytes
+                .iter()
+                .map(|x| format!("{:02x}", x))
+                .collect::<String>(),
+            OUTCOME_V2_HEX
+        );
+        let back: OpOutcome = curvine_runtime::common::SerdeUtils::deserialize(&bytes).unwrap();
+        assert_eq!(
+            back,
+            OpOutcome::IncarnationAllocatedV2 {
+                incarnation: 12,
+                mount_id: 3,
+                ttl_ms: 3_600_000
+            }
+        );
+    }
 
     #[test]
     fn test_key_encoding_roundtrip_and_order() {

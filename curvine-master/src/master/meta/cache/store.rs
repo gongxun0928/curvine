@@ -31,7 +31,7 @@
 //! No in-memory entry table exists in Phase 1; every read hits the store.
 
 use crate::master::meta::cache::entry::{
-    CacheEntry, ExpiryRow, IncarnationRow, ObjectRow, OpOutcome, OpToken,
+    CacheEntry, ExpiryRow, IncarnationPolicyRow, IncarnationRow, ObjectRow, OpOutcome, OpToken,
 };
 use curvine_error::FsResult;
 
@@ -60,6 +60,14 @@ pub trait CacheWrite {
 
     /// Create/update an incarnation row. Incarnation rows are durable forever.
     fn put_incarnation(&mut self, incarnation: u64, row: IncarnationRow) -> FsResult<()>;
+
+    /// 4b option A: write the incarnation's frozen policy snapshot under a
+    /// separate key. Written once at allocation; never mutated or deleted.
+    fn put_incarnation_policy(
+        &mut self,
+        incarnation: u64,
+        row: IncarnationPolicyRow,
+    ) -> FsResult<()>;
 
     /// Set the mount's current-incarnation pointer.
     fn set_current_incarnation(&mut self, mount_id: u32, incarnation: u64) -> FsResult<()>;
@@ -117,6 +125,14 @@ pub trait LocalCacheIndexStore {
 
     /// The mount's current incarnation, if mounted and not revoked.
     fn cache_current_incarnation(&self, mount_id: u32) -> FsResult<Option<u64>>;
+
+    /// The incarnation's frozen policy snapshot (4b option A). Pre-4b
+    /// allocations have no policy row; implementations synthesize
+    /// `ttl_ms == 0` so callers never need a None branch.
+    fn cache_get_incarnation_policy(
+        &self,
+        incarnation: u64,
+    ) -> FsResult<Option<IncarnationPolicyRow>>;
 
     fn cache_get_outcome(&self, token: OpToken) -> FsResult<Option<OpOutcome>>;
 

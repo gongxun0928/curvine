@@ -30,8 +30,8 @@
 
 use crate::master::meta::block_id::{BlockIdCodec, CacheObjectId};
 use crate::master::meta::cache::entry::{
-    validate_incarnation, CacheEntry, CacheEntryState, ExpiryRow, IncarnationRow, ObjectRow,
-    OpOutcome, OpToken,
+    validate_incarnation, CacheEntry, CacheEntryState, ExpiryRow, IncarnationPolicyRow,
+    IncarnationRow, ObjectRow, OpOutcome, OpToken,
 };
 use crate::master::meta::cache::store::{state_tags, CacheWrite, LocalCacheIndexStore};
 use curvine_core_error::{err_box, err_msg, CommonError, CommonResult};
@@ -244,7 +244,12 @@ impl CacheManager {
         Ok(())
     }
 
-    /// Identity-producing: allocate a never-reused mount incarnation.
+    /// Identity-producing (4a legacy): allocate a never-reused mount
+    /// incarnation WITHOUT a policy snapshot. Only reachable by replaying a
+    /// legacy `CacheIncarnationAllocate` journal entry written before 4b;
+    /// the 4b issuer writes [`Self::apply_incarnation_allocate_v2`]. The
+    /// recorded outcome is the legacy shape (incarnation only): a new V2
+    /// request carrying mount/ttl parameters can never match it exactly.
     pub fn apply_incarnation_allocate<S: LocalCacheIndexStore>(
         &self,
         store: &S,
@@ -265,6 +270,107 @@ impl CacheManager {
             store,
             token,
             &OpOutcome::IncarnationAllocated { incarnation },
+        )?;
+        match gate {
+            // Exact recorded history: may recover the in-memory watermark.
+            TokenGate::AlreadyApplied => {
+                self.advance_incarnation(incarnation);
+                return Ok(());
+            }
+            // Terminal, strict no-op: the entry's parameters are not
+            // trusted history.
+            TokenGate::Expired => return Ok(()),
+            TokenGate::Execute => (),
+        }
+
+        if let Some(row) = store.cache_get_incarnation(incarnation).map_err(cv)? {
+            return err_box!(
+                "incarnation {} already exists (mount {}, revoked {}) under a different token",
+                incarnation,
+                row.mount_id,
+                row.revoked
+            );
+        }
+        if let Some(hw) = store
+            .cache_get_state(state_tags::CACHE_INCARNATION)
+            .map_err(cv)?
+        {
+            if incarnation <= hw as u64 {
+                return err_box!(
+                    "incarnation {} is not above the durable watermark {}",
+                    incarnation,
+                    hw
+                );
+            }
+        }
+
+        // Never regress an existing newer pointer for this mount.
+        let write_pointer = match store.cache_current_incarnation(mount_id).map_err(cv)? {
+            Some(c) => c < incarnation,
+            None => true,
+        };
+
+        self.advance_incarnation(incarnation);
+
+        let mut w = store.cache_write();
+        w.put_incarnation(
+            incarnation,
+            IncarnationRow {
+                mount_id,
+                revoked: false,
+            },
+        )
+        .map_err(cv)?;
+        if write_pointer {
+            w.set_current_incarnation(mount_id, incarnation)
+                .map_err(cv)?;
+        }
+        // Legacy outcome shape: incarnation only. No policy row is written;
+        // readers treat a missing policy row as `ttl_ms == 0`.
+        w.put_outcome(token, &OpOutcome::IncarnationAllocated { incarnation })
+            .map_err(cv)?;
+        w.set_client_watermark(token.client_id, token.op_seq)
+            .map_err(cv)?;
+        w.set_state(state_tags::CACHE_INCARNATION, incarnation as i64)
+            .map_err(cv)?;
+        w.commit().map_err(cv)?;
+        Ok(())
+    }
+
+    /// Identity-producing (4b): allocate a never-reused mount incarnation
+    /// with the frozen policy snapshot. The TTL is persisted in a separate
+    /// policy row (option A) so the 4a `IncarnationRow` bytes stay
+    /// decodable; the recorded outcome is the V2 variant binding the full
+    /// request (mount + ttl + incarnation) so a replayed token with
+    /// different parameters is divergence, never AlreadyApplied.
+    pub fn apply_incarnation_allocate_v2<S: LocalCacheIndexStore>(
+        &self,
+        store: &S,
+        token: OpToken,
+        mount_id: u32,
+        incarnation: u64,
+        ttl_ms: i64,
+    ) -> CommonResult<()> {
+        Self::check_token(token)?;
+        if incarnation == 0 || incarnation > MAX_ISSUABLE_INCARNATION {
+            return err_box!(
+                "incarnation outside issuable range [1, {}]: {}",
+                MAX_ISSUABLE_INCARNATION,
+                incarnation
+            );
+        }
+        if ttl_ms < 0 {
+            return err_box!("mount ttl_ms must be non-negative: {}", ttl_ms);
+        }
+
+        let gate = Self::classify_token(
+            store,
+            token,
+            &OpOutcome::IncarnationAllocatedV2 {
+                incarnation,
+                mount_id,
+                ttl_ms,
+            },
         )?;
         match gate {
             // Exact recorded history: may recover the in-memory watermark.
@@ -315,6 +421,7 @@ impl CacheManager {
         self.advance_incarnation(incarnation);
 
         let mut w = store.cache_write();
+        // Legacy-shape row (frozen at 4a) + separate 4b policy row.
         w.put_incarnation(
             incarnation,
             IncarnationRow {
@@ -323,12 +430,21 @@ impl CacheManager {
             },
         )
         .map_err(cv)?;
+        w.put_incarnation_policy(incarnation, IncarnationPolicyRow { ttl_ms })
+            .map_err(cv)?;
         if write_pointer {
             w.set_current_incarnation(mount_id, incarnation)
                 .map_err(cv)?;
         }
-        w.put_outcome(token, &OpOutcome::IncarnationAllocated { incarnation })
-            .map_err(cv)?;
+        w.put_outcome(
+            token,
+            &OpOutcome::IncarnationAllocatedV2 {
+                incarnation,
+                mount_id,
+                ttl_ms,
+            },
+        )
+        .map_err(cv)?;
         w.set_client_watermark(token.client_id, token.op_seq)
             .map_err(cv)?;
         w.set_state(state_tags::CACHE_INCARNATION, incarnation as i64)
@@ -371,6 +487,8 @@ impl CacheManager {
         let clear_pointer = matches!(store.cache_current_incarnation(mount_id).map_err(cv)?, Some(c) if c == incarnation);
 
         let mut w = store.cache_write();
+        // The policy row (if any) is never touched: it is durable history,
+        // not live configuration.
         w.put_incarnation(
             incarnation,
             IncarnationRow {
@@ -384,6 +502,24 @@ impl CacheManager {
         }
         w.commit().map_err(cv)?;
         Ok(())
+    }
+
+    /// Apply-time incarnation fence (4b contract): a cache write may only
+    /// execute inside a live, current incarnation. `Ok(true)` = active
+    /// (row present, not revoked, mount pointer still names it);
+    /// `Ok(false)` = fenced → the caller performs a deterministic no-op and
+    /// the service's barrier readback reports terminal revoked/stale. Only
+    /// store failures return `Err`.
+    fn incarnation_active<S: LocalCacheIndexStore>(
+        store: &S,
+        incarnation: u64,
+    ) -> CommonResult<bool> {
+        match store.cache_get_incarnation(incarnation).map_err(cv)? {
+            Some(row) if !row.revoked => {
+                Ok(store.cache_current_incarnation(row.mount_id).map_err(cv)? == Some(incarnation))
+            }
+            _ => Ok(false),
+        }
     }
 
     /// Identity-producing: per-key load allocation. Writes the `Reserved`
@@ -434,6 +570,14 @@ impl CacheManager {
             // trusted history.
             TokenGate::Expired => return Ok(()),
             TokenGate::Execute => (),
+        }
+
+        // Apply-time incarnation fence (4b): a revoke or remount that
+        // interleaved between the service precheck and this apply fences
+        // the write deterministically; the service's barrier readback
+        // reports terminal revoked/stale.
+        if !Self::incarnation_active(store, incarnation)? {
+            return Ok(());
         }
 
         // Execute: only a genuinely-new absolute transition. A different
@@ -654,6 +798,14 @@ impl CacheManager {
             TokenGate::Execute => (),
         }
 
+        // Apply-time incarnation fence (4b): a revoke/remount interleaved
+        // between the service precheck and this apply fences the commit
+        // deterministically (the load stays Reserved and dies with its
+        // namespace).
+        if !Self::incarnation_active(store, incarnation)? {
+            return Ok(());
+        }
+
         let cur = match store.cache_get_entry(incarnation, key).map_err(cv)? {
             Some(v) => v,
             None => return err_box!("cache commit for missing entry ({}, {})", incarnation, key),
@@ -777,6 +929,13 @@ impl CacheManager {
                 expected_generation,
                 new_generation
             );
+        }
+
+        // Apply-time incarnation fence (4b): a remove for a fenced
+        // namespace is a deterministic no-op (the row dies with its
+        // namespace; there is nothing left to tombstone for a client).
+        if !Self::incarnation_active(store, incarnation)? {
+            return Ok(());
         }
 
         let cur = match store.cache_get_entry(incarnation, key).map_err(cv)? {
@@ -950,51 +1109,91 @@ mod tests {
         let store = new_store("incarnation");
         let mgr = CacheManager::new();
 
-        mgr.apply_incarnation_allocate(&store, token(2, 1), 7, 1)
+        mgr.apply_incarnation_allocate_v2(&store, token(2, 1), 7, 1, 3_600_000)
             .unwrap();
         assert_eq!(store.cache_current_incarnation(7).unwrap(), Some(1));
-        assert!(!store.cache_get_incarnation(1).unwrap().unwrap().revoked);
+        let row1 = store.cache_get_incarnation(1).unwrap().unwrap();
+        assert!(!row1.revoked);
+        // Frozen TTL lives in the separate policy row (option A); a legacy
+        // row decodes without it and readers synthesize ttl 0.
+        assert_eq!(
+            store.cache_get_incarnation_policy(1).unwrap(),
+            Some(IncarnationPolicyRow { ttl_ms: 3_600_000 })
+        );
         assert_eq!(
             store.cache_get_outcome(token(2, 1)).unwrap(),
-            Some(OpOutcome::IncarnationAllocated { incarnation: 1 })
+            Some(OpOutcome::IncarnationAllocatedV2 {
+                incarnation: 1,
+                mount_id: 7,
+                ttl_ms: 3_600_000,
+            })
         );
 
         // Idempotent replay and restore.
-        mgr.apply_incarnation_allocate(&store, token(2, 1), 7, 1)
+        mgr.apply_incarnation_allocate_v2(&store, token(2, 1), 7, 1, 3_600_000)
             .unwrap();
+        // Replay with different parameters (ttl) is divergence.
+        assert!(mgr
+            .apply_incarnation_allocate_v2(&store, token(2, 1), 7, 1, 999)
+            .is_err());
+        // Replay with a different mount id is divergence.
+        assert!(mgr
+            .apply_incarnation_allocate_v2(&store, token(2, 1), 8, 1, 3_600_000)
+            .is_err());
         let mgr2 = CacheManager::new();
         mgr2.restore_watermarks(&store).unwrap();
         assert_eq!(mgr2.current_incarnation(), 1);
 
-        // Remount: new incarnation, pointer moves.
-        mgr.apply_incarnation_allocate(&store, token(2, 2), 7, 2)
+        // Remount: new incarnation, pointer moves; frozen ttl may differ.
+        mgr.apply_incarnation_allocate_v2(&store, token(2, 2), 7, 2, 0)
             .unwrap();
         assert_eq!(store.cache_current_incarnation(7).unwrap(), Some(2));
 
-        // Revoke the current incarnation: pointer cleared, row kept.
+        // Revoke the current incarnation: pointer cleared, row kept; the
+        // frozen policy row is untouched history.
         mgr.apply_incarnation_revoke(&store, 7, 2).unwrap();
         assert_eq!(store.cache_current_incarnation(7).unwrap(), None);
-        assert!(store.cache_get_incarnation(2).unwrap().unwrap().revoked);
+        let row2 = store.cache_get_incarnation(2).unwrap().unwrap();
+        assert!(row2.revoked);
         // Idempotent revoke.
         mgr.apply_incarnation_revoke(&store, 7, 2).unwrap();
 
         // Late allocate replay for an incarnation that was later revoked
         // converges instead of resurrecting the pointer.
-        mgr.apply_incarnation_allocate(&store, token(2, 2), 7, 2)
+        mgr.apply_incarnation_allocate_v2(&store, token(2, 2), 7, 2, 0)
             .unwrap();
         assert_eq!(store.cache_current_incarnation(7).unwrap(), None);
 
+        // A legacy (4a-shape) outcome for the same token is NOT an exact
+        // match for a V2 request: the parameters are not trusted history.
+        mgr.apply_incarnation_allocate(&store, token(4, 1), 9, 3)
+            .unwrap();
+        assert!(mgr
+            .apply_incarnation_allocate_v2(&store, token(4, 1), 9, 3, 0)
+            .is_err());
+        // And symmetrically, a V2 outcome is not matched by a legacy-shape
+        // replay of the same token.
+        mgr.apply_incarnation_allocate_v2(&store, token(5, 1), 9, 4, 0)
+            .unwrap();
+        assert!(mgr
+            .apply_incarnation_allocate(&store, token(5, 1), 9, 4)
+            .is_err());
+
+        // Negative ttl is rejected outright.
+        assert!(mgr
+            .apply_incarnation_allocate_v2(&store, token(3, 1), 8, 3, -1)
+            .is_err());
         // Divergence: same incarnation claimed by another mount.
         assert!(mgr
-            .apply_incarnation_allocate(&store, token(3, 1), 8, 1)
+            .apply_incarnation_allocate_v2(&store, token(3, 1), 8, 1, 0)
             .is_err());
         // Issuable bound is the second gate (u64::MAX rejected by the store
         // as the first gate, i64::MAX by the allocator).
         assert!(mgr
-            .apply_incarnation_allocate(&store, token(3, 1), 8, u64::MAX)
+            .apply_incarnation_allocate_v2(&store, token(3, 1), 8, u64::MAX, 0)
             .is_err());
         assert!(mgr
-            .apply_incarnation_allocate(&store, token(3, 1), 8, MAX_ISSUABLE_INCARNATION + 1)
+            .apply_incarnation_allocate_v2(&store, token(3, 1), 8, MAX_ISSUABLE_INCARNATION + 1, 0)
             .is_err());
     }
 
@@ -1003,6 +1202,11 @@ mod tests {
         let store = new_store("key-lifecycle");
         let mgr = CacheManager::new();
         mgr.apply_id_reserve(&store, token(1, 1), OBJ, OBJ + 10)
+            .unwrap();
+
+        // 4b: the apply-time incarnation fence requires an active
+        // incarnation row before any allocate/commit/remove executes.
+        mgr.apply_incarnation_allocate(&store, token(90, 1), 5, 1)
             .unwrap();
 
         let alloc = reserved(1, OBJ);
@@ -1235,6 +1439,11 @@ mod tests {
         let store = new_store("token-gate");
         let mgr = CacheManager::new();
 
+        // 4b: the apply-time incarnation fence requires an active
+        // incarnation row before any allocate/commit/remove executes.
+        mgr.apply_incarnation_allocate(&store, token(90, 1), 5, 1)
+            .unwrap();
+
         // Same token, different parameters: divergence, never executes twice.
         mgr.apply_id_reserve(&store, token(1, 1), OBJ, OBJ + 10)
             .unwrap();
@@ -1293,13 +1502,14 @@ mod tests {
         );
         assert!(store.cache_get_outcome(token(2, 1)).unwrap().is_none());
 
-        // Incarnation allocate divergence on the same token is loud.
-        mgr.apply_incarnation_allocate(&store, token(3, 1), 7, 1)
+        // Incarnation allocate divergence on the same token is loud
+        // (incarnation 1 is owned by the fence setup; use 2/3 here).
+        mgr.apply_incarnation_allocate(&store, token(3, 1), 7, 2)
             .unwrap();
         assert!(mgr
-            .apply_incarnation_allocate(&store, token(3, 1), 7, 2)
+            .apply_incarnation_allocate(&store, token(3, 1), 7, 3)
             .is_err());
-        assert_eq!(store.cache_current_incarnation(7).unwrap(), Some(1));
+        assert_eq!(store.cache_current_incarnation(7).unwrap(), Some(2));
     }
 
     /// Cross-token aliasing (1c review blocker 1): Execute only accepts
@@ -1313,6 +1523,13 @@ mod tests {
 
         // --- id reserve: segment must be contiguous with the durable HW.
         mgr.apply_id_reserve(&store, token(5, 1), OBJ, OBJ + 10)
+            .unwrap();
+
+        // 4b: the apply-time incarnation fence requires an active
+        // incarnation row before any allocate/commit/remove executes.
+        // Mount 4 on purpose: this test later moves mount 5's pointer to
+        // incarnation 3, which would stale incarnation 1.
+        mgr.apply_incarnation_allocate(&store, token(90, 1), 4, 1)
             .unwrap();
         // Same segment under a different token: not Execute's expected
         // absolute transition (start != HW + 1) -> error, no outcome.
@@ -1487,6 +1704,11 @@ mod tests {
         let store = new_store("gen-overflow");
         let mgr = CacheManager::new();
 
+        // 4b: the apply-time incarnation fence requires an active
+        // incarnation row before any allocate/commit/remove executes.
+        mgr.apply_incarnation_allocate(&store, token(90, 1), 5, 1)
+            .unwrap();
+
         // Write the terminal tombstone directly (the store boundary allows
         // any generation >= 1; no journal path can produce it except a
         // remove at u64::MAX, but replay must still be safe).
@@ -1527,6 +1749,11 @@ mod tests {
         // Fencing (round-2 review): every allocate must consume an id at or
         // below the durable reserve watermark, so establish one first.
         mgr.apply_id_reserve(&store, token(9, 1), OBJ, OBJ + 100)
+            .unwrap();
+
+        // 4b: the apply-time incarnation fence requires an active
+        // incarnation row before any allocate/commit/remove executes.
+        mgr.apply_incarnation_allocate(&store, token(90, 1), 5, 1)
             .unwrap();
 
         let alloc = reserved(1, OBJ);
@@ -1767,5 +1994,103 @@ mod tests {
             ),
             first_state
         );
+    }
+
+    /// 4b P0-1: the apply-time incarnation fence. A revoked (or stale)
+    /// incarnation turns allocate/commit/remove into deterministic no-ops —
+    /// rows, outcomes, and watermarks stay untouched — while an exact
+    /// outcome replay (AlreadyApplied) still resolves in front of the
+    /// fence.
+    #[test]
+    fn test_apply_time_incarnation_fence() {
+        let store = new_store("apply-fence");
+        let mgr = CacheManager::new();
+        mgr.apply_id_reserve(&store, token(1, 1), OBJ, OBJ + 10)
+            .unwrap();
+        mgr.apply_incarnation_allocate_v2(&store, token(2, 1), 5, 1, 0)
+            .unwrap();
+        let alloc = reserved(1, OBJ);
+        mgr.apply_allocate(&store, token(1, 2), 1, "/k", 100, &alloc)
+            .unwrap();
+
+        // Revoke fences everything under incarnation 1.
+        mgr.apply_incarnation_revoke(&store, 5, 1).unwrap();
+
+        // Fenced allocate: deterministic no-op — no row, no outcome.
+        let alloc_j = reserved(1, OBJ + 1);
+        mgr.apply_allocate(&store, token(1, 5), 1, "/j", 100, &alloc_j)
+            .unwrap();
+        assert!(store.cache_get_entry(1, "/j").unwrap().is_none());
+        assert!(store.cache_get_outcome(token(1, 5)).unwrap().is_none());
+
+        // Fenced commit: the Reserved row stays untouched, no commit
+        // outcome, no client watermark advance.
+        mgr.apply_commit(
+            &store,
+            token(1, 2),
+            token(1, 6),
+            1,
+            "/k",
+            1,
+            OBJ,
+            100,
+            777,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            store.cache_get_entry(1, "/k").unwrap(),
+            Some(alloc.clone()),
+            "fenced commit must not touch the Reserved row"
+        );
+        assert!(store.cache_get_outcome(token(1, 6)).unwrap().is_none());
+
+        // Fenced remove: the row keeps its Reserved state.
+        mgr.apply_remove(&store, 1, "/k", 1, 2, OBJ).unwrap();
+        assert_eq!(
+            store.cache_get_entry(1, "/k").unwrap(),
+            Some(alloc),
+            "fenced remove must not tombstone the row"
+        );
+
+        // Exact outcome replay runs BEFORE the fence: the allocate token's
+        // AlreadyApplied path resolves from history even though the
+        // incarnation is revoked.
+        mgr.apply_allocate(&store, token(1, 2), 1, "/k", 100, &reserved(1, OBJ))
+            .unwrap();
+        assert_eq!(
+            store.cache_get_outcome(token(1, 2)).unwrap(),
+            Some(OpOutcome::Allocated {
+                incarnation: 1,
+                key: "/k".into(),
+                generation: 1,
+                object_id: OBJ,
+                file_len: 100,
+                block_size: 128,
+            })
+        );
+
+        // Stale fence: a newer incarnation owns the mount — the old one is
+        // fenced exactly like a revoked one.
+        mgr.apply_incarnation_allocate_v2(&store, token(2, 2), 5, 2, 0)
+            .unwrap();
+        assert_eq!(store.cache_current_incarnation(5).unwrap(), Some(2));
+        mgr.apply_allocate(&store, token(1, 7), 1, "/s", 100, &reserved(1, OBJ + 2))
+            .unwrap();
+        assert!(store.cache_get_entry(1, "/s").unwrap().is_none());
+        // Writes under the NEW incarnation are admitted.
+        mgr.apply_allocate(&store, token(1, 8), 2, "/s", 100, &reserved(1, OBJ + 3))
+            .unwrap();
+        assert!(store.cache_get_entry(2, "/s").unwrap().is_some());
+
+        // Revoke preserves the watermark and every recorded outcome.
+        assert_eq!(
+            store
+                .cache_get_state(state_tags::CACHE_INCARNATION)
+                .unwrap(),
+            Some(2)
+        );
+        assert!(store.cache_get_outcome(token(2, 1)).unwrap().is_some());
+        assert!(store.cache_get_outcome(token(2, 2)).unwrap().is_some());
     }
 }
