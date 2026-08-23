@@ -43,6 +43,13 @@ use curvine_error::{FsError, FsResult};
 /// rows with no lock held across pages.
 pub const SCAN_HARD_CAP: usize = 1024;
 
+/// Hard upper bound for the victim/eviction list of any single bounded
+/// mutation journal entry (4c.2). Every batch apply validates
+/// `1..=MUTATION_PAGE_CAP` at the boundary: one committed apply mutates at
+/// most this many identities in one transaction, and a journal entry can
+/// never carry an unbounded mutation payload.
+pub const MUTATION_PAGE_CAP: usize = 64;
+
 /// Validate a scan page limit at the storage boundary (`1..=SCAN_HARD_CAP`).
 pub fn validate_scan_limit(limit: usize) -> FsResult<()> {
     if limit == 0 || limit > SCAN_HARD_CAP {
@@ -50,6 +57,19 @@ pub fn validate_scan_limit(limit: usize) -> FsResult<()> {
             "scan limit must be in 1..={}, got {}",
             SCAN_HARD_CAP,
             limit
+        ))));
+    }
+    Ok(())
+}
+
+/// Validate a bounded mutation page length at the apply boundary
+/// (`1..=MUTATION_PAGE_CAP`).
+pub fn validate_page_len(len: usize) -> FsResult<()> {
+    if len == 0 || len > MUTATION_PAGE_CAP {
+        return Err(FsError::from(CommonError::from(err_msg!(
+            "mutation page length must be in 1..={}, got {}",
+            MUTATION_PAGE_CAP,
+            len
         ))));
     }
     Ok(())
@@ -208,6 +228,15 @@ pub trait LocalCacheIndexStore {
     ) -> FsResult<Option<IncarnationPolicyRow>>;
 
     fn cache_get_outcome(&self, token: OpToken) -> FsResult<Option<OpOutcome>>;
+
+    /// Bounded, resumable scan of OUTCOME rows only (4c.2) — the `0x01`
+    /// tag of the idempotency CF, never the `0x02` watermark rows — in
+    /// `(client_id, op_seq)` order, starting strictly after `after` (None =
+    /// from the beginning; `op_seq >= 1` is validated). `limit` is
+    /// validated `1..=SCAN_HARD_CAP`. Returns the tokens whose outcome row
+    /// exists; the outcome-GC driver filters them against the client
+    /// high-watermark before proposing evictions.
+    fn cache_scan_outcomes(&self, after: Option<&OpToken>, limit: usize) -> FsResult<Vec<OpToken>>;
 
     fn cache_client_watermark(&self, client_id: u64) -> FsResult<Option<u64>>;
 

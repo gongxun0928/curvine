@@ -142,6 +142,59 @@ impl From<&ExpiryRow> for ExpiryCursor {
     }
 }
 
+/// Exact victim identity journaled by a bounded scope-remove batch (4c.2).
+/// The leader discovers victims through a 4c.1 bounded page scan and
+/// journals ONLY these exact identities; the committed apply never
+/// re-scans — it runs an exact CAS per victim against the authoritative
+/// entry. A victim whose row is missing, already advanced, or already
+/// tombstoned at `new_generation` is a deterministic no-op; a same-
+/// generation object mismatch is loud divergence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopeRemoveVictim {
+    pub key: String,
+    /// The generation the leader observed for this key in its page.
+    pub expected_generation: u64,
+    /// `expected_generation + 1`: the tombstone generation this batch
+    /// writes, identical to a single-key remove.
+    pub new_generation: u64,
+    /// Object identity CAS: the object id the leader observed.
+    pub object_id: i64,
+    /// Expiry identity CAS: the deadline the leader observed on the row
+    /// (0 = none). The apply requires the committed row's `expire_at` to
+    /// match exactly — the version is only fully pinned by
+    /// (generation, object_id, expire_at).
+    pub expire_at: i64,
+}
+
+/// Exact victim identity journaled by a bounded revoked-incarnation vacuum
+/// batch (4c.2). Vacuum deletes whole rows (entry, expiry, reverse) — no
+/// tombstone — under the gate-3 re-verification that the incarnation row
+/// exists, belongs to the named mount, is revoked, and is not the mount's
+/// current pointer. Stale/missing victims are deterministic no-ops.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VacuumVictim {
+    pub key: String,
+    pub generation: u64,
+    pub object_id: i64,
+    /// Expiry identity CAS: the deadline the leader observed on the row
+    /// (0 = none); must match the committed row exactly.
+    pub expire_at: i64,
+}
+
+/// One client's evictions in a bounded outcome-window GC batch (4c.2).
+/// `evict_below` freezes the leader-observed client high-watermark into
+/// the entry (the eligibility fence): replay judges against THIS value,
+/// never against the apply-time watermark. Every listed op_seq satisfies
+/// `op_seq < evict_below <= durable watermark` — the boundary outcome at
+/// `op_seq == watermark` is never listed.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct OutcomeGcGroup {
+    pub client_id: u64,
+    pub evict_below: u64,
+    /// Strictly ascending; every op_seq < evict_below.
+    pub op_seqs: Vec<u64>,
+}
+
 /// Durable mount incarnation row. `mount_id` is a reusable routing id;
 /// `incarnation` is never reused. The row layout is frozen at 4a (bincode
 /// positional encoding cannot absorb appended fields — see journal/entry.rs);

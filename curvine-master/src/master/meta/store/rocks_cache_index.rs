@@ -671,6 +671,58 @@ impl LocalCacheIndexStore for RocksInodeStore {
         }
     }
 
+    fn cache_scan_outcomes(&self, after: Option<&OpToken>, limit: usize) -> FsResult<Vec<OpToken>> {
+        validate_scan_limit(limit)?;
+        // Cursor validation at the boundary: a page cursor always comes
+        // from a row this index produced, so `op_seq >= 1` (the token
+        // check every apply path enforces).
+        if let Some(t) = after {
+            if t.op_seq == 0 {
+                return Err(FsError::from(CommonError::from(err_msg!(
+                    "outcome scan cursor op_seq must be >= 1: {:?}",
+                    t
+                ))));
+            }
+        }
+        // Range: outcome rows only. Start at the cursor's frozen
+        // `(0x01, client_id, op_seq)` position (or the synthetic lowest
+        // position `[0x01, 0, 0]`, which is strictly below every real
+        // outcome key because op_seq >= 1); end at the tag boundary
+        // `[0x02]` — lexicographically after every `0x01`-tagged key and
+        // strictly before every watermark (`0x02`) row, so watermark rows
+        // are never touched by this scan.
+        let start = after
+            .map(|t| Self::outcome_key(t).to_vec())
+            .unwrap_or_else(|| vec![Self::IDEMPOTENCY_TAG_OUTCOME]);
+        let end = vec![Self::IDEMPOTENCY_TAG_WATERMARK];
+        let iter = self.db.range_scan(Self::CF_CACHE_IDEMPOTENCY, start, end)?;
+        let mut tokens = Vec::new();
+        let mut skip_after = after.copied();
+        for item in iter {
+            if tokens.len() >= limit {
+                break;
+            }
+            let (key, _value) = item.map_err(rocks_err)?;
+            if key.len() != 17 || key[0] != Self::IDEMPOTENCY_TAG_OUTCOME {
+                return Err(FsError::from(CommonError::from(err_msg!(
+                    "corrupt idempotency outcome key length {} (tag {:02x})",
+                    key.len(),
+                    key.first().copied().unwrap_or(0)
+                ))));
+            }
+            let client_id = RocksUtils::u64_from_bytes(&key[1..9])?;
+            let op_seq = RocksUtils::u64_from_bytes(&key[9..17])?;
+            // Exclusive cursor: skip only the exact cursor row.
+            if let Some(c) = skip_after.take() {
+                if client_id == c.client_id && op_seq == c.op_seq {
+                    continue;
+                }
+            }
+            tokens.push(OpToken { client_id, op_seq });
+        }
+        Ok(tokens)
+    }
+
     fn cache_client_watermark(&self, client_id: u64) -> FsResult<Option<u64>> {
         match self
             .db
@@ -1643,6 +1695,79 @@ mod tests {
         w.commit()?;
         assert!(store.cache_get_outcome(token)?.is_none());
         assert_eq!(store.cache_client_watermark(11)?, Some(3));
+        Ok(())
+    }
+
+    /// 4c.2 outcome-window scan: strictly ascending `(client_id, op_seq)`
+    /// order regardless of insertion order, exclusive-cursor resume with
+    /// no skips and no duplicates, watermark rows invisible (the scan
+    /// never touches the `0x02` tag space), and malformed cursor/limit
+    /// rejected at the boundary.
+    #[test]
+    fn test_outcome_scan_ordered_resumable_tag_bounded() -> FsResult<()> {
+        let store = new_store("outcome-scan")?;
+        let outcome = OpOutcome::Reserved {
+            start: OBJ,
+            end: OBJ + 1,
+        };
+
+        // Seed outcomes out of (client, seq) order plus a watermark row
+        // whose key shares the client prefix but sits in the 0x02 tag
+        // space.
+        let mut w = store.cache_write();
+        for (client, seq) in [(3u64, 2u64), (1, 5), (3, 1), (1, 9), (2, 4)] {
+            w.put_outcome(
+                OpToken {
+                    client_id: client,
+                    op_seq: seq,
+                },
+                &outcome,
+            )?;
+        }
+        w.set_client_watermark(1, 10)?;
+        w.commit()?;
+
+        let t = |client: u64, seq: u64| OpToken {
+            client_id: client,
+            op_seq: seq,
+        };
+
+        // Full window in frozen index order.
+        let full = store.cache_scan_outcomes(None, 10)?;
+        assert_eq!(full, vec![t(1, 5), t(1, 9), t(2, 4), t(3, 1), t(3, 2)]);
+
+        // Bounded pages with exclusive cursor resume cover the window
+        // exactly once, ending on an empty boundary page.
+        let p1 = store.cache_scan_outcomes(None, 2)?;
+        assert_eq!(p1, vec![t(1, 5), t(1, 9)]);
+        let p2 = store.cache_scan_outcomes(Some(&p1[1]), 2)?;
+        assert_eq!(p2, vec![t(2, 4), t(3, 1)]);
+        let p3 = store.cache_scan_outcomes(Some(&p2[1]), 2)?;
+        assert_eq!(p3, vec![t(3, 2)]);
+        let p4 = store.cache_scan_outcomes(Some(&p3[0]), 2)?;
+        assert!(p4.is_empty());
+
+        // Evicted rows disappear from the window; watermarks still never
+        // surface even when every outcome of their client is gone.
+        let mut w = store.cache_write();
+        w.delete_outcome(t(1, 5))?;
+        w.delete_outcome(t(1, 9))?;
+        w.commit()?;
+        let after = store.cache_scan_outcomes(None, 10)?;
+        assert_eq!(after, vec![t(2, 4), t(3, 1), t(3, 2)]);
+
+        // Limit and cursor validation at the boundary.
+        assert!(store.cache_scan_outcomes(None, 0).is_err());
+        assert!(store.cache_scan_outcomes(None, SCAN_HARD_CAP + 1).is_err());
+        assert!(store
+            .cache_scan_outcomes(
+                Some(&OpToken {
+                    client_id: 1,
+                    op_seq: 0
+                }),
+                5
+            )
+            .is_err());
         Ok(())
     }
 

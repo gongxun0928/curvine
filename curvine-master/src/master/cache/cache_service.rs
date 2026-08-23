@@ -47,12 +47,17 @@ use crate::master::fs::policy::ChooseContext;
 use crate::master::fs::WorkerManager;
 use crate::master::journal::{
     CacheAllocateEntry, CacheCommitEntry, CacheIdReserveEntry, CacheIncarnationAllocateV2Entry,
-    CacheIncarnationRevokeEntry, CacheRemoveEntry, JournalEntry, JournalWriter,
+    CacheIncarnationRevokeEntry, CacheOutcomeGcEntry, CacheRemoveEntry, CacheScopeRemoveEntry,
+    CacheTtlSweepEntry, CacheVacuumEntry, JournalEntry, JournalWriter,
 };
-use crate::master::meta::cache::entry::{CacheEntry, CacheEntryState, OpOutcome, OpToken};
+use crate::master::meta::cache::entry::{
+    CacheEntry, CacheEntryState, ExpiryCursor, ExpiryRow, OpOutcome, OpToken, OutcomeGcGroup,
+    ScopeRemoveVictim, VacuumVictim,
+};
 use crate::master::meta::cache::state_tags;
 use crate::master::meta::cache::LocalCacheIndexStore;
 use crate::master::meta::cache::MAX_ISSUABLE_INCARNATION;
+use crate::master::meta::cache::MUTATION_PAGE_CAP;
 use crate::master::meta::{BlockIdCodec, CacheBlockLayout};
 use crate::master::{MasterMonitor, SyncFsDir};
 use curvine_core_error::{err_box, err_msg, CommonError, CommonResult};
@@ -263,6 +268,56 @@ pub struct CacheService {
     /// production; compiled out entirely outside `cfg(test)`.
     #[cfg(test)]
     barrier_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+}
+
+/// Per-call upper bound on proposed pages for every 4c.2 bounded-mutation
+/// driver: the single-call derived work stays bounded even against a
+/// pathological namespace; larger jobs resume through the returned cursor.
+pub const MUTATION_MAX_PAGES_PER_CALL: usize = 256;
+
+/// Resumable progress of one scope-remove driver call (4c.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeRemoveProgress {
+    /// Scan boundary reached: the whole scope was paged.
+    pub done: bool,
+    /// Exclusive resume cursor (last scanned key); `None` only when
+    /// `done` and the scope never yielded a row.
+    pub cursor: Option<String>,
+    /// Victims journaled this call.
+    pub processed: usize,
+}
+
+/// Resumable progress of one TTL-sweep driver call (4c.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TtlSweepProgress {
+    /// The due range was fully paged at this deadline.
+    pub done: bool,
+    /// Exclusive resume cursor (last scanned frozen position).
+    pub cursor: Option<ExpiryCursor>,
+    /// Expiry victims journaled this call.
+    pub processed: usize,
+}
+
+/// Resumable progress of one vacuum driver call (4c.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VacuumProgress {
+    /// The incarnation was fully paged.
+    pub done: bool,
+    /// Exclusive resume cursor (last scanned key).
+    pub cursor: Option<String>,
+    /// Victims journaled this call.
+    pub processed: usize,
+}
+
+/// Resumable progress of one outcome-GC driver call (4c.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutcomeGcProgress {
+    /// The outcome window was fully paged.
+    pub done: bool,
+    /// Exclusive resume cursor (last scanned token).
+    pub cursor: Option<OpToken>,
+    /// Evictions journaled this call (sum of grouped op seqs).
+    pub processed: usize,
 }
 
 impl CacheService {
@@ -1430,6 +1485,354 @@ impl CacheService {
                 other
             ),
         }
+    }
+
+    // ---- 4c.2 leader-side bounded mutation drivers. Each driver pages the
+    // authoritative store with a 4c.1 bounded scan (exclusive cursor +
+    // validated limit), journals ONLY the exact victim identities of one
+    // page per journal entry, and returns `{done, cursor, processed}`:
+    // `cursor` is the last SCANNED identity (a stale/no-op page still
+    // advances it), and `done` is judged by the RAW scan page touching the
+    // scan boundary — never by the number of applied mutations. A caller
+    // re-invokes with the returned cursor until `done`; per-call work is
+    // bounded by `max_pages`. ----
+
+    /// Prefix-scope remove (4c.2): page the scope with the 4c.1 scoped
+    /// scan, journal one bounded `CacheScopeRemove` batch per page. The
+    /// committed apply runs the per-victim exact CAS; this driver only
+    /// freezes identities — it never mutates the store itself.
+    pub fn remove_scope(
+        &self,
+        rpc_id: i64,
+        incarnation: u64,
+        scope: &str,
+        after: Option<&str>,
+        max_pages: usize,
+    ) -> CommonResult<ScopeRemoveProgress> {
+        self.require_enabled()?;
+        self.require_leader()?;
+        if scope.is_empty() {
+            return err_box!("cache scope remove scope must be a non-empty prefix path");
+        }
+        let max_pages = max_pages.clamp(1, MUTATION_MAX_PAGES_PER_CALL);
+        if let Some(a) = after {
+            if !crate::master::meta::cache::key_in_scope(a, scope) {
+                return err_box!("cache scope remove cursor {} is outside scope {}", a, scope);
+            }
+        }
+
+        let mut cursor = after.map(|a| a.to_string());
+        let mut processed = 0usize;
+        for _ in 0..max_pages {
+            let page = {
+                let store = self.fs_dir.read();
+                let rocks = store.get_rocks_store();
+                rocks.cache_scan_entries_in_scope(
+                    incarnation,
+                    scope,
+                    cursor.as_deref(),
+                    MUTATION_PAGE_CAP,
+                )?
+            };
+            if page.is_empty() {
+                return Ok(ScopeRemoveProgress {
+                    done: true,
+                    cursor,
+                    processed,
+                });
+            }
+            let victims: Vec<ScopeRemoveVictim> = page
+                .iter()
+                .map(|(k, e)| {
+                    Ok(ScopeRemoveVictim {
+                        key: k.clone(),
+                        expected_generation: e.generation,
+                        new_generation: e
+                            .generation
+                            .checked_add(1)
+                            .ok_or_else(|| cm_err("cache scope remove generation overflow"))?,
+                        object_id: e.object_id,
+                        expire_at: e.expire_at,
+                    })
+                })
+                .collect::<CommonResult<_>>()?;
+            let last_key = page.last().unwrap().0.clone();
+            let op_id = self.fs_dir.read().next_op_id();
+            let entry = JournalEntry::CacheScopeRemove(CacheScopeRemoveEntry {
+                op_id,
+                rpc_id,
+                incarnation,
+                scope: scope.to_string(),
+                victims,
+            });
+            self.journal_writer
+                .sync_propose_cache(entry)
+                .map_err(fs_err)?;
+            processed += page.len();
+            cursor = Some(last_key);
+            if page.len() < MUTATION_PAGE_CAP {
+                return Ok(ScopeRemoveProgress {
+                    done: true,
+                    cursor,
+                    processed,
+                });
+            }
+        }
+        Ok(ScopeRemoveProgress {
+            done: false,
+            cursor,
+            processed,
+        })
+    }
+
+    /// TTL sweep (4c.2): page the due expiry rows with the 4c.1 ordered
+    /// scan and journal one bounded `CacheTtlSweep` batch per page.
+    pub fn sweep_ttl(
+        &self,
+        rpc_id: i64,
+        now: i64,
+        after: Option<&ExpiryCursor>,
+        max_pages: usize,
+    ) -> CommonResult<TtlSweepProgress> {
+        self.require_enabled()?;
+        self.require_leader()?;
+        let max_pages = max_pages.clamp(1, MUTATION_MAX_PAGES_PER_CALL);
+
+        let mut cursor: Option<ExpiryCursor> = after.cloned();
+        let mut processed = 0usize;
+        for _ in 0..max_pages {
+            let page: Vec<ExpiryRow> = {
+                let store = self.fs_dir.read();
+                let rocks = store.get_rocks_store();
+                rocks.cache_scan_expiry(now, cursor.as_ref(), MUTATION_PAGE_CAP)?
+            };
+            if page.is_empty() {
+                return Ok(TtlSweepProgress {
+                    done: true,
+                    cursor,
+                    processed,
+                });
+            }
+            let next_cursor = ExpiryCursor::from(page.last().unwrap());
+            let op_id = self.fs_dir.read().next_op_id();
+            let entry = JournalEntry::CacheTtlSweep(CacheTtlSweepEntry {
+                op_id,
+                rpc_id,
+                now,
+                victims: page.clone(),
+            });
+            self.journal_writer
+                .sync_propose_cache(entry)
+                .map_err(fs_err)?;
+            processed += page.len();
+            cursor = Some(next_cursor);
+            if page.len() < MUTATION_PAGE_CAP {
+                return Ok(TtlSweepProgress {
+                    done: true,
+                    cursor,
+                    processed,
+                });
+            }
+        }
+        Ok(TtlSweepProgress {
+            done: false,
+            cursor,
+            processed,
+        })
+    }
+
+    /// Revoked-incarnation vacuum (4c.2): leader-verifies the gate-3
+    /// preconditions (row exists, belongs to the mount, revoked, not
+    /// current), then pages the incarnation with the 4c.1 entry scan and
+    /// journals one bounded `CacheVacuum` batch per page. The apply
+    /// re-verifies everything; vacuum never touches pointers, watermarks,
+    /// outcomes, or the incarnation/policy rows.
+    pub fn vacuum_incarnation(
+        &self,
+        rpc_id: i64,
+        mount_id: u32,
+        incarnation: u64,
+        after: Option<&str>,
+        max_pages: usize,
+    ) -> CommonResult<VacuumProgress> {
+        self.require_enabled()?;
+        self.require_leader()?;
+        let max_pages = max_pages.clamp(1, MUTATION_MAX_PAGES_PER_CALL);
+        {
+            let store = self.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            match rocks.cache_get_incarnation(incarnation).map_err(fs_err)? {
+                Some(row) if row.revoked && row.mount_id == mount_id => {
+                    if rocks.cache_current_incarnation(mount_id).map_err(fs_err)?
+                        == Some(incarnation)
+                    {
+                        return err_box!(
+                            "vacuum incarnation {} is still mount {}'s current incarnation",
+                            incarnation,
+                            mount_id
+                        );
+                    }
+                }
+                Some(row) => {
+                    return err_box!(
+                        "vacuum incarnation {} is not vacuumable (mount {}, revoked {})",
+                        incarnation,
+                        row.mount_id,
+                        row.revoked
+                    )
+                }
+                None => {
+                    return err_box!("vacuum incarnation {} has no incarnation row", incarnation)
+                }
+            }
+        }
+
+        let mut cursor = after.map(|a| a.to_string());
+        let mut processed = 0usize;
+        for _ in 0..max_pages {
+            let page = {
+                let store = self.fs_dir.read();
+                let rocks = store.get_rocks_store();
+                rocks.cache_scan_entries(incarnation, cursor.as_deref(), MUTATION_PAGE_CAP)?
+            };
+            if page.is_empty() {
+                return Ok(VacuumProgress {
+                    done: true,
+                    cursor,
+                    processed,
+                });
+            }
+            let victims: Vec<VacuumVictim> = page
+                .iter()
+                .map(|(k, e)| VacuumVictim {
+                    key: k.clone(),
+                    generation: e.generation,
+                    object_id: e.object_id,
+                    expire_at: e.expire_at,
+                })
+                .collect();
+            let last_key = page.last().unwrap().0.clone();
+            let op_id = self.fs_dir.read().next_op_id();
+            let entry = JournalEntry::CacheVacuum(CacheVacuumEntry {
+                op_id,
+                rpc_id,
+                incarnation,
+                mount_id,
+                victims,
+            });
+            self.journal_writer
+                .sync_propose_cache(entry)
+                .map_err(fs_err)?;
+            processed += page.len();
+            cursor = Some(last_key);
+            if page.len() < MUTATION_PAGE_CAP {
+                return Ok(VacuumProgress {
+                    done: true,
+                    cursor,
+                    processed,
+                });
+            }
+        }
+        Ok(VacuumProgress {
+            done: false,
+            cursor,
+            processed,
+        })
+    }
+
+    /// Bounded outcome-window GC (4c.2): page the outcome rows with the
+    /// ordered outcome scan, filter by the leader-OBSERVED client
+    /// high-watermark (`op_seq < hw`, boundary excluded), and journal one
+    /// bounded `CacheOutcomeGc` batch of per-client groups carrying the
+    /// frozen `evict_below` fence. `done` is judged by the RAW scan page
+    /// (a full page with zero eligible tokens still advances the cursor
+    /// and continues).
+    pub fn gc_outcomes(
+        &self,
+        rpc_id: i64,
+        after: Option<&OpToken>,
+        max_pages: usize,
+    ) -> CommonResult<OutcomeGcProgress> {
+        self.require_enabled()?;
+        self.require_leader()?;
+        let max_pages = max_pages.clamp(1, MUTATION_MAX_PAGES_PER_CALL);
+
+        let mut cursor = after.copied();
+        let mut processed = 0usize;
+        for _ in 0..max_pages {
+            let (page, hws) = {
+                let store = self.fs_dir.read();
+                let rocks = store.get_rocks_store();
+                let page = rocks.cache_scan_outcomes(cursor.as_ref(), MUTATION_PAGE_CAP)?;
+                let mut hws = HashMap::new();
+                for t in &page {
+                    if let std::collections::hash_map::Entry::Vacant(e) = hws.entry(t.client_id) {
+                        e.insert(rocks.cache_client_watermark(t.client_id)?);
+                    }
+                }
+                (page, hws)
+            };
+            if page.is_empty() {
+                return Ok(OutcomeGcProgress {
+                    done: true,
+                    cursor,
+                    processed,
+                });
+            }
+            let next_cursor = *page.last().unwrap();
+
+            // Freeze eligibility against the observed watermarks: group by
+            // client, strictly below its observed HW. Page order is
+            // (client, seq), so tokens of one client are contiguous.
+            let mut groups: Vec<OutcomeGcGroup> = Vec::new();
+            for t in &page {
+                let eligible = matches!(hws.get(&t.client_id), Some(Some(hw)) if t.op_seq < *hw);
+                if eligible {
+                    match groups.last_mut() {
+                        Some(g) if g.client_id == t.client_id => g.op_seqs.push(t.op_seq),
+                        _ => {
+                            let hw = match hws.get(&t.client_id) {
+                                Some(Some(hw)) => *hw,
+                                _ => unreachable!("eligibility checked above"),
+                            };
+                            groups.push(OutcomeGcGroup {
+                                client_id: t.client_id,
+                                evict_below: hw,
+                                op_seqs: vec![t.op_seq],
+                            })
+                        }
+                    }
+                }
+            }
+            if !groups.is_empty() {
+                // `processed` counts journaled evictions (the exact token
+                // identities frozen into this batch), not scanned rows.
+                let journaled: usize = groups.iter().map(|g| g.op_seqs.len()).sum();
+                let op_id = self.fs_dir.read().next_op_id();
+                let entry = JournalEntry::CacheOutcomeGc(CacheOutcomeGcEntry {
+                    op_id,
+                    rpc_id,
+                    groups,
+                });
+                self.journal_writer
+                    .sync_propose_cache(entry)
+                    .map_err(fs_err)?;
+                processed += journaled;
+            }
+            cursor = Some(next_cursor);
+            if page.len() < MUTATION_PAGE_CAP {
+                return Ok(OutcomeGcProgress {
+                    done: true,
+                    cursor,
+                    processed,
+                });
+            }
+        }
+        Ok(OutcomeGcProgress {
+            done: false,
+            cursor,
+            processed,
+        })
     }
 
     /// 4b: allocate the next never-reused mount incarnation for `mount_id`.
@@ -3896,5 +4299,46 @@ mod tests {
         assert!(rebuilt
             .iter()
             .all(|r| r.block_id != layout(issued, 130).block_id(1).unwrap()));
+    }
+
+    /// 4c.2 driver smoke gates: the entry-point checks (capability,
+    /// leadership implied by the test leader state, scope/cursor shape,
+    /// vacuum gate-3 pre-verify) and the empty-namespace fast termination
+    /// (done on the first empty RAW page, nothing journaled — the raft
+    /// barrier fails closed in unit tests, so any page proposal would
+    /// surface as an error here).
+    #[test]
+    fn test_mutation_driver_gates() {
+        let service = build_service("mutation-drivers", chooser(vec![worker(1)]));
+
+        // Empty namespaces terminate immediately with nothing journaled.
+        let p = service.remove_scope(7, 1, "/a", None, 4).unwrap();
+        assert_eq!(
+            p,
+            ScopeRemoveProgress {
+                done: true,
+                cursor: None,
+                processed: 0
+            }
+        );
+        let t = service.sweep_ttl(7, 1000, None, 4).unwrap();
+        assert!(t.done && t.processed == 0);
+        let g = service.gc_outcomes(7, None, 4).unwrap();
+        assert!(g.done && g.processed == 0);
+
+        // Vacuum re-verifies the gate-3 rows before paging.
+        assert!(service.vacuum_incarnation(7, 5, 1, None, 4).is_err());
+
+        // The scope must be a non-empty prefix and the cursor in-scope.
+        assert!(service.remove_scope(7, 1, "", None, 4).is_err());
+        assert!(service.remove_scope(7, 1, "/a", Some("/zz"), 4).is_err());
+
+        // Capability gate mirrors every other cache entry point.
+        let disabled =
+            build_service_enabled("mutation-drivers-off", chooser(vec![worker(1)]), false);
+        assert!(disabled.remove_scope(7, 1, "/a", None, 4).is_err());
+        assert!(disabled.sweep_ttl(7, 1000, None, 4).is_err());
+        assert!(disabled.vacuum_incarnation(7, 5, 1, None, 4).is_err());
+        assert!(disabled.gc_outcomes(7, None, 4).is_err());
     }
 }

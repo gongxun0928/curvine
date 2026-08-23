@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::meta::cache::{CacheEntry, OpToken};
+use crate::master::meta::cache::{
+    CacheEntry, ExpiryRow, OpToken, OutcomeGcGroup, ScopeRemoveVictim, VacuumVictim,
+};
 use crate::master::meta::inode::{InodeDir, InodeFile, InodeView};
 use crate::master::meta::BlockMeta;
 use curvine_core_error::{err_box, CommonResult};
@@ -320,6 +322,83 @@ pub struct CacheRemoveEntry {
     pub(crate) expected_object_id: i64,
 }
 
+// ---- 4c.2 bounded mutation/journal entries. None of these carry an
+// idempotency token: they are conditional batch CAS operations whose
+// replay determinism comes from the per-victim exact-CAS against the
+// authoritative entry (stale/missing = deterministic no-op), never from a
+// recorded outcome. Every victim list is validated `1..=MUTATION_PAGE_CAP`
+// at the apply boundary — a journal entry can never carry an unbounded
+// mutation payload. The apply NEVER re-runs a range scan: it mutates only
+// the journaled identities. ----
+
+/// Conditional batch CAS (4c.2): prefix-scope remove. The leader paged the
+/// scope with the 4c.1 `cache_scan_entries_in_scope` cursor and journals
+/// the exact victim identities it observed; the apply tombstones each
+/// victim exactly like a single-key remove (`any@expected -> Tombstoned@new`).
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct CacheScopeRemoveEntry {
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
+    pub(crate) incarnation: u64,
+    /// The prefix scope the leader paged (audit/context only: the apply
+    /// never re-scans it, membership is already frozen into the victims).
+    pub(crate) scope: String,
+    /// Strictly ascending by key (a page of the ordered scan). `1..=MUTATION_PAGE_CAP`.
+    pub(crate) victims: Vec<ScopeRemoveVictim>,
+}
+
+/// Conditional batch CAS (4c.2): TTL sweep. The leader paged due expiry
+/// rows with the 4c.1 `cache_scan_expiry(now, cursor)` cursor and journals
+/// the exact expiry-row identities. The apply first exact-CAS-deletes each
+/// victim's own expiry row (missing = idempotent no-op; identity mismatch
+/// = loud divergence — it never touches any OTHER expiry position), then
+/// tombstones the authoritative entry only on a full
+/// (generation, object_id, expire_at) identity match; a stale/missing/
+/// advanced entry is a terminal no-op.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct CacheTtlSweepEntry {
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
+    /// The deadline instant the leader scanned with (context; the apply
+    /// does not re-derive it).
+    pub(crate) now: i64,
+    /// Ascending in frozen `(expire_at, incarnation, object_id)` index
+    /// order (a page of the ordered scan).
+    pub(crate) victims: Vec<ExpiryRow>,
+}
+
+/// Conditional batch (4c.2): revoked-incarnation vacuum. The apply
+/// re-verifies at commit time that the incarnation row exists, belongs to
+/// `mount_id`, is revoked, and is not the mount's current pointer (revoke
+/// is permanent, so this check replays deterministically), then deletes
+/// whole rows — entry, expiry, reverse — for each exact victim identity.
+/// Vacuum never touches the incarnation row, the policy row, outcomes,
+/// client watermarks, allocator watermarks, or mount pointers.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct CacheVacuumEntry {
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
+    pub(crate) incarnation: u64,
+    pub(crate) mount_id: u32,
+    /// Strictly ascending by key (a page of the ordered scan).
+    pub(crate) victims: Vec<VacuumVictim>,
+}
+
+/// Conditional batch (4c.2): bounded outcome-window GC with the frozen
+/// eligibility fence. The apply loud-rejects any group whose
+/// `evict_below` exceeds the client's durable watermark (an illegal
+/// entry; watermark monotonicity keeps the check replay-stable), then
+/// evicts the listed outcome rows unconditionally (missing = idempotent
+/// no-op). The watermark itself is never lowered or raised — an evicted
+/// token keeps answering Expired (terminal, never re-executed).
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct CacheOutcomeGcEntry {
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
+    /// Ascending by client_id.
+    pub(crate) groups: Vec<OutcomeGcGroup>,
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum JournalEntry {
     Mkdir(MkdirEntry),
@@ -348,6 +427,10 @@ pub enum JournalEntry {
     CacheCommit(CacheCommitEntry),
     CacheRemove(CacheRemoveEntry),
     CacheIncarnationAllocateV2(CacheIncarnationAllocateV2Entry),
+    CacheScopeRemove(CacheScopeRemoveEntry),
+    CacheTtlSweep(CacheTtlSweepEntry),
+    CacheVacuum(CacheVacuumEntry),
+    CacheOutcomeGc(CacheOutcomeGcEntry),
 }
 
 impl JournalEntry {
@@ -378,6 +461,10 @@ impl JournalEntry {
             JournalEntry::CacheCommit(e) => e.op_id,
             JournalEntry::CacheRemove(e) => e.op_id,
             JournalEntry::CacheIncarnationAllocateV2(e) => e.op_id,
+            JournalEntry::CacheScopeRemove(e) => e.op_id,
+            JournalEntry::CacheTtlSweep(e) => e.op_id,
+            JournalEntry::CacheVacuum(e) => e.op_id,
+            JournalEntry::CacheOutcomeGc(e) => e.op_id,
         }
     }
 
@@ -408,6 +495,10 @@ impl JournalEntry {
             JournalEntry::CacheCommit(e) => e.rpc_id,
             JournalEntry::CacheRemove(e) => e.rpc_id,
             JournalEntry::CacheIncarnationAllocateV2(e) => e.rpc_id,
+            JournalEntry::CacheScopeRemove(e) => e.rpc_id,
+            JournalEntry::CacheTtlSweep(e) => e.rpc_id,
+            JournalEntry::CacheVacuum(e) => e.rpc_id,
+            JournalEntry::CacheOutcomeGc(e) => e.rpc_id,
         }
     }
 
@@ -456,7 +547,11 @@ impl JournalEntry {
             | JournalEntry::CacheAllocate(_)
             | JournalEntry::CacheCommit(_)
             | JournalEntry::CacheRemove(_)
-            | JournalEntry::CacheIncarnationAllocateV2(_) => Vec::new(),
+            | JournalEntry::CacheIncarnationAllocateV2(_)
+            | JournalEntry::CacheScopeRemove(_)
+            | JournalEntry::CacheTtlSweep(_)
+            | JournalEntry::CacheVacuum(_)
+            | JournalEntry::CacheOutcomeGc(_) => Vec::new(),
         }
     }
 
@@ -483,6 +578,10 @@ impl JournalEntry {
                 | JournalEntry::CacheCommit(_)
                 | JournalEntry::CacheRemove(_)
                 | JournalEntry::CacheIncarnationAllocateV2(_)
+                | JournalEntry::CacheScopeRemove(_)
+                | JournalEntry::CacheTtlSweep(_)
+                | JournalEntry::CacheVacuum(_)
+                | JournalEntry::CacheOutcomeGc(_)
         )
     }
 }
@@ -673,9 +772,10 @@ mod tests {
     // prefix. Journals persisted by older binaries replay on newer ones
     // purely by positional stability, so this test is the golden wire
     // format: 0..=17 are the pre-cache variants (identical to main at the
-    // branch base), and the cache block appended by task #3 phase 1c must
-    // occupy 18..=23. Reordering or inserting any variant silently
-    // corrupts every persisted journal.
+    // branch base), the cache block appended by task #3 phase 1c occupies
+    // 18..=23, 4b appended V2 allocation at 24, and the 4c.2 bounded
+    // mutation batches occupy 25..=28 — tail-appends only. Reordering or
+    // inserting any variant silently corrupts every persisted journal.
     fn discriminant(entry: &JournalEntry) -> u32 {
         let bytes = SerdeUtils::serialize(entry).expect("serialize journal entry");
         assert!(bytes.len() >= 4, "bincode output too short for variant tag");
@@ -1096,6 +1196,45 @@ mod tests {
                 }),
                 24,
             ),
+            // 4c.2 append: bounded mutation batches at the tail. Everything
+            // above keeps its discriminant byte (frozen-bytes compat gate).
+            (
+                JournalEntry::CacheScopeRemove(CacheScopeRemoveEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    incarnation: 1,
+                    scope: "/s".into(),
+                    victims: vec![],
+                }),
+                25,
+            ),
+            (
+                JournalEntry::CacheTtlSweep(CacheTtlSweepEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    now: 1,
+                    victims: vec![],
+                }),
+                26,
+            ),
+            (
+                JournalEntry::CacheVacuum(CacheVacuumEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    incarnation: 1,
+                    mount_id: 1,
+                    victims: vec![],
+                }),
+                27,
+            ),
+            (
+                JournalEntry::CacheOutcomeGc(CacheOutcomeGcEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    groups: vec![],
+                }),
+                28,
+            ),
         ];
 
         for (entry, expected) in cases {
@@ -1106,5 +1245,174 @@ mod tests {
                 entry
             );
         }
+    }
+
+    // ---- 4c.2 bounded mutation batch fixtures ----
+
+    fn scope_remove_fixture() -> CacheScopeRemoveEntry {
+        CacheScopeRemoveEntry {
+            op_id: 41,
+            rpc_id: -7,
+            incarnation: 12,
+            scope: "/s".into(),
+            victims: vec![ScopeRemoveVictim {
+                key: "/k".into(),
+                expected_generation: 1,
+                new_generation: 2,
+                object_id: crate::master::meta::cache::BlockIdCodec::CACHE_OBJECT_MIN,
+                expire_at: 5000,
+            }],
+        }
+    }
+
+    fn ttl_sweep_fixture() -> CacheTtlSweepEntry {
+        CacheTtlSweepEntry {
+            op_id: 41,
+            rpc_id: -7,
+            now: 5000,
+            victims: vec![ExpiryRow {
+                expire_at: 5000,
+                incarnation: 12,
+                object_id: crate::master::meta::cache::BlockIdCodec::CACHE_OBJECT_MIN,
+                key: "/k".into(),
+                generation: 1,
+            }],
+        }
+    }
+
+    fn vacuum_fixture() -> CacheVacuumEntry {
+        CacheVacuumEntry {
+            op_id: 41,
+            rpc_id: -7,
+            incarnation: 12,
+            mount_id: 3,
+            victims: vec![VacuumVictim {
+                key: "/k".into(),
+                generation: 1,
+                object_id: crate::master::meta::cache::BlockIdCodec::CACHE_OBJECT_MIN,
+                expire_at: 5000,
+            }],
+        }
+    }
+
+    fn outcome_gc_fixture() -> CacheOutcomeGcEntry {
+        CacheOutcomeGcEntry {
+            op_id: 41,
+            rpc_id: -7,
+            groups: vec![OutcomeGcGroup {
+                client_id: 99,
+                evict_below: 7,
+                op_seqs: vec![1, 2],
+            }],
+        }
+    }
+
+    /// Frozen wire bytes of the four 4c.2 bounded mutation batch variants
+    /// (review correction: literal-hex fixtures, not roundtrip-only). The
+    /// variants are NEW at 4c.2 — no pre-4c.2 binary can ever have written
+    /// them — so these literals freeze the layout from this commit
+    /// forward: any later field reorder/retag silently corrupting
+    /// persisted 4c.2 journals fails here bit-exactly. Discriminant tags
+    /// 0x19..=0x1c (25..=28) sit strictly above every prior variant, so an
+    /// old binary rejects them loudly instead of misdecoding.
+    #[test]
+    fn test_4c2_frozen_journal_bytes() {
+        const SCOPE_HEX: &str = "190000002900000000000000f9ffffffffffffff0c0000000000000002000000000000002f73010000000000000002000000000000002f6b0100000000000000020000000000000000000000400000008813000000000000";
+        const TTL_HEX: &str = "1a0000002900000000000000f9ffffffffffffff8813000000000000010000000000000088130000000000000c00000000000000000000004000000002000000000000002f6b0100000000000000";
+        const VACUUM_HEX: &str = "1b0000002900000000000000f9ffffffffffffff0c0000000000000003000000010000000000000002000000000000002f6b010000000000000000000000400000008813000000000000";
+        const GC_HEX: &str = "1c0000002900000000000000f9ffffffffffffff010000000000000063000000000000000700000000000000020000000000000001000000000000000200000000000000";
+
+        // Round-trip each literal: encode == frozen bytes, decode keeps
+        // the variant and every frozen field.
+        let bytes =
+            SerdeUtils::serialize(&JournalEntry::CacheScopeRemove(scope_remove_fixture())).unwrap();
+        assert_eq!(hex_encode(&bytes), SCOPE_HEX);
+        match SerdeUtils::deserialize::<JournalEntry>(&bytes).unwrap() {
+            JournalEntry::CacheScopeRemove(e) => {
+                assert_eq!((e.op_id, e.rpc_id, e.incarnation), (41, -7, 12));
+                assert_eq!(e.scope, "/s");
+                assert_eq!(e.victims.len(), 1);
+                let v = &e.victims[0];
+                assert_eq!(
+                    (v.key.as_str(), v.expected_generation, v.new_generation),
+                    ("/k", 1, 2)
+                );
+                assert_eq!(
+                    v.object_id,
+                    crate::master::meta::cache::BlockIdCodec::CACHE_OBJECT_MIN
+                );
+                assert_eq!(v.expire_at, 5000);
+            }
+            other => panic!("scope bytes crosswalked to {:?}", other),
+        }
+
+        let bytes =
+            SerdeUtils::serialize(&JournalEntry::CacheTtlSweep(ttl_sweep_fixture())).unwrap();
+        assert_eq!(hex_encode(&bytes), TTL_HEX);
+        match SerdeUtils::deserialize::<JournalEntry>(&bytes).unwrap() {
+            JournalEntry::CacheTtlSweep(e) => {
+                assert_eq!(e.now, 5000);
+                assert_eq!(e.victims.len(), 1);
+                let r = &e.victims[0];
+                assert_eq!(
+                    (r.expire_at, r.incarnation, r.key.as_str(), r.generation),
+                    (5000, 12, "/k", 1)
+                );
+            }
+            other => panic!("ttl bytes crosswalked to {:?}", other),
+        }
+
+        let bytes = SerdeUtils::serialize(&JournalEntry::CacheVacuum(vacuum_fixture())).unwrap();
+        assert_eq!(hex_encode(&bytes), VACUUM_HEX);
+        match SerdeUtils::deserialize::<JournalEntry>(&bytes).unwrap() {
+            JournalEntry::CacheVacuum(e) => {
+                assert_eq!((e.incarnation, e.mount_id), (12, 3));
+                assert_eq!(e.victims.len(), 1);
+                assert_eq!(
+                    (e.victims[0].key.as_str(), e.victims[0].generation),
+                    ("/k", 1)
+                );
+            }
+            other => panic!("vacuum bytes crosswalked to {:?}", other),
+        }
+
+        let bytes =
+            SerdeUtils::serialize(&JournalEntry::CacheOutcomeGc(outcome_gc_fixture())).unwrap();
+        assert_eq!(hex_encode(&bytes), GC_HEX);
+        match SerdeUtils::deserialize::<JournalEntry>(&bytes).unwrap() {
+            JournalEntry::CacheOutcomeGc(e) => {
+                assert_eq!(e.groups.len(), 1);
+                assert_eq!((e.groups[0].client_id, e.groups[0].evict_below), (99, 7));
+                assert_eq!(e.groups[0].op_seqs, vec![1, 2]);
+            }
+            other => panic!("gc bytes crosswalked to {:?}", other),
+        }
+    }
+
+    /// A journal segment mixing pre-4b, 4b, and 4c.2 entries must decode
+    /// each entry to its own variant (no crosswalk across the three
+    /// append eras).
+    #[test]
+    fn test_mixed_4c2_journal_batch_no_crosswalk() {
+        let mixed = vec![
+            JournalEntry::CacheIncarnationAllocate(legacy_allocate_fixture()),
+            JournalEntry::CacheIncarnationAllocateV2(v2_allocate_fixture()),
+            JournalEntry::CacheScopeRemove(scope_remove_fixture()),
+            JournalEntry::CacheTtlSweep(ttl_sweep_fixture()),
+            JournalEntry::CacheVacuum(vacuum_fixture()),
+            JournalEntry::CacheOutcomeGc(outcome_gc_fixture()),
+        ];
+        let bytes = SerdeUtils::serialize(&mixed).unwrap();
+        let back: Vec<JournalEntry> = SerdeUtils::deserialize(&bytes).unwrap();
+        assert_eq!(back.len(), 6);
+        assert!(matches!(back[0], JournalEntry::CacheIncarnationAllocate(_)));
+        assert!(matches!(
+            back[1],
+            JournalEntry::CacheIncarnationAllocateV2(_)
+        ));
+        assert!(matches!(back[2], JournalEntry::CacheScopeRemove(_)));
+        assert!(matches!(back[3], JournalEntry::CacheTtlSweep(_)));
+        assert!(matches!(back[4], JournalEntry::CacheVacuum(_)));
+        assert!(matches!(back[5], JournalEntry::CacheOutcomeGc(_)));
     }
 }

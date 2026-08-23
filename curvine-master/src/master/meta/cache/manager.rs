@@ -30,10 +30,13 @@
 
 use crate::master::meta::block_id::{BlockIdCodec, CacheObjectId};
 use crate::master::meta::cache::entry::{
-    validate_incarnation, CacheEntry, CacheEntryState, ExpiryRow, IncarnationPolicyRow,
-    IncarnationRow, ObjectRow, OpOutcome, OpToken,
+    validate_expiry_row, validate_incarnation, CacheEntry, CacheEntryState, ExpiryRow,
+    IncarnationPolicyRow, IncarnationRow, ObjectRow, OpOutcome, OpToken, OutcomeGcGroup,
+    ScopeRemoveVictim, VacuumVictim,
 };
-use crate::master::meta::cache::store::{state_tags, CacheWrite, LocalCacheIndexStore};
+use crate::master::meta::cache::store::{
+    state_tags, validate_page_len, CacheWrite, LocalCacheIndexStore,
+};
 use curvine_core_error::{err_box, err_msg, CommonError, CommonResult};
 use curvine_runtime::sync::AtomicLong;
 
@@ -1012,6 +1015,474 @@ impl CacheManager {
         }
         // The reverse row is only a GC hint for the superseded version.
         w.delete_object(cur.object_id).map_err(cv)?;
+        w.commit().map_err(cv)?;
+        Ok(())
+    }
+
+    // ---- 4c.2 bounded mutation/journal apply paths. Every batch is
+    // validated `1..=MUTATION_PAGE_CAP` at the boundary, mutates only the
+    // journaled exact victim identities (the apply NEVER re-runs a range
+    // scan), commits at most one bounded transaction per entry, and
+    // resolves stale/missing victims as deterministic no-ops so journal
+    // replay converges. ----
+
+    /// Validate a scope-remove page: length bound, strictly ascending keys
+    /// (a page of the ordered key scan), adjacent generations, and
+    /// cache-domain object ids.
+    fn validate_scope_victims(victims: &[ScopeRemoveVictim]) -> CommonResult<()> {
+        validate_page_len(victims.len()).map_err(cv)?;
+        for (i, v) in victims.iter().enumerate() {
+            if v.expected_generation < 1 {
+                return err_box!(
+                    "scope remove victim generation must be >= 1: {}",
+                    v.expected_generation
+                );
+            }
+            if Some(v.new_generation) != v.expected_generation.checked_add(1) {
+                return err_box!(
+                    "scope remove victim generations not adjacent for {}: expected {}, new {}",
+                    v.key,
+                    v.expected_generation,
+                    v.new_generation
+                );
+            }
+            if !BlockIdCodec::is_cache_owner(v.object_id) {
+                return err_box!(
+                    "scope remove victim object id outside cache domain: {}",
+                    v.object_id
+                );
+            }
+            if i > 0 && victims[i - 1].key >= v.key {
+                return err_box!(
+                    "scope remove victims must be strictly ascending by key: {} !< {}",
+                    victims[i - 1].key,
+                    v.key
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Conditional batch CAS (4c.2): prefix-scope remove. The victims were
+    /// paged by the leader with the 4c.1 scoped scan; this apply only runs
+    /// an exact CAS per victim against the authoritative entry — it never
+    /// re-scans the scope. A fenced incarnation is a whole-batch
+    /// deterministic no-op (the rows die with their namespace, reclaimed by
+    /// vacuum).
+    pub fn apply_scope_remove<S: LocalCacheIndexStore>(
+        &self,
+        store: &S,
+        incarnation: u64,
+        scope: &str,
+        victims: &[ScopeRemoveVictim],
+    ) -> CommonResult<()> {
+        validate_incarnation(incarnation)?;
+        if scope.is_empty() {
+            return err_box!("cache scope remove scope must be a non-empty prefix path");
+        }
+        Self::validate_scope_victims(victims)?;
+
+        // Apply-time incarnation fence (4b): same terminal semantics as a
+        // single-key remove.
+        if !Self::incarnation_active(store, incarnation)? {
+            return Ok(());
+        }
+
+        let mut w = store.cache_write();
+        for v in victims {
+            let cur = match store.cache_get_entry(incarnation, &v.key).map_err(cv)? {
+                Some(cur) => cur,
+                // Missing: stale victim (page raced a remove/vacuum), no-op.
+                None => continue,
+            };
+            // Later state already advanced past this victim's tombstone:
+            // converge (same rule as a single-key remove replay).
+            if cur.generation > v.new_generation {
+                continue;
+            }
+            if cur.generation == v.new_generation {
+                if cur.state == CacheEntryState::Tombstoned {
+                    continue; // already applied
+                }
+                return err_box!(
+                    "cache scope remove replay divergence for ({}, {})@{}: state {:?}",
+                    incarnation,
+                    v.key,
+                    v.new_generation,
+                    cur.state
+                );
+            }
+            // Identity CAS at the victim's expected generation: the
+            // committed row must match the observed (object_id, expire_at)
+            // exactly — the version is only fully pinned by the triple.
+            if cur.object_id != v.object_id || cur.expire_at != v.expire_at {
+                return err_box!(
+                    "cache scope remove identity mismatch for ({}, {})@{}: committed (object {}, expire {}) vs victim (object {}, expire {})",
+                    incarnation,
+                    v.key,
+                    v.expected_generation,
+                    cur.object_id,
+                    cur.expire_at,
+                    v.object_id,
+                    v.expire_at
+                );
+            }
+            if cur.generation != v.expected_generation {
+                return err_box!(
+                    "cache scope remove CAS violation for ({}, {}): committed generation {} vs victim {}",
+                    incarnation,
+                    v.key,
+                    cur.generation,
+                    v.expected_generation
+                );
+            }
+
+            let new = CacheEntry {
+                generation: v.new_generation,
+                state: CacheEntryState::Tombstoned,
+                object_id: cur.object_id,
+                len: 0,
+                ufs_mtime: cur.ufs_mtime,
+                block_size: cur.block_size,
+                expire_at: 0,
+            };
+            w.put_entry(incarnation, &v.key, &new).map_err(cv)?;
+            if cur.expire_at > 0 {
+                // Exact-identity CAS delete at the frozen position; the
+                // committed (key, generation) at it was written by this
+                // version's commit, so it must match exactly.
+                w.delete_expiry(
+                    cur.expire_at,
+                    incarnation,
+                    cur.object_id,
+                    &v.key,
+                    cur.generation,
+                )
+                .map_err(cv)?;
+            }
+            w.delete_object(cur.object_id).map_err(cv)?;
+        }
+        w.commit().map_err(cv)?;
+        Ok(())
+    }
+
+    /// Validate a TTL sweep page: length bound, positive deadline, and
+    /// strictly ascending frozen `(expire_at, incarnation, object_id)`
+    /// positions (a page of the ordered expiry scan).
+    fn validate_ttl_victims(victims: &[ExpiryRow]) -> CommonResult<()> {
+        validate_page_len(victims.len()).map_err(cv)?;
+        for v in victims {
+            validate_expiry_row(v)?;
+            validate_incarnation(v.incarnation)?;
+        }
+        for i in 1..victims.len() {
+            let a = &victims[i - 1];
+            let b = &victims[i];
+            if (a.expire_at, a.incarnation, a.object_id)
+                >= (b.expire_at, b.incarnation, b.object_id)
+            {
+                return err_box!(
+                    "ttl sweep victims must be ascending in frozen index order: ({}, {}, {}) !< ({}, {}, {})",
+                    a.expire_at,
+                    a.incarnation,
+                    a.object_id,
+                    b.expire_at,
+                    b.incarnation,
+                    b.object_id
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Conditional batch CAS (4c.2): TTL sweep over a page of due expiry
+    /// rows. Per victim, exactly two identity-bound steps: (1) exact-CAS
+    /// delete of the victim's OWN expiry row at its frozen position — a
+    /// missing row is an idempotent no-op, an identity mismatch is loud
+    /// divergence, and NO other expiry position is ever touched; (2) a full
+    /// `(generation, object_id, expire_at)` identity CAS against the
+    /// authoritative entry — an exact match tombstones the entry (and drops
+    /// its reverse row) exactly like a remove; a missing or advanced entry
+    /// is the stale terminal no-op (the load is dead; the old object is
+    /// reclaimable).
+    pub fn apply_ttl_sweep<S: LocalCacheIndexStore>(
+        &self,
+        store: &S,
+        now: i64,
+        victims: &[ExpiryRow],
+    ) -> CommonResult<()> {
+        if now <= 0 {
+            return err_box!("ttl sweep deadline must be positive: {}", now);
+        }
+        Self::validate_ttl_victims(victims)?;
+
+        let mut w = store.cache_write();
+        for v in victims {
+            // (1) The victim's own frozen position, exact identity only.
+            w.delete_expiry(
+                v.expire_at,
+                v.incarnation,
+                v.object_id,
+                &v.key,
+                v.generation,
+            )
+            .map_err(cv)?;
+
+            // (2) Authoritative-entry CAS: only the exact version that
+            // produced this expiry row may be tombstoned by the sweep —
+            // and only inside a live namespace. In a fenced (revoked or
+            // stale) incarnation the sweep stops at the expiry-index
+            // cleanup above: the authoritative row is left for the
+            // revoked-incarnation vacuum, the only variant allowed to
+            // delete primary rows in a revoked namespace (4b fence).
+            if !Self::incarnation_active(store, v.incarnation)? {
+                continue;
+            }
+            match store.cache_get_entry(v.incarnation, &v.key).map_err(cv)? {
+                Some(cur) if cur.generation == v.generation => {
+                    if cur.object_id != v.object_id || cur.expire_at != v.expire_at {
+                        return err_box!(
+                            "ttl sweep identity divergence for ({}, {})@{}: committed (object {}, expire {}) vs victim (object {}, expire {})",
+                            v.incarnation,
+                            v.key,
+                            v.generation,
+                            cur.object_id,
+                            cur.expire_at,
+                            v.object_id,
+                            v.expire_at
+                        );
+                    }
+                    let new_generation = v.generation.checked_add(1).ok_or_else(|| {
+                        CommonError::from(err_msg!(
+                            "ttl sweep generation overflow at u64::MAX for ({}, {})",
+                            v.incarnation,
+                            v.key
+                        ))
+                    })?;
+                    let new = CacheEntry {
+                        generation: new_generation,
+                        state: CacheEntryState::Tombstoned,
+                        object_id: cur.object_id,
+                        len: 0,
+                        ufs_mtime: cur.ufs_mtime,
+                        block_size: cur.block_size,
+                        expire_at: 0,
+                    };
+                    w.put_entry(v.incarnation, &v.key, &new).map_err(cv)?;
+                    w.delete_object(v.object_id).map_err(cv)?;
+                }
+                // Missing row, or a later generation already advanced past
+                // the victim: terminal no-op (the expiry row cleanup above
+                // already reclaimed the victim's own index position).
+                _ => continue,
+            }
+        }
+        w.commit().map_err(cv)?;
+        Ok(())
+    }
+
+    /// Validate a vacuum page: length bound, strictly ascending keys,
+    /// generation and object-domain checks.
+    fn validate_vacuum_victims(victims: &[VacuumVictim]) -> CommonResult<()> {
+        validate_page_len(victims.len()).map_err(cv)?;
+        for (i, v) in victims.iter().enumerate() {
+            if v.generation < 1 {
+                return err_box!("vacuum victim generation must be >= 1: {}", v.generation);
+            }
+            if !BlockIdCodec::is_cache_owner(v.object_id) {
+                return err_box!(
+                    "vacuum victim object id outside cache domain: {}",
+                    v.object_id
+                );
+            }
+            if i > 0 && victims[i - 1].key >= v.key {
+                return err_box!(
+                    "vacuum victims must be strictly ascending by key: {} !< {}",
+                    victims[i - 1].key,
+                    v.key
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Conditional batch (4c.2): revoked-incarnation vacuum. Gate-3
+    /// re-verification at apply time — the incarnation row must exist,
+    /// belong to `mount_id`, be revoked, and NOT be the mount's current
+    /// pointer (revoke is permanent and pointers only move forward, so the
+    /// check replays deterministically). Victims are then deleted WHOLE —
+    /// entry row (no tombstone), own expiry row (exact identity), reverse
+    /// row. Vacuum never touches the incarnation row, the policy row,
+    /// outcomes, client watermarks, allocator watermarks, or the pointer.
+    pub fn apply_vacuum<S: LocalCacheIndexStore>(
+        &self,
+        store: &S,
+        incarnation: u64,
+        mount_id: u32,
+        victims: &[VacuumVictim],
+    ) -> CommonResult<()> {
+        validate_incarnation(incarnation)?;
+        Self::validate_vacuum_victims(victims)?;
+
+        match store.cache_get_incarnation(incarnation).map_err(cv)? {
+            Some(row) => {
+                if row.mount_id != mount_id {
+                    return err_box!(
+                        "vacuum incarnation {} belongs to mount {}, entry says mount {}",
+                        incarnation,
+                        row.mount_id,
+                        mount_id
+                    );
+                }
+                if !row.revoked {
+                    return err_box!(
+                        "vacuum incarnation {} is not revoked: vacuum of a live namespace is illegal",
+                        incarnation
+                    );
+                }
+            }
+            // Incarnation rows are durable forever, so a committed vacuum
+            // entry always finds its row — replay included.
+            None => return err_box!("vacuum incarnation {} has no incarnation row", incarnation),
+        }
+        if store.cache_current_incarnation(mount_id).map_err(cv)? == Some(incarnation) {
+            return err_box!(
+                "vacuum incarnation {} is still mount {}'s current incarnation",
+                incarnation,
+                mount_id
+            );
+        }
+
+        let mut w = store.cache_write();
+        for v in victims {
+            let cur = match store.cache_get_entry(incarnation, &v.key).map_err(cv)? {
+                Some(cur) => cur,
+                // Missing: already vacuumed page replay, no-op.
+                None => continue,
+            };
+            if cur.generation != v.generation {
+                if cur.generation > v.generation {
+                    // A later version exists: the page raced a mutation;
+                    // the row stays for the next vacuum page. Deterministic
+                    // no-op (replay sees the same committed state).
+                    continue;
+                }
+                return err_box!(
+                    "vacuum victim generation {} is beyond the committed row generation {} for ({}, {})",
+                    v.generation,
+                    cur.generation,
+                    incarnation,
+                    v.key
+                );
+            }
+            if cur.object_id != v.object_id || cur.expire_at != v.expire_at {
+                return err_box!(
+                    "vacuum identity mismatch for ({}, {})@{}: committed (object {}, expire {}) vs victim (object {}, expire {})",
+                    incarnation,
+                    v.key,
+                    v.generation,
+                    cur.object_id,
+                    cur.expire_at,
+                    v.object_id,
+                    v.expire_at
+                );
+            }
+            w.delete_entry(incarnation, &v.key).map_err(cv)?;
+            if cur.expire_at > 0 {
+                w.delete_expiry(
+                    cur.expire_at,
+                    incarnation,
+                    cur.object_id,
+                    &v.key,
+                    cur.generation,
+                )
+                .map_err(cv)?;
+            }
+            w.delete_object(cur.object_id).map_err(cv)?;
+        }
+        w.commit().map_err(cv)?;
+        Ok(())
+    }
+
+    /// Conditional batch (4c.2): bounded outcome-window GC with the frozen
+    /// eligibility fence. Eligibility is judged against the
+    /// leader-observed `evict_below` frozen in the entry — NEVER against
+    /// the apply-time watermark, which would make the entry's effect
+    /// depend on apply timing (a first no-op could turn into a delete on
+    /// replay after the watermark advanced — non-convergent). The apply
+    /// loud-rejects a group whose `evict_below` exceeds the client's
+    /// durable watermark (an illegal entry; watermark monotonicity keeps
+    /// this check replay-stable), then evicts the listed outcome rows
+    /// unconditionally: a missing outcome is the idempotent replay no-op.
+    /// The watermark itself is never moved — an evicted token keeps
+    /// answering Expired (terminal, never re-executed).
+    pub fn apply_outcome_gc<S: LocalCacheIndexStore>(
+        &self,
+        store: &S,
+        groups: &[OutcomeGcGroup],
+    ) -> CommonResult<()> {
+        let total: usize = groups.iter().map(|g| g.op_seqs.len()).sum();
+        validate_page_len(total).map_err(cv)?;
+        for (i, g) in groups.iter().enumerate() {
+            Self::check_token(OpToken {
+                client_id: g.client_id,
+                op_seq: g.evict_below,
+            })?;
+            if g.op_seqs.is_empty() {
+                return err_box!("outcome gc group for client {} is empty", g.client_id);
+            }
+            if i > 0 && groups[i - 1].client_id >= g.client_id {
+                return err_box!("outcome gc groups must be strictly ascending by client_id");
+            }
+            for (j, seq) in g.op_seqs.iter().enumerate() {
+                if *seq == 0 {
+                    return err_box!("outcome gc op_seq must be >= 1: {}", seq);
+                }
+                if *seq >= g.evict_below {
+                    return err_box!(
+                        "outcome gc op_seq {} is not below the frozen eligibility fence {} for client {}",
+                        seq,
+                        g.evict_below,
+                        g.client_id
+                    );
+                }
+                if j > 0 && g.op_seqs[j - 1] >= *seq {
+                    return err_box!(
+                        "outcome gc op_seqs must be strictly ascending for client {}",
+                        g.client_id
+                    );
+                }
+            }
+            // Frozen-fence legality: the observed watermark must still (or
+            // already) be at/above the frozen cutoff. Monotonic, so this
+            // replays identically.
+            match store.cache_client_watermark(g.client_id).map_err(cv)? {
+                Some(hw) if g.evict_below <= hw => (),
+                other => {
+                    return err_box!(
+                    "outcome gc eligibility fence {} exceeds client {}'s durable watermark {:?}",
+                    g.evict_below,
+                    g.client_id,
+                    other
+                )
+                }
+            }
+        }
+
+        let mut w = store.cache_write();
+        for g in groups {
+            for seq in &g.op_seqs {
+                let token = OpToken {
+                    client_id: g.client_id,
+                    op_seq: *seq,
+                };
+                // Unconditional within the frozen fence: missing = the
+                // idempotent replay no-op.
+                if store.cache_get_outcome(token).map_err(cv)?.is_some() {
+                    w.delete_outcome(token).map_err(cv)?;
+                }
+            }
+        }
         w.commit().map_err(cv)?;
         Ok(())
     }
@@ -2106,5 +2577,858 @@ mod tests {
         );
         assert!(store.cache_get_outcome(token(2, 1)).unwrap().is_some());
         assert!(store.cache_get_outcome(token(2, 2)).unwrap().is_some());
+    }
+
+    // ---- 4c.2 bounded mutation batches ----
+
+    /// Unit-test stand-in for a completed allocate+commit round trip in
+    /// namespace `incarnation` (mount `mount_id`): a Valid@1 entry with an
+    /// expiry row at `expire_at` (0 = none) and its reverse row. Repeated
+    /// calls replay idempotently (issuer-side rows use fixed tokens).
+    #[allow(clippy::too_many_arguments)]
+    fn seed_committed(
+        store: &RocksInodeStore,
+        mgr: &CacheManager,
+        mount_id: u32,
+        incarnation: u64,
+        key: &str,
+        object_id: i64,
+        len: i64,
+        expire_at: i64,
+    ) {
+        mgr.apply_incarnation_allocate_v2(
+            store,
+            OpToken {
+                client_id: 91,
+                op_seq: incarnation,
+            },
+            mount_id,
+            incarnation,
+            0,
+        )
+        .unwrap();
+        mgr.apply_id_reserve(store, token(1, 1), OBJ, OBJ + 1000)
+            .unwrap();
+        let alloc_token = OpToken {
+            client_id: 31,
+            op_seq: object_id as u64,
+        };
+        mgr.apply_allocate(
+            store,
+            alloc_token,
+            incarnation,
+            key,
+            len,
+            &reserved(1, object_id),
+        )
+        .unwrap();
+        mgr.apply_commit(
+            store,
+            alloc_token,
+            OpToken {
+                client_id: 32,
+                op_seq: object_id as u64,
+            },
+            incarnation,
+            key,
+            1,
+            object_id,
+            len,
+            777,
+            expire_at,
+        )
+        .unwrap();
+    }
+
+    /// Re-open a Tombstoned key: the only legal re-allocation
+    /// (Tombstoned@g -> Reserved@g+1) followed by a commit, producing a
+    /// Valid@{g+1} row with a strictly greater object id.
+    #[allow(clippy::too_many_arguments)]
+    fn reopen_committed(
+        store: &RocksInodeStore,
+        mgr: &CacheManager,
+        incarnation: u64,
+        key: &str,
+        old_generation: u64,
+        object_id: i64,
+        len: i64,
+        expire_at: i64,
+    ) {
+        let generation = old_generation + 1;
+        let alloc_token = OpToken {
+            client_id: 41,
+            op_seq: object_id as u64,
+        };
+        mgr.apply_allocate(
+            store,
+            alloc_token,
+            incarnation,
+            key,
+            len,
+            &reserved(generation, object_id),
+        )
+        .unwrap();
+        mgr.apply_commit(
+            store,
+            alloc_token,
+            OpToken {
+                client_id: 42,
+                op_seq: object_id as u64,
+            },
+            incarnation,
+            key,
+            generation,
+            object_id,
+            len,
+            777,
+            expire_at,
+        )
+        .unwrap();
+    }
+
+    fn scope_victim(key: &str, expected: u64, object_id: i64, expire_at: i64) -> ScopeRemoveVictim {
+        ScopeRemoveVictim {
+            key: key.to_string(),
+            expected_generation: expected,
+            new_generation: expected + 1,
+            object_id,
+            expire_at,
+        }
+    }
+
+    fn vacuum_victim(key: &str, generation: u64, object_id: i64, expire_at: i64) -> VacuumVictim {
+        VacuumVictim {
+            key: key.to_string(),
+            generation,
+            object_id,
+            expire_at,
+        }
+    }
+
+    fn expiry_row(expire_at: i64, incarnation: u64, object_id: i64, key: &str) -> ExpiryRow {
+        ExpiryRow {
+            expire_at,
+            incarnation,
+            object_id,
+            key: key.to_string(),
+            generation: 1,
+        }
+    }
+
+    #[test]
+    fn test_apply_scope_remove_cas_fences_validation() {
+        let store = new_store("scope-remove");
+        let mgr = CacheManager::new();
+
+        seed_committed(&store, &mgr, 5, 1, "/a/x", OBJ, 300, 5000);
+        seed_committed(&store, &mgr, 5, 1, "/a/y", OBJ + 1, 400, 5000);
+        seed_committed(&store, &mgr, 5, 1, "/b/z", OBJ + 2, 500, 6000);
+
+        // Exact page over the /a scope: both victims tombstoned at g+1,
+        // expiry and reverse rows dropped, len cleared, geometry preserved.
+        let victims = vec![
+            scope_victim("/a/x", 1, OBJ, 5000),
+            scope_victim("/a/y", 1, OBJ + 1, 5000),
+        ];
+        mgr.apply_scope_remove(&store, 1, "/a", &victims).unwrap();
+        for (key, block_size) in [("/a/x", 128), ("/a/y", 128)] {
+            let e = store.cache_get_entry(1, key).unwrap().unwrap();
+            assert_eq!(
+                (
+                    e.state,
+                    e.generation,
+                    e.object_id,
+                    e.len,
+                    e.expire_at,
+                    e.block_size
+                ),
+                (
+                    CacheEntryState::Tombstoned,
+                    2,
+                    e.object_id,
+                    0,
+                    0,
+                    block_size
+                )
+            );
+        }
+        assert!(store.cache_get_object(OBJ).unwrap().is_none());
+        assert!(store.cache_get_object(OBJ + 1).unwrap().is_none());
+        // Outside the scope: untouched, its expiry row survives.
+        let outside = store.cache_get_entry(1, "/b/z").unwrap().unwrap();
+        assert_eq!(outside.state, CacheEntryState::Valid);
+        assert_eq!(store.cache_scan_expiry(100_000, None, 10).unwrap().len(), 1);
+
+        // Idempotent replay: every victim meets Tombstoned@new_generation.
+        mgr.apply_scope_remove(&store, 1, "/a", &victims).unwrap();
+
+        // Missing victim (page raced a remove/vacuum): deterministic no-op.
+        mgr.apply_scope_remove(&store, 1, "/a", &[scope_victim("/a/gone", 3, OBJ + 9, 0)])
+            .unwrap();
+        assert!(store.cache_get_entry(1, "/a/gone").unwrap().is_none());
+
+        // Later generation already advanced past the victim's tombstone:
+        // converge (stale no-op). /a/x re-opened to Valid@3 first.
+        reopen_committed(&store, &mgr, 1, "/a/x", 2, OBJ + 10, 350, 0);
+        mgr.apply_scope_remove(&store, 1, "/a", &[scope_victim("/a/x", 1, OBJ, 5000)])
+            .unwrap();
+        assert_eq!(
+            store
+                .cache_get_entry(1, "/a/x")
+                .unwrap()
+                .unwrap()
+                .generation,
+            3
+        );
+
+        // Identity divergence: expected generation matches the committed
+        // row but the observed (object, expire) does not — loud, and the
+        // batch leaves zero writes behind.
+        assert!(mgr
+            .apply_scope_remove(&store, 1, "/b", &[scope_victim("/b/z", 1, OBJ + 9, 6000)])
+            .is_err());
+        assert_eq!(
+            store.cache_get_entry(1, "/b/z").unwrap().unwrap().state,
+            CacheEntryState::Valid
+        );
+
+        // Replay divergence: the row sits at the victim's new generation
+        // but is NOT the victim's tombstone (a newer identity lives there).
+        assert!(mgr
+            .apply_scope_remove(&store, 1, "/a", &[scope_victim("/a/x", 2, OBJ + 10, 0)])
+            .is_err());
+        assert_eq!(
+            store.cache_get_entry(1, "/a/x").unwrap().unwrap().state,
+            CacheEntryState::Valid
+        );
+
+        // CAS violation: the victim's expected generation is beyond the
+        // committed row (illegal entry, never a legit race).
+        assert!(mgr
+            .apply_scope_remove(&store, 1, "/b", &[scope_victim("/b/z", 5, OBJ + 2, 6000)])
+            .is_err());
+
+        // 4b fence: a revoked namespace turns the whole batch into a no-op.
+        mgr.apply_incarnation_revoke(&store, 5, 1).unwrap();
+        mgr.apply_scope_remove(&store, 1, "/b", &[scope_victim("/b/z", 1, OBJ + 2, 6000)])
+            .unwrap();
+        assert_eq!(
+            store.cache_get_entry(1, "/b/z").unwrap().unwrap().state,
+            CacheEntryState::Valid
+        );
+        assert_eq!(store.cache_scan_expiry(100_000, None, 10).unwrap().len(), 1);
+
+        // Validation: empty scope, empty page, page-cap bomb, non-adjacent
+        // generations, zero generation, non-cache object id, unsorted keys.
+        assert!(mgr.apply_scope_remove(&store, 1, "", &victims).is_err());
+        assert!(mgr.apply_scope_remove(&store, 1, "/a", &[]).is_err());
+        let mut bomb: Vec<ScopeRemoveVictim> = (0..65)
+            .map(|i| scope_victim(&format!("/a/{:04}", i), 1, OBJ + 100 + i, 0))
+            .collect();
+        assert!(mgr.apply_scope_remove(&store, 1, "/a", &bomb).is_err());
+        assert!(mgr
+            .apply_scope_remove(
+                &store,
+                1,
+                "/a",
+                &[ScopeRemoveVictim {
+                    key: "/a/x".into(),
+                    expected_generation: 1,
+                    new_generation: 3,
+                    object_id: OBJ,
+                    expire_at: 0,
+                }]
+            )
+            .is_err());
+        assert!(mgr
+            .apply_scope_remove(&store, 1, "/a", &[scope_victim("/a/x", 0, OBJ, 0)])
+            .is_err());
+        assert!(mgr
+            .apply_scope_remove(&store, 1, "/a", &[scope_victim("/a/x", 1, 5, 0)])
+            .is_err());
+        bomb.sort_by(|a, b| b.key.cmp(&a.key));
+        assert!(mgr.apply_scope_remove(&store, 1, "/a", &bomb[1..]).is_err());
+    }
+
+    #[test]
+    fn test_apply_ttl_sweep_identity_and_fence() {
+        let store = new_store("ttl-sweep");
+        let mgr = CacheManager::new();
+
+        seed_committed(&store, &mgr, 5, 1, "/t/a", OBJ, 300, 1000);
+        seed_committed(&store, &mgr, 5, 1, "/t/b", OBJ + 1, 400, 1000);
+        seed_committed(&store, &mgr, 5, 1, "/t/c", OBJ + 2, 500, 2000);
+        // A due row inside a revoked namespace: expiry-index cleanup only.
+        seed_committed(&store, &mgr, 6, 2, "/t/d", OBJ + 3, 500, 1000);
+        mgr.apply_incarnation_revoke(&store, 6, 2).unwrap();
+
+        // The leader page at now=1500 covers exactly the due rows, in
+        // frozen index order (expire_at, incarnation, object_id).
+        let page = store.cache_scan_expiry(1500, None, 10).unwrap();
+        assert_eq!(page.len(), 3);
+        assert_eq!(
+            (
+                page[0].key.as_str(),
+                page[1].key.as_str(),
+                page[2].key.as_str()
+            ),
+            ("/t/a", "/t/b", "/t/d")
+        );
+
+        mgr.apply_ttl_sweep(&store, 1500, &page).unwrap();
+        // Live namespace: full remove semantics at g+1.
+        for key in ["/t/a", "/t/b"] {
+            let e = store.cache_get_entry(1, key).unwrap().unwrap();
+            assert_eq!(
+                (e.state, e.generation, e.len, e.expire_at),
+                (CacheEntryState::Tombstoned, 2, 0, 0)
+            );
+        }
+        // Fenced namespace (4b retention): the expiry row was reclaimed
+        // but the authoritative row stays for the revoked-incarnation
+        // vacuum — the ONLY variant allowed to delete it.
+        let fenced = store.cache_get_entry(2, "/t/d").unwrap().unwrap();
+        assert_eq!(fenced.state, CacheEntryState::Valid);
+        assert_eq!(fenced.expire_at, 1000);
+        // Only the not-yet-due row remains in the index.
+        let left = store.cache_scan_expiry(1_000_000, None, 10).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].key, "/t/c");
+        assert!(store.cache_get_object(OBJ).unwrap().is_none());
+        assert!(store.cache_get_object(OBJ + 1).unwrap().is_none());
+        assert!(store.cache_get_object(OBJ + 3).unwrap().is_some());
+
+        // Idempotent replay: every victim now meets a missing/stale row.
+        mgr.apply_ttl_sweep(&store, 1500, &page).unwrap();
+        assert_eq!(
+            store.cache_get_entry(2, "/t/d").unwrap().unwrap().state,
+            CacheEntryState::Valid
+        );
+
+        // Stale victim: the entry advanced past the victim generation —
+        // the expiry cleanup stays a no-op and the row is untouched.
+        mgr.apply_remove(&store, 1, "/t/c", 1, 2, OBJ + 2).unwrap();
+        reopen_committed(&store, &mgr, 1, "/t/c", 2, OBJ + 12, 550, 0);
+        mgr.apply_ttl_sweep(&store, 1500, &[expiry_row(2000, 1, OBJ + 2, "/t/c")])
+            .unwrap();
+        assert_eq!(
+            store
+                .cache_get_entry(1, "/t/c")
+                .unwrap()
+                .unwrap()
+                .generation,
+            3
+        );
+
+        // Identity divergence: generation matches (/t/c sits at Valid@3),
+        // identity does not — loud, zero writes.
+        assert!(mgr
+            .apply_ttl_sweep(
+                &store,
+                2500,
+                &[ExpiryRow {
+                    expire_at: 1000,
+                    incarnation: 1,
+                    object_id: OBJ + 9,
+                    key: "/t/c".into(),
+                    generation: 3,
+                }]
+            )
+            .is_err());
+
+        // Illegal deadlines and unsorted pages are rejected before writes.
+        assert!(mgr
+            .apply_ttl_sweep(&store, 0, &[expiry_row(1, 1, OBJ, "/k")])
+            .is_err());
+        assert!(mgr
+            .apply_ttl_sweep(&store, -5, &[expiry_row(1, 1, OBJ, "/k")])
+            .is_err());
+        assert!(mgr
+            .apply_ttl_sweep(
+                &store,
+                1500,
+                &[
+                    expiry_row(2000, 1, OBJ + 2, "/t/c"),
+                    expiry_row(1000, 1, OBJ, "/t/a"),
+                ]
+            )
+            .is_err());
+        let bomb: Vec<ExpiryRow> = (0..65)
+            .map(|i| expiry_row(1000 + i, 1, OBJ + 100 + i, "/bomb"))
+            .collect();
+        assert!(mgr.apply_ttl_sweep(&store, 1_000_000, &bomb).is_err());
+    }
+
+    #[test]
+    fn test_apply_vacuum_revoked_namespace() {
+        let store = new_store("vacuum");
+        let mgr = CacheManager::new();
+
+        seed_committed(&store, &mgr, 5, 1, "/v/a", OBJ, 300, 5000);
+        seed_committed(&store, &mgr, 5, 1, "/v/b", OBJ + 1, 400, 0);
+        // Raced row: re-opened past the victim generation.
+        seed_committed(&store, &mgr, 5, 1, "/v/c", OBJ + 2, 500, 0);
+        mgr.apply_remove(&store, 1, "/v/c", 1, 2, OBJ + 2).unwrap();
+        reopen_committed(&store, &mgr, 1, "/v/c", 2, OBJ + 12, 550, 0);
+
+        // Gate-3 failures, loud, before any write: wrong mount, live
+        // namespace, missing incarnation row.
+        assert!(mgr
+            .apply_vacuum(&store, 1, 4, &[vacuum_victim("/v/a", 1, OBJ, 5000)])
+            .is_err());
+        assert!(mgr
+            .apply_vacuum(&store, 1, 5, &[vacuum_victim("/v/a", 1, OBJ, 5000)])
+            .is_err());
+        assert!(mgr
+            .apply_vacuum(&store, 9, 5, &[vacuum_victim("/v/a", 1, OBJ, 5000)])
+            .is_err());
+        assert!(store.cache_get_entry(1, "/v/a").unwrap().is_some());
+
+        // Revoke the namespace (pointer moves off it), then vacuum the
+        // exact page: rows deleted WHOLE — no tombstone left behind.
+        mgr.apply_incarnation_revoke(&store, 5, 1).unwrap();
+        let victims = vec![
+            vacuum_victim("/v/a", 1, OBJ, 5000),
+            vacuum_victim("/v/b", 1, OBJ + 1, 0),
+            vacuum_victim("/v/c", 1, OBJ + 2, 0),
+        ];
+        mgr.apply_vacuum(&store, 1, 5, &victims).unwrap();
+        assert!(store.cache_get_entry(1, "/v/a").unwrap().is_none());
+        assert!(store.cache_get_entry(1, "/v/b").unwrap().is_none());
+        assert!(store.cache_get_object(OBJ).unwrap().is_none());
+        assert!(store.cache_get_object(OBJ + 1).unwrap().is_none());
+        assert!(store
+            .cache_scan_expiry(1_000_000, None, 10)
+            .unwrap()
+            .is_empty());
+        // The raced row (cur.generation 3 > victim 1) survives for the
+        // next vacuum page.
+        let raced = store.cache_get_entry(1, "/v/c").unwrap().unwrap();
+        assert_eq!((raced.generation, raced.state), (3, CacheEntryState::Valid));
+
+        // Replay is a no-op (every victim row is gone).
+        mgr.apply_vacuum(&store, 1, 5, &victims).unwrap();
+
+        // The raced row now vacuums at its current generation.
+        mgr.apply_vacuum(&store, 1, 5, &[vacuum_victim("/v/c", 3, OBJ + 12, 0)])
+            .unwrap();
+        assert!(store.cache_get_entry(1, "/v/c").unwrap().is_none());
+
+        // Identity mismatch and beyond-committed generation are loud.
+        seed_committed(&store, &mgr, 6, 3, "/v/w", OBJ + 20, 100, 0);
+        mgr.apply_incarnation_revoke(&store, 6, 3).unwrap();
+        assert!(mgr
+            .apply_vacuum(&store, 3, 6, &[vacuum_victim("/v/w", 1, OBJ + 99, 0)])
+            .is_err());
+        assert!(mgr
+            .apply_vacuum(&store, 3, 6, &[vacuum_victim("/v/w", 5, OBJ + 20, 0)])
+            .is_err());
+        assert!(store.cache_get_entry(3, "/v/w").unwrap().is_some());
+
+        // Page-cap bomb and unsorted pages rejected.
+        let bomb: Vec<VacuumVictim> = (0..65)
+            .map(|i| vacuum_victim(&format!("/v/{:04}", i), 1, OBJ + 100 + i, 0))
+            .collect();
+        assert!(mgr.apply_vacuum(&store, 3, 6, &bomb).is_err());
+        assert!(mgr
+            .apply_vacuum(
+                &store,
+                3,
+                6,
+                &[
+                    vacuum_victim("/v/z", 1, OBJ + 30, 0),
+                    vacuum_victim("/v/w", 1, OBJ + 20, 0),
+                ]
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn test_apply_outcome_gc_frozen_fence() {
+        let store = new_store("outcome-gc");
+        let mgr = CacheManager::new();
+
+        // A live namespace so the allocations record their outcomes.
+        mgr.apply_incarnation_allocate_v2(
+            &store,
+            OpToken {
+                client_id: 91,
+                op_seq: 1,
+            },
+            7,
+            1,
+            0,
+        )
+        .unwrap();
+
+        // Object ids must sit inside a durable reserve segment.
+        mgr.apply_id_reserve(&store, token(1, 1), OBJ, OBJ + 100)
+            .unwrap();
+
+        // Client 11 executes five ops; its durable watermark is 5.
+        for seq in 1..=5u64 {
+            mgr.apply_allocate(
+                &store,
+                token(11, seq),
+                1,
+                &format!("/g/{}", seq),
+                100,
+                &reserved(1, OBJ + seq as i64),
+            )
+            .unwrap();
+        }
+        assert_eq!(store.cache_client_watermark(11).unwrap(), Some(5));
+        assert!(store.cache_get_outcome(token(11, 1)).unwrap().is_some());
+
+        // Frozen-fence GC below the observed watermark: outcomes 1..3
+        // evicted, 4..5 retained, watermark never moved.
+        mgr.apply_outcome_gc(
+            &store,
+            &[OutcomeGcGroup {
+                client_id: 11,
+                evict_below: 5,
+                op_seqs: vec![1, 2, 3],
+            }],
+        )
+        .unwrap();
+        for seq in 1..=3u64 {
+            assert!(store.cache_get_outcome(token(11, seq)).unwrap().is_none());
+        }
+        for seq in 4..=5u64 {
+            assert!(store.cache_get_outcome(token(11, seq)).unwrap().is_some());
+        }
+        assert_eq!(store.cache_client_watermark(11).unwrap(), Some(5));
+
+        // Idempotent replay: missing outcomes are no-ops.
+        mgr.apply_outcome_gc(
+            &store,
+            &[OutcomeGcGroup {
+                client_id: 11,
+                evict_below: 5,
+                op_seqs: vec![1, 2, 3],
+            }],
+        )
+        .unwrap();
+        assert!(store.cache_get_outcome(token(11, 4)).unwrap().is_some());
+
+        // Fence legality: an evict_below above the durable watermark is an
+        // illegal entry — loud, and the whole batch leaves zero writes
+        // (token 11:4 survives a rejected batch that also lists it).
+        assert!(mgr
+            .apply_outcome_gc(
+                &store,
+                &[OutcomeGcGroup {
+                    client_id: 11,
+                    evict_below: 99,
+                    op_seqs: vec![4],
+                }]
+            )
+            .is_err());
+        assert!(store.cache_get_outcome(token(11, 4)).unwrap().is_some());
+        // A client with no watermark at all is equally illegal.
+        assert!(mgr
+            .apply_outcome_gc(
+                &store,
+                &[OutcomeGcGroup {
+                    client_id: 12,
+                    evict_below: 2,
+                    op_seqs: vec![1],
+                }]
+            )
+            .is_err());
+
+        // Structural rejections (journal bombs): empty group, seq 0, seq at
+        // or above the fence, unsorted seqs, duplicate clients, total above
+        // the page cap.
+        assert!(mgr
+            .apply_outcome_gc(
+                &store,
+                &[OutcomeGcGroup {
+                    client_id: 11,
+                    evict_below: 5,
+                    op_seqs: vec![],
+                }]
+            )
+            .is_err());
+        assert!(mgr
+            .apply_outcome_gc(
+                &store,
+                &[OutcomeGcGroup {
+                    client_id: 11,
+                    evict_below: 5,
+                    op_seqs: vec![4, 0],
+                }]
+            )
+            .is_err());
+        assert!(mgr
+            .apply_outcome_gc(
+                &store,
+                &[OutcomeGcGroup {
+                    client_id: 11,
+                    evict_below: 5,
+                    op_seqs: vec![4, 5],
+                }]
+            )
+            .is_err());
+        assert!(mgr
+            .apply_outcome_gc(
+                &store,
+                &[OutcomeGcGroup {
+                    client_id: 11,
+                    evict_below: 5,
+                    op_seqs: vec![2, 1],
+                }]
+            )
+            .is_err());
+        assert!(mgr
+            .apply_outcome_gc(
+                &store,
+                &[
+                    OutcomeGcGroup {
+                        client_id: 11,
+                        evict_below: 5,
+                        op_seqs: vec![4],
+                    },
+                    OutcomeGcGroup {
+                        client_id: 11,
+                        evict_below: 5,
+                        op_seqs: vec![5],
+                    },
+                ]
+            )
+            .is_err());
+        // Total op_seqs above the page cap: 65 seqs under one fence.
+        {
+            let mut w = store.cache_write();
+            w.set_client_watermark(13, 1_000).unwrap();
+            w.commit().unwrap();
+        }
+        let seqs: Vec<u64> = (1..=65u64).collect();
+        assert!(mgr
+            .apply_outcome_gc(
+                &store,
+                &[OutcomeGcGroup {
+                    client_id: 13,
+                    evict_below: 1_000,
+                    op_seqs: seqs,
+                }]
+            )
+            .is_err());
+        assert!(mgr.apply_outcome_gc(&store, &[]).is_err());
+
+        // Multi-group batch across ascending clients in one bounded entry.
+        for seq in 1..=2u64 {
+            mgr.apply_allocate(
+                &store,
+                token(21, seq),
+                1,
+                &format!("/h/{}", seq),
+                100,
+                &reserved(1, OBJ + 50 + seq as i64),
+            )
+            .unwrap();
+        }
+        assert_eq!(store.cache_client_watermark(21).unwrap(), Some(2));
+        mgr.apply_outcome_gc(
+            &store,
+            &[
+                OutcomeGcGroup {
+                    client_id: 11,
+                    evict_below: 5,
+                    op_seqs: vec![4],
+                },
+                OutcomeGcGroup {
+                    client_id: 21,
+                    evict_below: 2,
+                    op_seqs: vec![1],
+                },
+            ],
+        )
+        .unwrap();
+        assert!(store.cache_get_outcome(token(11, 4)).unwrap().is_none());
+        assert!(store.cache_get_outcome(token(21, 1)).unwrap().is_none());
+        assert!(store.cache_get_outcome(token(21, 2)).unwrap().is_some());
+        assert_eq!(store.cache_client_watermark(21).unwrap(), Some(2));
+    }
+
+    /// Byte-comparable projection of every durable cache-mode row family
+    /// the 4c.2 mutations touch (entries, expiry index, outcomes,
+    /// incarnation rows, mount pointers, client watermarks, reverse rows).
+    fn dump_state(store: &RocksInodeStore) -> String {
+        let mut out = String::new();
+        for incarnation in [1u64, 2, 3] {
+            for (key, e) in store.cache_scan_entries(incarnation, None, 100).unwrap() {
+                out.push_str(&format!(
+                    "E {} {} {:?} {} {} {} {} {}\n",
+                    incarnation,
+                    key,
+                    e.state,
+                    e.generation,
+                    e.object_id,
+                    e.len,
+                    e.expire_at,
+                    e.block_size
+                ));
+            }
+        }
+        for r in store.cache_scan_expiry(1_000_000, None, 100).unwrap() {
+            out.push_str(&format!(
+                "X {} {} {} {} {}\n",
+                r.expire_at, r.incarnation, r.object_id, r.key, r.generation
+            ));
+        }
+        for t in store.cache_scan_outcomes(None, 100).unwrap() {
+            out.push_str(&format!(
+                "O {} {} {:?}\n",
+                t.client_id,
+                t.op_seq,
+                store.cache_get_outcome(t).unwrap()
+            ));
+        }
+        for incarnation in [1u64, 2, 3] {
+            if let Some(row) = store.cache_get_incarnation(incarnation).unwrap() {
+                out.push_str(&format!(
+                    "I {} {} {}\n",
+                    incarnation, row.mount_id, row.revoked
+                ));
+            }
+        }
+        for mount in [5u32, 6] {
+            out.push_str(&format!(
+                "P {} {:?}\n",
+                mount,
+                store.cache_current_incarnation(mount).unwrap()
+            ));
+        }
+        for client in [1u64, 21, 91] {
+            out.push_str(&format!(
+                "W {} {:?}\n",
+                client,
+                store.cache_client_watermark(client).unwrap()
+            ));
+        }
+        for object in OBJ..OBJ + 12 {
+            if let Some(row) = store.cache_get_object(object).unwrap() {
+                out.push_str(&format!(
+                    "R {} {} {} {}\n",
+                    object, row.incarnation, row.key, row.generation
+                ));
+            }
+        }
+        out
+    }
+
+    type ReplayStep<'a> = Box<dyn Fn(&CacheManager, &RocksInodeStore) -> CommonResult<()> + 'a>;
+
+    /// Fault/replay gate (4c.2): a paged mutation segment — with a
+    /// mid-segment page replayed (leader restart between propose and
+    /// ack) — must converge byte-identically whether the journal replays
+    /// once, twice, or partially-overlapped.
+    #[test]
+    fn test_mutation_journal_replay_double_run_converges() {
+        // Journal segment (built exactly as the leader drivers would page
+        // it): scope-remove pages over /j, a mid-segment page replay,
+        // a TTL sweep page, a vacuum page for the revoked namespace, and
+        // outcome-GC groups (with their own replay).
+        let scope_page1: Vec<ScopeRemoveVictim> = vec![
+            scope_victim("/j/a", 1, OBJ, 1000),
+            scope_victim("/j/b", 1, OBJ + 1, 1000),
+        ];
+        let scope_page2: Vec<ScopeRemoveVictim> = vec![
+            scope_victim("/j/c", 1, OBJ + 2, 1000),
+            scope_victim("/j/d", 1, OBJ + 3, 1000),
+            scope_victim("/j/e", 1, OBJ + 4, 1000),
+        ];
+        let ttl_page: Vec<ExpiryRow> = vec![
+            expiry_row(1000, 1, OBJ + 5, "/k/a"),
+            expiry_row(1000, 1, OBJ + 6, "/k/b"),
+        ];
+        let vacuum_page: Vec<VacuumVictim> = vec![vacuum_victim("/j2/x", 1, OBJ + 7, 1000)];
+        let gc_groups: Vec<OutcomeGcGroup> = vec![OutcomeGcGroup {
+            client_id: 21,
+            evict_below: 3,
+            op_seqs: vec![1, 2],
+        }];
+        let journal: Vec<ReplayStep> = vec![
+            Box::new(|mgr, store| mgr.apply_scope_remove(store, 1, "/j", &scope_page1)),
+            Box::new(|mgr, store| mgr.apply_scope_remove(store, 1, "/j", &scope_page1)),
+            Box::new(|mgr, store| mgr.apply_scope_remove(store, 1, "/j", &scope_page2)),
+            Box::new(|mgr, store| mgr.apply_ttl_sweep(store, 2000, &ttl_page)),
+            Box::new(|mgr, store| mgr.apply_vacuum(store, 2, 6, &vacuum_page)),
+            Box::new(|mgr, store| mgr.apply_outcome_gc(store, &gc_groups)),
+            Box::new(|mgr, store| mgr.apply_outcome_gc(store, &gc_groups)),
+        ];
+
+        let seed = |store: &RocksInodeStore, mgr: &CacheManager| {
+            for (i, key) in ["/j/a", "/j/b", "/j/c", "/j/d", "/j/e"].iter().enumerate() {
+                seed_committed(store, mgr, 5, 1, key, OBJ + i as i64, 100, 1000);
+            }
+            seed_committed(store, mgr, 5, 1, "/k/a", OBJ + 5, 100, 1000);
+            seed_committed(store, mgr, 5, 1, "/k/b", OBJ + 6, 100, 1000);
+            seed_committed(store, mgr, 6, 2, "/j2/x", OBJ + 7, 100, 1000);
+            mgr.apply_incarnation_revoke(store, 6, 2).unwrap();
+            // Client 21's op history (watermark 3) for outcome GC.
+            for seq in 1..=3u64 {
+                mgr.apply_allocate(
+                    store,
+                    OpToken {
+                        client_id: 21,
+                        op_seq: seq,
+                    },
+                    1,
+                    &format!("/g/{}", seq),
+                    100,
+                    &reserved(1, OBJ + 20 + seq as i64),
+                )
+                .unwrap();
+            }
+        };
+
+        // Run A: single replay.
+        let store_a = new_store("replay-a");
+        let mgr_a = CacheManager::new();
+        seed(&store_a, &mgr_a);
+        for step in &journal {
+            step(&mgr_a, &store_a).unwrap();
+        }
+
+        // Run B: full double replay.
+        let store_b = new_store("replay-b");
+        let mgr_b = CacheManager::new();
+        seed(&store_b, &mgr_b);
+        for _ in 0..2 {
+            for step in &journal {
+                step(&mgr_b, &store_b).unwrap();
+            }
+        }
+
+        // Run C: interrupted leader restart — entries 0..=1 applied, then
+        // the whole segment replays over them (overlap), then continues.
+        let store_c = new_store("replay-c");
+        let mgr_c = CacheManager::new();
+        seed(&store_c, &mgr_c);
+        for step in &journal[..2] {
+            step(&mgr_c, &store_c).unwrap();
+        }
+        for step in &journal {
+            step(&mgr_c, &store_c).unwrap();
+        }
+
+        let dump_a = dump_state(&store_a);
+        let dump_b = dump_state(&store_b);
+        let dump_c = dump_state(&store_c);
+        assert_eq!(dump_a, dump_b, "double replay diverged");
+        assert_eq!(dump_a, dump_c, "overlapped restart replay diverged");
+
+        // The converged end state is the expected projection: /j fully
+        // tombstoned, /k swept, namespace 2 vacuumed empty, outcomes 21:1
+        // and 21:2 evicted under the frozen fence.
+        assert!(dump_a.contains("E 1 /j/a Tombstoned 2"));
+        assert!(dump_a.contains("E 1 /k/a Tombstoned 2"));
+        assert!(!dump_a.contains("E 2 "));
+        assert!(!dump_a.contains("O 21 1"));
+        assert!(!dump_a.contains("O 21 2"));
+        assert!(dump_a.contains("O 21 3"));
+        assert!(dump_a.contains("W 21 Some(3)"));
     }
 }

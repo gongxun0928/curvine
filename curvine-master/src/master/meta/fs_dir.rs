@@ -1062,6 +1062,16 @@ impl FsDir {
                 e.new_generation,
                 e.expected_object_id,
             ),
+            JournalEntry::CacheScopeRemove(e) => {
+                self.cache
+                    .apply_scope_remove(store, e.incarnation, &e.scope, &e.victims)
+            }
+            JournalEntry::CacheTtlSweep(e) => self.cache.apply_ttl_sweep(store, e.now, &e.victims),
+            JournalEntry::CacheVacuum(e) => {
+                self.cache
+                    .apply_vacuum(store, e.incarnation, e.mount_id, &e.victims)
+            }
+            JournalEntry::CacheOutcomeGc(e) => self.cache.apply_outcome_gc(store, &e.groups),
             _ => err_box!("journal entry is not a cache entry variant"),
         }
     }

@@ -267,7 +267,11 @@ impl JournalLoader {
                 | JournalEntry::CacheAllocate(_)
                 | JournalEntry::CacheCommit(_)
                 | JournalEntry::CacheRemove(_)
-                | JournalEntry::CacheIncarnationAllocateV2(_) => (),
+                | JournalEntry::CacheIncarnationAllocateV2(_)
+                | JournalEntry::CacheScopeRemove(_)
+                | JournalEntry::CacheTtlSweep(_)
+                | JournalEntry::CacheVacuum(_)
+                | JournalEntry::CacheOutcomeGc(_) => (),
 
                 _ => has_ufs_affecting = true,
             }
