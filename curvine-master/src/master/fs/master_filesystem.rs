@@ -1623,6 +1623,22 @@ impl MasterFilesystem {
         }
         if !cache_items.is_empty() {
             if list.full_report {
+                // #[cfg(test)] deterministic seam (RC2 gpt56 `e6207e1d`
+                // focused check): the FS accumulator has authorized the
+                // page and bound the trigger's Start-identity tag, but the
+                // cache-domain page has NOT been processed. A hook may run
+                // a same-wire-session Start RETRY here — the fresh row may
+                // then swallow this RPC's page and self-Complete with a
+                // NEW-tag ticket, which the trigger below must refuse.
+                // Compiled out outside cfg(test); never set in production.
+                #[cfg(test)]
+                if let Some(hook) = crate::master::master_handler::FULL_PAGE_SEAM
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                {
+                    hook();
+                }
                 // 4d.3: full-report cache pages feed the cache
                 // accumulator (cache-before-FS: they never reach the FS
                 // chain below). The declared total passed here is the
@@ -1780,10 +1796,25 @@ impl MasterFilesystem {
             // stash (cache-only worker) carries it from the in-place
             // transition, the mixed path consumes the still-Partial row
             // via the same transition, exact on the trigger's tag.
-            let snapshot = cache_complete.take().or_else(|| {
-                self.cache_service
-                    .take_cache_full_snapshot(list.worker_id, &session, trigger_tag)
-            });
+            // RC2 focused check (gpt56 `e6207e1d`): the stash is ONLY
+            // consumable when its ticket binds the SAME Start tag the
+            // FS trigger captured — a same-wire-session Start retry
+            // landing between the authorization and the cache page
+            // processing lets the fresh row swallow this RPC's page and
+            // self-Complete with a NEW-tag ticket; that ticket is
+            // dropped here (no reconcile, and crucially NO release of
+            // the retried row, which stays Reconciling until a new
+            // Start reopens it).
+            let snapshot = cache_complete
+                .take()
+                .filter(|(_, ticket)| ticket.tag == trigger_tag)
+                .or_else(|| {
+                    self.cache_service.take_cache_full_snapshot(
+                        list.worker_id,
+                        &session,
+                        trigger_tag,
+                    )
+                });
             if let Some((entries, ticket)) = snapshot {
                 // #[cfg(test)] deterministic seam (RC1 P0-1, gpt56
                 // `d2546338` item 1): the checkout window — the row is
@@ -3596,6 +3627,81 @@ mod tests {
             .expect("retried Start's mixed report published");
         assert_eq!(hit.blocks.len(), 3);
         assert_eq!(hit.blocks[2].block_len, 22);
+    }
+
+    /// RC2 focused check (gpt56 `e6207e1d`): the collect→page fence. The
+    /// FS accumulator authorizes the page and binds the trigger's
+    /// Start-identity tag A, THEN a same-wire-session Start RETRY lands
+    /// before the cache-domain page is processed (FULL_PAGE_SEAM) — fresh
+    /// registry tag B, fresh accumulator row. The new row swallows this
+    /// RPC's page and self-Completes with a ticket bound to tag B; the
+    /// trigger must refuse that ticket (tag ≠ trigger tag → drop, zero
+    /// reconcile) and must NOT release the retried row (it stays
+    /// Reconciling until a new Start reopens it).
+    #[test]
+    fn test_4d3_rc2_collect_page_start_retry_race() {
+        let (fs, addr, [b1, b2, b3]) = build_rc2_retry_fs("collectpage");
+        let old_tag = fs.cache_service.cache_session_tag(1).unwrap();
+        let list = |session: &str, total: u64, blocks: Vec<BlockReportInfo>| BlockReportList {
+            cluster_id: fs.worker_manager.read().conf.cluster_id.to_string(),
+            worker_id: 1,
+            full_report: true,
+            total_len: total,
+            blocks,
+            worker_session_id: Some(session.into()),
+        };
+        let cfinal = |id: i64, len: i64| {
+            BlockReportInfo::new(id, BlockReportStatus::Finalized, StorageType::Disk, len)
+        };
+
+        {
+            let fs2 = fs.clone();
+            *crate::master::master_handler::FULL_PAGE_SEAM
+                .lock()
+                .unwrap() = Some(Box::new(move || {
+                // Same-wire-session Start RETRY between the FS
+                // authorization (trigger tag A bound) and the cache page
+                // processing: fresh tag B, fresh accumulator row.
+                fs2.begin_worker_session(&addr, "s1").unwrap();
+            }));
+        }
+
+        // Single completing cache-only page: the FS trigger completes and
+        // captures tag A, the retry installs tag B mid-window, and the
+        // fresh row swallows the page and self-Completes with ticket B.
+        fs.block_report(
+            list(
+                "s1",
+                3,
+                vec![cfinal(b1, 64), cfinal(b2, 64), cfinal(b3, 22)],
+            ),
+            None,
+        )
+        .unwrap();
+        *crate::master::master_handler::FULL_PAGE_SEAM
+            .lock()
+            .unwrap() = None;
+
+        // The old page never published onto the retried Start's tag.
+        assert!(
+            fs.cache_service.get(1, "/k", true).unwrap().is_none(),
+            "new-tag self-Complete ticket refused by the trigger"
+        );
+        let new_tag = fs.cache_service.cache_session_tag(1).unwrap();
+        assert_ne!(new_tag, old_tag, "the retry issued a fresh tag");
+        assert_eq!(
+            fs.cache_service.session_spine_snapshot(1).accumulator,
+            Some(("s1".to_string(), false)),
+            "retried row is non-terminal"
+        );
+        // The trigger did NOT release the retried row: it stays
+        // Reconciling (checkout consumed by the swallowed page), so a
+        // later same-session page is Skipped — only a new Start reopens.
+        assert!(matches!(
+            fs.cache_service
+                .cache_full_report_page(1, "s1", 3, &[cfinal(b1, 64)]),
+            crate::cache::cache_service::CacheFullReportOutcome::Skipped
+        ));
     }
 
     /// P0-1 (gpt56 `25d4b51e` item 1): an incremental outcome's

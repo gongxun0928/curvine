@@ -1479,6 +1479,21 @@ pub(crate) static FULL_TRIGGER_SEAM: std::sync::Mutex<Option<Box<dyn Fn() + Send
 pub(crate) static FULL_TAKE_SEAM: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
     std::sync::Mutex::new(None);
 
+/// #[cfg(test)] seam storage for the 4d.3 RC2 collect→page Start-retry
+/// proof (gpt56 `e6207e1d` focused check): the hook set here (if any) is
+/// fired by `MasterFilesystem::block_report` exactly between the FS
+/// accumulator's authorization (which binds the end-of-report trigger's
+/// Start-identity tag) and the cache-domain page processing. A hook can
+/// run a same-WIRE-session Start RETRY (fresh registry tag, fresh cache
+/// accumulator row) inside the window; the new row may then swallow the
+/// old RPC page and self-Complete with a ticket bound to the NEW tag —
+/// the trigger must refuse that ticket (tag mismatch → drop, no
+/// reconcile, no release of the retried row). Never set in production;
+/// compiled out entirely outside cfg(test).
+#[cfg(test)]
+pub(crate) static FULL_PAGE_SEAM: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
+    std::sync::Mutex::new(None);
+
 #[cfg(test)]
 mod tests {
     use super::*;
