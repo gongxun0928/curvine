@@ -352,22 +352,65 @@ impl CacheGcQueue {
 /// 4d (R8-2): one retired session of a worker — the block identities it
 /// held when its session ended (a later Start superseded it, or
 /// End/lost-worker retired it session-exactly). Drained boundedly from
-/// the queue front; the identities are `(object_id, seq)` pairs so the
-/// drain can both derive block ids (via the locations geometry) and
-/// remove the replica rows.
+/// the queue front. RC2-round2 shape (gpt56 `25d4b51e` P0-2): entries
+/// are object-keyed (`object_id → seqs`) so removing a whole object's
+/// trace is one O(1) map drop — never a seq materialization.
 struct RetiredSession {
     tag: u64,
-    entries: HashSet<(i64, i64)>,
+    entries: HashMap<i64, HashSet<i64>>,
+}
+
+impl RetiredSession {
+    /// Total identities queued in this record (diagnostics/tests).
+    fn entries_total(&self) -> usize {
+        self.entries.values().map(|s| s.len()).sum()
+    }
 }
 
 /// 4d (R8-2): per-worker reverse view of the published locations.
 /// `live` holds the block identities published under the worker's
 /// CURRENT session tag; a Start moves live into a retired session
-/// record in O(1) instead of swapping hash sets.
+/// record in O(1) instead of swapping hash sets. RC2-round2 shape: the
+/// live set is object-keyed (`object_id → seqs`) so an object-level
+/// drop is one O(1) map removal per holder — the pre-P0-2 flat
+/// `(object_id, seq)` set forced a full identity walk.
 #[derive(Default)]
 struct WorkerRev {
-    live: HashSet<(i64, i64)>,
+    live: HashMap<i64, HashSet<i64>>,
     retired: VecDeque<RetiredSession>,
+}
+
+impl WorkerRev {
+    fn live_contains(&self, object_id: i64, seq: i64) -> bool {
+        self.live
+            .get(&object_id)
+            .is_some_and(|s| s.contains(&seq))
+    }
+
+    fn live_len(&self) -> usize {
+        self.live.values().map(|s| s.len()).sum()
+    }
+
+    fn live_insert(&mut self, object_id: i64, seq: i64) {
+        self.live.entry(object_id).or_default().insert(seq);
+    }
+
+    fn live_extend(&mut self, entries: impl IntoIterator<Item = (i64, i64)>) {
+        for (object_id, seq) in entries {
+            self.live.entry(object_id).or_default().insert(seq);
+        }
+    }
+
+    /// Remove ONE identity, dropping the object row once the worker
+    /// holds none of its blocks (bounded hygiene, O(1)).
+    fn live_remove_identity(&mut self, object_id: i64, seq: i64) {
+        if let Some(seqs) = self.live.get_mut(&object_id) {
+            seqs.remove(&seq);
+            if seqs.is_empty() {
+                self.live.remove(&object_id);
+            }
+        }
+    }
 }
 
 /// 4d (R4/R9-3): the cache session registry entry for one worker,
@@ -463,23 +506,37 @@ struct CacheVolatile {
     /// the last cache incremental accepted for it; a full-report
     /// reconcile only proceeds against a stable generation.
     reconcile_gens: HashMap<u32, u64>,
-    /// 4d.2 RC2 delete-pending quarantine (gpt56 `7cc7295c`):
-    /// object_id → set of `(worker_id, session_tag, seq)` identities
-    /// this session reported as orphan/corrupt. A same-tag Finalized
-    /// re-report of a quarantined identity only defers — the physical
-    /// delete is still in flight, so the read path must not re-serve
-    /// the block. Released by the exact Deleted ack (worker-side delete
+    /// 4d.2 RC2 delete-pending quarantine (gpt56 `7cc7295c`), reshaped
+    /// in RC2-round2 (gpt56 `25d4b51e` P0-2): object_id →
+    /// `(worker_id, session_tag) → seqs` this session reported as
+    /// orphan/corrupt. A same-tag Finalized re-report of a quarantined
+    /// identity only defers — the physical delete is still in flight,
+    /// so the read path must not re-serve the block. Released by the
+    /// exact `(worker, tag, seq)` Deleted ack (worker-side delete
     /// completed), a new session for that worker (old tags only), or
     /// the epoch cold clear; an object-level drop (GC completion /
-    /// no-geometry retire) removes the whole row.
-    quarantine: HashMap<i64, HashSet<(u32, u64, i64)>>,
+    /// no-geometry retire) removes the whole row in O(#reporters).
+    quarantine: HashMap<i64, HashMap<(u32, u64), HashSet<i64>>>,
+    /// Directed index over `quarantine` (RC2-round2): worker → tag →
+    /// objects. A Start purge or an ack resolves EXACTLY this worker's
+    /// entries in O(its own identities) — never a scan of every
+    /// quarantined object. Rows are cleaned lazily; a stale object
+    /// reference is a harmless no-op lookup.
+    quarantine_index: HashMap<u32, HashMap<u64, HashSet<i64>>>,
+    /// RC2-round2: additive object → holders set fed at publish. An
+    /// object-level drop consults it so the per-worker live/retired
+    /// rows drop in O(#holders) map removals; a stale holder is a
+    /// harmless no-op removal. Never scanned.
+    location_holders: HashMap<i64, HashSet<u32>>,
     /// 4d.2 RC3 pending-retired round-robin (gpt56 `7cc7295c`): workers
-    /// whose retired deque still holds work, each present AT MOST once.
-    /// `drain_retired` pops from the front, applies a bounded quantum,
-    /// and rotates unfinished workers to the back — traversal is
-    /// bounded by the pending set (never the full `by_worker` map) and
-    /// a large queue cannot starve the others.
+    /// whose retired deque still holds work, each present AT MOST once
+    /// (set membership mirrors the deque — RC2-round2 removes the
+    /// linear `contains` scan). `drain_retired` pops from the front,
+    /// applies a bounded quantum, and rotates unfinished workers to the
+    /// back — traversal is bounded by the pending set (never the full
+    /// `by_worker` map) and a large queue cannot starve the others.
     retired_rr: VecDeque<u32>,
+    retired_rr_set: HashSet<u32>,
     /// Monotonic session tag issuer — NEVER reset, including by the
     /// epoch cold clear: a tag must never be reused across sessions,
     /// or a stale retired-session drain could match fresh state. 0 is
@@ -546,8 +603,10 @@ impl CacheVolatile {
                 // reverse trace of the object's identities in the same
                 // critical section — live sets, retired records, and the
                 // quarantine row — so a finished object never leaks the
-                // reverse index.
-                self.remove_object_state(object_id);
+                // reverse index. RC2-round2: the drop is O(#holders)
+                // map removals (object-keyed live/retired rows), never
+                // an identity walk.
+                self.drop_object_state(object_id);
             } else {
                 self.gc.items.insert(object_id, work);
                 self.gc.order.push_back(object_id);
@@ -571,7 +630,10 @@ impl CacheVolatile {
         self.by_worker.clear();
         self.reconcile_gens.clear();
         self.quarantine.clear();
+        self.quarantine_index.clear();
+        self.location_holders.clear();
         self.retired_rr.clear();
+        self.retired_rr_set.clear();
         self.gc.items.clear();
         self.gc.order.clear();
         true
@@ -608,9 +670,28 @@ impl CacheVolatile {
         // RC2 (gpt56 `7cc7295c`): a new session releases the worker's
         // OLD-tag quarantine entries — the fresh tag is a different
         // reporter contract; only same-tag entries may keep blocking.
-        self.quarantine
-            .values_mut()
-            .for_each(|set| set.retain(|(w, t, _)| !(*w == worker_id && *t != tag)));
+        // RC2-round2: the purge resolves through the directed
+        // `quarantine_index` — it touches only THIS worker's entries,
+        // never a scan of every quarantined object.
+        if let Some(tags) = self.quarantine_index.remove(&worker_id) {
+            for (t, objs) in tags {
+                if t == tag {
+                    self.quarantine_index
+                        .entry(worker_id)
+                        .or_default()
+                        .insert(t, objs);
+                    continue;
+                }
+                for obj in &objs {
+                    if let Some(row) = self.quarantine.get_mut(obj) {
+                        row.remove(&(worker_id, t));
+                        if row.is_empty() {
+                            self.quarantine.remove(obj);
+                        }
+                    }
+                }
+            }
+        }
         self.worker_sessions.insert(
             worker_id,
             WorkerSession {
@@ -650,45 +731,57 @@ impl CacheVolatile {
             if !rev.live.is_empty() {
                 let live = std::mem::take(&mut rev.live);
                 rev.retired.push_back(RetiredSession { tag, entries: live });
-                if !self.retired_rr.contains(&worker_id) {
+                if !self.retired_rr_set.contains(&worker_id) {
                     self.retired_rr.push_back(worker_id);
+                    self.retired_rr_set.insert(worker_id);
                 }
             }
         }
     }
 
-    /// Object-level volatile drop (RC3): remove the retained locations
-    /// entry AND every reverse-index trace of its identities — the live
-    /// sets and retired records of the workers that actually held
-    /// replicas (never a full `by_worker` scan), plus the object's whole
-    /// quarantine row. Same-guard callers make this atomic with the
-    /// locations removal (GC completion / no-geometry retire).
-    fn remove_object_state(&mut self, object_id: i64) {
-        let Some(locs) = self.locations.remove(&object_id) else {
-            return;
-        };
-        let seqs: Vec<i64> = locs.blocks.keys().copied().collect();
-        let holders: Vec<u32> = locs
-            .blocks
-            .values()
-            .flatten()
-            .map(|r| r.worker.worker_id)
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        for worker_id in holders {
-            if let Some(rev) = self.by_worker.get_mut(&worker_id) {
-                for seq in &seqs {
-                    rev.live.remove(&(object_id, *seq));
-                }
-                for record in rev.retired.iter_mut() {
-                    for seq in &seqs {
-                        record.entries.remove(&(object_id, *seq));
+    /// Object-level volatile drop, RC2-round2 bounded form (gpt56
+    /// `25d4b51e` P0-2): remove the retained locations entry, the
+    /// quarantine row (+ its directed-index traces), and each holder's
+    /// live/retired OBJECT rows. With object-keyed live/retired sets and
+    /// the additive `location_holders` index the whole drop is
+    /// O(#holders + #quarantine-reporters) map removals — no seq
+    /// materialization, no holders×seqs nesting, and it works when the
+    /// locations row never existed (quarantine-only objects MUST clear
+    /// their row too). Same-guard callers (GC completion /
+    /// no-geometry retire) make it atomic.
+    fn drop_object_state(&mut self, object_id: i64) {
+        self.locations.remove(&object_id);
+        if let Some(row) = self.quarantine.remove(&object_id) {
+            for (w, t) in row.keys().copied().collect::<Vec<_>>() {
+                if let Some(tags) = self.quarantine_index.get_mut(&w) {
+                    if let Some(objs) = tags.get_mut(&t) {
+                        objs.remove(&object_id);
                     }
+                    if tags.get(&t).is_some_and(|s| s.is_empty()) {
+                        tags.remove(&t);
+                    }
+                }
+                if self
+                    .quarantine_index
+                    .get(&w)
+                    .is_none_or(|m| m.is_empty())
+                {
+                    self.quarantine_index.remove(&w);
                 }
             }
         }
-        self.quarantine.remove(&object_id);
+        let holders = self
+            .location_holders
+            .remove(&object_id)
+            .unwrap_or_default();
+        for worker_id in holders {
+            if let Some(rev) = self.by_worker.get_mut(&worker_id) {
+                rev.live.remove(&object_id);
+                for record in rev.retired.iter_mut() {
+                    record.entries.remove(&object_id);
+                }
+            }
+        }
     }
 
     /// 4d.2 (R8-2/R9-1, RC3 fairness): bounded METADATA-ONLY drain of
@@ -717,23 +810,38 @@ impl CacheVolatile {
             let (front_tag, drained): (u64, Vec<(i64, i64)>) = {
                 let Some(rev) = self.by_worker.get_mut(&worker_id) else {
                     self.retired_rr.pop_front();
+                    self.retired_rr_set.remove(&worker_id);
                     continue;
                 };
                 let Some(front) = rev.retired.front_mut() else {
                     self.retired_rr.pop_front();
+                    self.retired_rr_set.remove(&worker_id);
                     continue;
                 };
-                let take = front.entries.len().min(budget).min(RETIRED_DRAIN_QUANTUM);
+                let take = front
+                    .entries_total()
+                    .min(budget)
+                    .min(RETIRED_DRAIN_QUANTUM);
                 (
                     front.tag,
-                    front.entries.iter().copied().take(take).collect(),
+                    front
+                        .entries
+                        .iter()
+                        .flat_map(|(obj, seqs)| seqs.iter().map(move |s| (*obj, *s)))
+                        .take(take)
+                        .collect(),
                 )
             };
             let take = drained.len();
             for (object_id, seq) in drained {
                 if let Some(rev) = self.by_worker.get_mut(&worker_id) {
                     if let Some(front) = rev.retired.front_mut() {
-                        front.entries.remove(&(object_id, seq));
+                        if let Some(seqs) = front.entries.get_mut(&object_id) {
+                            seqs.remove(&seq);
+                            if seqs.is_empty() {
+                                front.entries.remove(&object_id);
+                            }
+                        }
                     }
                 }
                 if let Some(locs) = self.locations.get_mut(&object_id) {
@@ -769,6 +877,8 @@ impl CacheVolatile {
             let front_worker = self.retired_rr.pop_front().unwrap();
             if still_pending {
                 self.retired_rr.push_back(front_worker);
+            } else {
+                self.retired_rr_set.remove(&front_worker);
             }
         }
         removed
@@ -820,8 +930,14 @@ struct CacheReportSession {
 /// the caller applies both lists (`wm.remove_block` /
 /// `wm.deleted_block`) AFTER the volatile guard is released; the
 /// cache service itself never takes the wm lock (declared order).
+/// P0-1 (gpt56 `25d4b51e`): the registry tag the decisions were made
+/// under — the apply path rechecks it under the transition gate
+/// (`start_gate → WM → volatile`) so a Start/lost swap between the
+/// decision and the WM side effect makes the whole outcome a loud
+/// no-op instead of acting on the new session. 0 = no-op outcome.
 #[derive(Debug, Default)]
 pub struct CacheIncrOutcome {
+    pub session_tag: u64,
     /// Block ids proven orphan or corrupt for THIS worker (R1 dead
     /// classification / R3 length violation): each is enqueued into
     /// the worker's delete queue (the BlockMap re-delivers until the
@@ -2155,8 +2271,15 @@ impl CacheService {
                                         .by_worker
                                         .entry(worker_id)
                                         .or_default()
-                                        .live
-                                        .extend(entries);
+                                        .live_extend(entries);
+                                    // RC2-round2: the additive holders index
+                                    // feeds every publish path so an
+                                    // object-level drop is O(#holders).
+                                    volatile
+                                        .location_holders
+                                        .entry(object_id)
+                                        .or_default()
+                                        .insert(worker_id);
                                 }
                                 Settlement::Applied
                             } else {
@@ -3022,6 +3145,37 @@ impl CacheService {
         Ok(())
     }
 
+    /// #[cfg(test)] 4d.2 P0-1/P0-2 handler-test support: observable
+    /// exact-identity quarantine probe (and whole-row presence), so
+    /// fence tests assert without reaching into the private volatile
+    /// lock. Compiled out outside cfg(test).
+    #[cfg(test)]
+    pub(crate) fn quarantine_contains(
+        &self,
+        object_id: i64,
+        worker_id: u32,
+        session_tag: u64,
+        seq: i64,
+    ) -> bool {
+        let volatile = self.state.lock().unwrap();
+        volatile
+            .quarantine
+            .get(&object_id)
+            .and_then(|row| row.get(&(worker_id, session_tag)))
+            .is_some_and(|s| s.contains(&seq))
+    }
+
+    /// #[cfg(test)] 4d.2 P0-1 handler-test support: observable live-set
+    /// probe for one identity. Compiled out outside cfg(test).
+    #[cfg(test)]
+    pub(crate) fn live_contains(&self, worker_id: u32, object_id: i64, seq: i64) -> bool {
+        let volatile = self.state.lock().unwrap();
+        volatile
+            .by_worker
+            .get(&worker_id)
+            .is_some_and(|rev| rev.live_contains(object_id, seq))
+    }
+
     /// #[cfg(test)] 4d RC2 handler-test support: an observable snapshot
     /// of one worker's session spine — registry row (wire session, live
     /// tag), tag-issuer cursor, and accumulator
@@ -3301,6 +3455,12 @@ impl CacheService {
         // location mutation share one serialized domain — no TOCTOU
         // window for a concurrent Start/publish).
         let mut outcome = CacheIncrOutcome::default();
+        // P0-1 (gpt56 `25d4b51e` item 1): the decision is bound to THIS
+        // registry tag; the handler's WorkerManager side effects recheck
+        // it under the transition gate before applying, so an outcome
+        // computed before a Start/lost swap can never act on the new
+        // session.
+        outcome.session_tag = reg_tag;
         for (block_id, decision) in decisions {
             match decision {
                 Dec::Defer => {}
@@ -3323,14 +3483,22 @@ impl CacheService {
                                 }
                             }
                         }
+                        // RC2-round2: the still-holds recheck is
+                        // (worker, reg_tag) EXACT — an old-tag replica
+                        // row of the same worker must not keep the
+                        // current-tag live entry alive.
                         let still_holds = volatile
                             .locations
                             .get(&object_id)
                             .and_then(|l| l.blocks.get(&seq))
-                            .is_some_and(|rs| rs.iter().any(|r| r.worker.worker_id == worker_id));
+                            .is_some_and(|rs| {
+                                rs.iter().any(|r| {
+                                    r.worker.worker_id == worker_id && r.tag == reg_tag
+                                })
+                            });
                         if !still_holds {
                             if let Some(rev) = volatile.by_worker.get_mut(&worker_id) {
-                                rev.live.remove(&(object_id, seq));
+                                rev.live_remove_identity(object_id, seq);
                             }
                         }
                         // Delete-pending quarantine (exact
@@ -3341,7 +3509,16 @@ impl CacheService {
                             .quarantine
                             .entry(object_id)
                             .or_default()
-                            .insert((worker_id, reg_tag, seq));
+                            .entry((worker_id, reg_tag))
+                            .or_default()
+                            .insert(seq);
+                        volatile
+                            .quarantine_index
+                            .entry(worker_id)
+                            .or_default()
+                            .entry(reg_tag)
+                            .or_default()
+                            .insert(object_id);
                     }
                     outcome.remove_blocks.push(block_id);
                 }
@@ -3355,7 +3532,7 @@ impl CacheService {
                         }
                     }
                     if let Some(rev) = volatile.by_worker.get_mut(&worker_id) {
-                        rev.live.remove(&(object_id, seq));
+                        rev.live_remove_identity(object_id, seq);
                     }
                     outcome.deleted_acks.push(block_id);
                 }
@@ -3366,7 +3543,8 @@ impl CacheService {
                     let quarantined = volatile
                         .quarantine
                         .get(&object_id)
-                        .is_some_and(|s| s.contains(&(worker_id, reg_tag, seq)));
+                        .and_then(|row| row.get(&(worker_id, reg_tag)))
+                        .is_some_and(|s| s.contains(&seq));
                     if quarantined {
                         log::warn!(
                             "cache incr report: block {} re-reported Finalized while delete-pending; deferred",
@@ -3398,8 +3576,12 @@ impl CacheService {
                             .by_worker
                             .entry(worker_id)
                             .or_default()
-                            .live
-                            .insert((object_id, seq));
+                            .live_insert(object_id, seq);
+                        volatile
+                            .location_holders
+                            .entry(object_id)
+                            .or_default()
+                            .insert(worker_id);
                     }
                 }
             }
@@ -3407,12 +3589,26 @@ impl CacheService {
         Ok(outcome)
     }
 
+    /// P0-1 (gpt56 `25d4b51e`): the worker's CURRENT registry tag, read
+    /// under the volatile guard. The fenced outcome apply compares it
+    /// with the tag captured at decision time.
+    pub fn cache_session_tag(&self, worker_id: u32) -> Option<u64> {
+        if !self.enabled || !self.monitor.is_active() {
+            return None;
+        }
+        let volatile = self.lock_volatile();
+        volatile.worker_sessions.get(&worker_id).map(|s| s.tag)
+    }
+
     /// 4d.2 RC2: release the delete-pending quarantine for one
-    /// `(worker, block)` once the worker's Deleted ack for the physical
-    /// delete has been processed. A later Finalized re-report of the
-    /// identity may then publish again (fresh data legitimately
-    /// re-written after the delete completed).
-    pub fn ack_cache_deleted(&self, worker_id: u32, block_id: i64) {
+    /// EXACT `(worker, session_tag, object, seq)` once the worker's
+    /// Deleted ack for the physical delete has been processed. P0-1:
+    /// the tag is part of the identity — an ack computed under an old
+    /// tag can never release a quarantine a newer session built. A
+    /// later Finalized re-report of the identity may then publish
+    /// again (fresh data legitimately re-written after the delete
+    /// completed).
+    pub fn ack_cache_deleted(&self, worker_id: u32, session_tag: u64, block_id: i64) {
         if !self.enabled || !self.monitor.is_active() {
             return;
         }
@@ -3424,8 +3620,37 @@ impl CacheService {
         }
         let seq = BlockIdCodec::get_seq(block_id);
         let mut volatile = self.lock_volatile();
-        if let Some(set) = volatile.quarantine.get_mut(&object_id) {
-            set.retain(|(w, _, s)| !(*w == worker_id && *s == seq));
+        let key = (worker_id, session_tag);
+        let row_empty = {
+            let Some(row) = volatile.quarantine.get_mut(&object_id) else {
+                return;
+            };
+            if let Some(seqs) = row.get_mut(&key) {
+                seqs.remove(&seq);
+            }
+            let key_empty = row.get(&key).is_some_and(|s| s.is_empty());
+            if key_empty {
+                row.remove(&key);
+            }
+            row.is_empty()
+        };
+        if row_empty {
+            volatile.quarantine.remove(&object_id);
+            if let Some(tags) = volatile.quarantine_index.get_mut(&worker_id) {
+                if let Some(objs) = tags.get_mut(&session_tag) {
+                    objs.remove(&object_id);
+                }
+                if tags.get(&session_tag).is_some_and(|s| s.is_empty()) {
+                    tags.remove(&session_tag);
+                }
+            }
+            if volatile
+                .quarantine_index
+                .get(&worker_id)
+                .is_none_or(|m| m.is_empty())
+            {
+                volatile.quarantine_index.remove(&worker_id);
+            }
         }
     }
 
@@ -3893,13 +4118,16 @@ impl CacheService {
                     next_seq: 1,
                 })?;
             } else if !volatile.gc.items.contains_key(&object_id) {
-                // No geometry and no locations (and no earlier item):
+                // No geometry and no earlier item:
                 // nothing drainable — drop any retained entry so it
                 // cannot leak. The 4d full report re-derives whatever
                 // unreported physical blocks exist. RC3: the drop also
                 // clears the object's reverse traces in the same guard.
+                // RC2-round2: a quarantine-only object (no locations row
+                // ever published) MUST clear its quarantine row too —
+                // the old locations-None early-return leaked it forever.
                 volatile.gc.order.retain(|id| *id != object_id);
-                volatile.remove_object_state(object_id);
+                volatile.drop_object_state(object_id);
             }
             // Plans for the object are dropped under the same guard
             // (4d R8-1 supplement): with plans merged into the volatile
@@ -6995,8 +7223,7 @@ mod tests {
             .by_worker
             .entry(7)
             .or_default()
-            .live
-            .insert((42, 1));
+            .live_insert(42, 1);
         volatile
             .gc
             .enqueue(CacheGcWork {
@@ -7049,8 +7276,7 @@ mod tests {
             .by_worker
             .entry(7)
             .or_default()
-            .live
-            .insert((100, 1));
+            .live_insert(100, 1);
         assert_eq!(
             volatile.reconcile_gens.get(&7).copied().unwrap_or(0),
             1,
@@ -7072,7 +7298,7 @@ mod tests {
         assert!(rev.live.is_empty());
         assert_eq!(rev.retired.len(), 1);
         assert_eq!(rev.retired[0].tag, 1);
-        assert!(rev.retired[0].entries.contains(&(100, 1)));
+        assert!(rev.retired[0].entries.get(&100).is_some_and(|s| s.contains(&1)));
         assert_eq!(volatile.reconcile_gens.get(&7).copied().unwrap_or(0), 2);
 
         // Retiring an already-retired session is a no-op (registry row
@@ -7089,8 +7315,7 @@ mod tests {
             .by_worker
             .get_mut(&7)
             .unwrap()
-            .live
-            .insert((200, 2));
+            .live_insert(200, 2);
         let tag = volatile
             .install_session(7, "s2".to_string(), worker(7))
             .unwrap();
@@ -7099,7 +7324,7 @@ mod tests {
         assert!(rev.live.is_empty());
         assert_eq!(rev.retired.len(), 2, "second retire session recorded");
         assert_eq!(rev.retired[1].tag, 2);
-        assert!(rev.retired[1].entries.contains(&(200, 2)));
+        assert!(rev.retired[1].entries.get(&200).is_some_and(|s| s.contains(&2)));
     }
 
     /// Final review `f14fa328`: the service-level cache End/lost retire
@@ -7510,8 +7735,7 @@ mod tests {
             .by_worker
             .entry(1)
             .or_default()
-            .live
-            .insert((OBJ, 1));
+            .live_insert(OBJ, 1);
 
         // The legacy (empty-session) Start lands.
         service.purge_worker_cache_session(1);
@@ -8196,8 +8420,10 @@ mod tests {
                 assert_eq!(replicas[0].tag, tag);
             }
             let live = &volatile.by_worker[&1].live;
-            assert!(live.contains(&(OBJ, 1)) && live.contains(&(OBJ, 3)));
-            assert!(!live.contains(&(OBJ, 2)));
+            assert!(
+                (live.get(&OBJ).is_some_and(|s| s.contains(&1) && s.contains(&3)))
+            );
+            assert!(!live.get(&OBJ).is_some_and(|s| s.contains(&2)));
             // Reconcile generation bumped past the install bump.
             assert!(*volatile.reconcile_gens.get(&1).unwrap() >= 2);
         }
@@ -8245,7 +8471,9 @@ mod tests {
             let tag = volatile.worker_sessions[&1].tag;
             let quarantined = volatile.quarantine.get(&OBJ).unwrap();
             for seq in [1i64, 2, 3] {
-                assert!(quarantined.contains(&(1, tag, seq)));
+                assert!(quarantined
+                    .get(&(1, tag))
+                    .is_some_and(|s| s.contains(&seq)));
             }
         }
 
@@ -8333,7 +8561,7 @@ mod tests {
             let replicas = volatile.locations[&OBJ].blocks[&1].clone();
             assert_eq!(replicas.len(), 1);
             assert_eq!(replicas[0].worker.worker_id, 2);
-            assert!(!volatile.by_worker[&1].live.contains(&(OBJ, 1)));
+            assert!(!volatile.by_worker[&1].live_contains(OBJ, 1));
         }
 
         // Idempotent re-Delete: no error, ack again (BlockMap's own ack
@@ -8404,8 +8632,9 @@ mod tests {
         {
             let volatile = service.state.lock().unwrap();
             let live = &volatile.by_worker[&1].live;
+            let seqs = live.get(&OBJ).unwrap();
             for seq in 1..=3 {
-                assert!(live.contains(&(OBJ, seq)));
+                assert!(seqs.contains(&seq));
             }
         }
 
@@ -8466,7 +8695,7 @@ mod tests {
             let rev = volatile.by_worker.get(&1).unwrap();
             assert!(rev.live.is_empty());
             assert_eq!(rev.retired.len(), 1);
-            assert_eq!(rev.retired[0].entries.len(), 3);
+            assert_eq!(rev.retired[0].entries_total(), 3);
         }
         assert!(service.get(1, "/k", true).unwrap().is_some());
         assert!(service.retire_worker_session(2, "seed-2"));
@@ -8525,7 +8754,7 @@ mod tests {
             block_size: 64,
             blocks: HashMap::new(),
         };
-        let mut entries = HashSet::new();
+        let mut entries: HashMap<i64, HashSet<i64>> = HashMap::new();
         for seq in 1..=total {
             locs.blocks.insert(
                 seq as i64,
@@ -8534,25 +8763,26 @@ mod tests {
                     tag: 7,
                 }],
             );
-            entries.insert((OBJ, seq as i64));
+            entries.entry(OBJ).or_default().insert(seq as i64);
         }
         volatile.locations.insert(OBJ, locs);
         volatile.by_worker.insert(
             7,
             WorkerRev {
-                live: HashSet::new(),
+                live: HashMap::new(),
                 retired: VecDeque::from([RetiredSession { tag: 7, entries }]),
             },
         );
         // Production enqueues via `retire_live`; this hand-built state
         // must register the pending-retired round-robin itself.
         volatile.retired_rr.push_back(7);
+        volatile.retired_rr_set.insert(7);
 
         // First drain: exactly the cap, record stays at the front.
         assert_eq!(volatile.drain_retired(), RETIRED_DRAIN_PER_TICK);
         assert_eq!(volatile.by_worker[&7].retired.len(), 1);
         assert_eq!(
-            volatile.by_worker[&7].retired[0].entries.len(),
+            volatile.by_worker[&7].retired[0].entries_total(),
             5,
             "record partially drained stays queued"
         );
@@ -8752,7 +8982,7 @@ mod tests {
             let live = &volatile.by_worker[&1].live;
             for seq in 1..=3i64 {
                 assert!(
-                    !live.contains(&(OBJ, seq)),
+                    !live.get(&OBJ).is_some_and(|s| s.contains(&seq)),
                     "stripped {} must not be live",
                     seq
                 );
@@ -8766,7 +8996,7 @@ mod tests {
             .incr_block_report(1, "seed-1", &[BlockReportInfo::with_deleted(b1, 64)])
             .unwrap();
         assert_eq!(out.deleted_acks, vec![b1]);
-        service.ack_cache_deleted(1, b1);
+        service.ack_cache_deleted(1, out.session_tag, b1);
         let out = service
             .incr_block_report(1, "seed-1", &[report(b1, 64)])
             .unwrap();
@@ -8776,7 +9006,7 @@ mod tests {
             // release; b2/b3 stay quarantined so the whole object still
             // misses).
             let volatile = service.state.lock().unwrap();
-            assert!(volatile.by_worker[&1].live.contains(&(OBJ, 1)));
+            assert!(volatile.by_worker[&1].live_contains(OBJ, 1));
         }
         assert!(service.get(1, "/k", true).unwrap().is_none());
 
@@ -8900,12 +9130,16 @@ mod tests {
         }
         volatile.locations.insert(OBJ, big_locs);
         volatile.locations.insert(OBJ + 1, small_locs);
-        volatile.by_worker.entry(7).or_default().live = (1..=big)
-            .map(|seq| (OBJ, seq as i64))
-            .collect::<HashSet<_>>();
-        volatile.by_worker.entry(8).or_default().live = (1..=3)
-            .map(|seq| (OBJ + 1, seq as i64))
-            .collect::<HashSet<_>>();
+        {
+            let rev = volatile.by_worker.entry(7).or_default();
+            let seqs: HashSet<i64> = (1..=big).map(|seq| seq as i64).collect();
+            rev.live.insert(OBJ, seqs);
+        }
+        {
+            let rev = volatile.by_worker.entry(8).or_default();
+            let seqs: HashSet<i64> = (1..=3).map(|seq| seq as i64).collect();
+            rev.live.insert(OBJ + 1, seqs);
+        }
         volatile.retire_live(7, 7);
         volatile.retire_live(8, 8);
         assert_eq!(volatile.retired_rr.len(), 2);
@@ -8919,11 +9153,133 @@ mod tests {
             "small queue fully drains in tick 1"
         );
         assert!(!volatile.retired_rr.contains(&8));
-        let big_left = volatile.by_worker[&7].retired[0].entries.len();
+        let big_left = volatile.by_worker[&7].retired[0].entries_total();
         assert_eq!(big_left, big - (RETIRED_DRAIN_PER_TICK - 3));
         assert!(volatile.retired_rr.contains(&7));
         // Small object's rows are all gone after its drain (the empty
         // outer locations row itself is reclaimed by GC completion).
         assert!(volatile.locations[&(OBJ + 1)].blocks.is_empty());
+    }
+
+    /// P0-2 (gpt56 `25d4b51e` item 2): a QUARANTINE-ONLY object — no
+    /// locations row ever published — must lose its quarantine row at
+    /// the no-geometry retire (the pre-fix locations-None early-return
+    /// leaked it forever), together with its directed-index trace.
+    #[test]
+    fn test_4d2_p02_quarantine_only_no_geometry_drop() {
+        let service = build_service("4d2-p02a", chooser(vec![worker(1)]));
+        seed_sessions(&service, &[worker(1)]);
+        let lay = layout(OBJ, 130);
+        let b1 = lay.block_id(1).unwrap();
+
+        // No committed entry: the report is a proven orphan and NO
+        // locations row is ever created — the object is quarantine-only.
+        let out = service
+            .incr_block_report(1, "seed-1", &[report(b1, 64)])
+            .unwrap();
+        assert_eq!(out.remove_blocks, vec![b1]);
+        {
+            let volatile = service.state.lock().unwrap();
+            assert!(volatile.quarantine.contains_key(&OBJ));
+            assert!(!volatile.locations.contains_key(&OBJ));
+            assert!(volatile.quarantine_index.contains_key(&1));
+        }
+
+        // No-geometry retire (nothing published, no committed row): the
+        // bounded drop MUST clear the quarantine row even without a
+        // locations row, and clean the directed index.
+        service.retire_object_state(1, OBJ, None).unwrap();
+        {
+            let volatile = service.state.lock().unwrap();
+            assert!(
+                !volatile.quarantine.contains_key(&OBJ),
+                "quarantine-only object must not leak its row"
+            );
+            assert!(!volatile.quarantine_index.contains_key(&1));
+            assert!(!volatile.location_holders.contains_key(&OBJ));
+        }
+    }
+
+    /// P0-2 (gpt56 `25d4b51e` item 2): the GC handoff stays
+    /// quantum-capped for a large layout (no per-tick unbounded work),
+    /// and the completion drop clears every trace via the holders
+    /// index; a Start purge resolves through the directed quarantine
+    /// index — only that worker's own identities are touched — and the
+    /// Deleted-ack release is tag-exact.
+    #[test]
+    fn test_4d2_p02_bounded_gc_and_directed_purge() {
+        // -- Part A: bounded drain + completion drop. --
+        let service = build_service("4d2-p02b", chooser(vec![worker(1)]));
+        seed_sessions(&service, &[worker(1)]);
+        mount_incarnation(&service, 1, 0);
+        let len = 600 * 64; // 600 blocks, all exactly 64
+        committed_entry(&service, token(2, 1), token(2, 2), "/k", OBJ, len, 0);
+        let lay = layout(OBJ, len);
+        let items: Vec<BlockReportInfo> = (1..=600i64)
+            .map(|i| report(lay.block_id(i).unwrap(), 64))
+            .collect();
+        let out = service.incr_block_report(1, "seed-1", &items).unwrap();
+        assert!(out.remove_blocks.is_empty());
+        {
+            let volatile = service.state.lock().unwrap();
+            assert_eq!(volatile.by_worker[&1].live_len(), 600);
+            assert!(volatile.location_holders.contains_key(&OBJ));
+        }
+        {
+            let mut volatile = service.state.lock().unwrap();
+            volatile
+                .gc
+                .enqueue(CacheGcWork {
+                    incarnation: 1,
+                    object_id: OBJ,
+                    len,
+                    block_size: 64,
+                    next_seq: 1,
+                })
+                .unwrap();
+            // Ticks 1-2: quantum-capped, no completion, traces intact.
+            assert_eq!(volatile.gc_take_batch().unwrap().len(), 256);
+            assert_eq!(volatile.gc_take_batch().unwrap().len(), 256);
+            assert!(volatile.locations.contains_key(&OBJ));
+            assert_eq!(volatile.by_worker[&1].live_len(), 600);
+            // Tick 3: the 88-block tail completes; the O(#holders) drop
+            // clears locations/live/holders in the same critical
+            // section — no identity walk, no materialized seq list.
+            assert_eq!(volatile.gc_take_batch().unwrap().len(), 88);
+            assert!(!volatile.locations.contains_key(&OBJ));
+            assert!(volatile.by_worker.get(&1).is_none_or(|r| r.live_len() == 0));
+            assert!(!volatile.location_holders.contains_key(&OBJ));
+        }
+
+        // -- Part B: directed Start purge + tag-exact ack. --
+        let service = build_service("4d2-p02c", chooser(vec![worker(1), worker(2)]));
+        seed_sessions(&service, &[worker(1), worker(2)]);
+        let b1 = layout(OBJ, 130).block_id(1).unwrap();
+        let c1 = BlockIdCodec::encode_block_id(OBJ + 1, 1).unwrap();
+        service
+            .incr_block_report(1, "seed-1", &[report(b1, 64)])
+            .unwrap();
+        service
+            .incr_block_report(2, "seed-2", &[report(c1, 64)])
+            .unwrap();
+        let t1 = service.cache_session_tag(1).unwrap();
+        let t2 = service.cache_session_tag(2).unwrap();
+
+        // An ack carrying the WRONG tag releases nothing.
+        service.ack_cache_deleted(1, t1 + 100, b1);
+        assert!(service.quarantine_contains(OBJ, 1, t1, 1));
+
+        // Worker 1's Start purges only ITS old-tag entries — worker 2's
+        // quarantine (different worker, different object) is untouched.
+        service.begin_cache_session(1, "fresh-1", &worker(1)).unwrap();
+        assert!(!service.quarantine_contains(OBJ, 1, t1, 1));
+        assert!(service.quarantine_contains(OBJ + 1, 2, t2, 1));
+        {
+            let volatile = service.state.lock().unwrap();
+            assert!(!volatile.quarantine.contains_key(&OBJ));
+            assert!(volatile.quarantine.contains_key(&(OBJ + 1)));
+            assert!(!volatile.quarantine_index.contains_key(&1));
+            assert!(volatile.quarantine_index.contains_key(&2));
+        }
     }
 }

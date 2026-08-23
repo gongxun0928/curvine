@@ -1401,6 +1401,52 @@ impl MasterFilesystem {
         }
     }
 
+    /// P0-1 (gpt56 `25d4b51e` item 1): apply one incremental-report
+    /// outcome's WorkerManager side effects under the transition fence.
+    /// The outcome carries the registry tag its decisions were made
+    /// under; the whole WM apply runs while holding `start_gate → WM
+    /// write → volatile`, so a Start/End/lost transition can never
+    /// interleave between the tag recheck and the side effects — an
+    /// outcome computed before a session swap is a LOUD no-op (its
+    /// volatile strip already happened under the old tag's guard; the
+    /// physical reclamation is the full-report reconcile's job), never
+    /// a delete queue entry or a quarantine release against the NEW
+    /// session.
+    fn apply_cache_incr_outcome(
+        &self,
+        worker_id: u32,
+        outcome: crate::cache::cache_service::CacheIncrOutcome,
+    ) {
+        if outcome.session_tag == 0
+            || (outcome.remove_blocks.is_empty() && outcome.deleted_acks.is_empty())
+        {
+            return;
+        }
+        let _gate = self.start_gate.lock();
+        let mut wm = self.worker_manager.write();
+        // Exact-tag recheck under the fence (lock order matches the
+        // heartbeat path: start_gate → WM → volatile).
+        if self.cache_service.cache_session_tag(worker_id) != Some(outcome.session_tag) {
+            warn!(
+                "cache incr outcome for worker {} dropped: session tag changed since decision",
+                worker_id
+            );
+            return;
+        }
+        for id in outcome.remove_blocks {
+            wm.remove_block(worker_id, id);
+        }
+        for id in outcome.deleted_acks {
+            wm.deleted_block(worker_id, id);
+            // 4d.2 RC2: the worker-side delete for this identity
+            // completed — release its delete-pending quarantine so a
+            // later Finalized re-report may publish again. P0-1: the
+            // release is exact `(worker, captured tag, seq)`.
+            self.cache_service
+                .ack_cache_deleted(worker_id, outcome.session_tag, id);
+        }
+    }
+
     /// Process block reports
     pub fn block_report(
         &self,
@@ -1457,20 +1503,7 @@ impl MasterFilesystem {
                 let outcome =
                     self.cache_service
                         .incr_block_report(list.worker_id, session, &cache_items)?;
-                if !outcome.remove_blocks.is_empty() || !outcome.deleted_acks.is_empty() {
-                    let mut wm = self.worker_manager.write();
-                    for id in outcome.remove_blocks {
-                        wm.remove_block(list.worker_id, id);
-                    }
-                    for id in outcome.deleted_acks {
-                        wm.deleted_block(list.worker_id, id);
-                        // 4d.2 RC2: the worker-side delete for this
-                        // identity completed — release its delete-pending
-                        // quarantine so a later Finalized re-report may
-                        // publish again.
-                        self.cache_service.ack_cache_deleted(list.worker_id, id);
-                    }
-                }
+                self.apply_cache_incr_outcome(list.worker_id, outcome);
             }
         }
 
@@ -2313,5 +2346,192 @@ mod tests {
             fs.cache_service.get(1, "/k", true).unwrap().is_none(),
             "losing one block's only replica is a whole-object miss"
         );
+    }
+
+    /// P0-1 (gpt56 `25d4b51e` item 1): an incremental outcome's
+    /// WorkerManager side effects are fenced by the registry tag the
+    /// decisions were made under. A paused stale outcome (computed
+    /// before a Start swapped the session) must be a LOUD no-op — no
+    /// BlockMap delete queue entry, no quarantine release against the
+    /// NEW session — while a fresh outcome applies normally.
+    #[test]
+    fn test_4d2_p01_outcome_fence_over_start() {
+        use curvine_model::{HeartbeatStatus, WorkerCommand};
+
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.cache_metadata_enabled = true;
+        conf.master.meta_dir =
+            Utils::test_sub_dir(format!("master-fs-4d2-fence/meta-{}", Utils::rand_str(6)));
+        conf.journal.journal_dir = Utils::test_sub_dir(format!(
+            "master-fs-4d2-fence/journal-{}",
+            Utils::rand_str(6)
+        ));
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        fs.master_monitor
+            .journal_ctl
+            .set_state(curvine_raft::raft::RoleState::Leader);
+        let cluster_id = conf.cluster_id.clone();
+
+        let addr = WorkerAddress {
+            worker_id: 1,
+            hostname: "fence-1".into(),
+            ip_addr: "10.0.0.1".into(),
+            rpc_port: 8200,
+            web_port: 8300,
+        };
+        fs.begin_worker_session(&addr, "s1").unwrap();
+
+        // Committed Valid cache entry: OBJ, len 150 -> 64/64/22.
+        let obj = BlockIdCodec::CACHE_OBJECT_MIN;
+        let lay = crate::master::meta::CacheBlockLayout::derive(obj, 150, 64).unwrap();
+        let b1 = lay.block_id(1).unwrap();
+        let b2 = lay.block_id(2).unwrap();
+        {
+            let store = fs.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let mgr = &store.cache;
+            mgr.apply_incarnation_allocate_v2(rocks, token(91, 1), 5, 1, 0)
+                .unwrap();
+            mgr.apply_id_reserve(rocks, token(1, 1), obj, obj + 100)
+                .unwrap();
+            let alloc = crate::master::meta::cache::entry::CacheEntry {
+                generation: 1,
+                state: crate::master::meta::cache::entry::CacheEntryState::Reserved,
+                object_id: obj,
+                len: 0,
+                ufs_mtime: 0,
+                block_size: 64,
+                expire_at: 0,
+            };
+            mgr.apply_allocate(rocks, token(2, 1), 1, "/k", 150, &alloc)
+                .unwrap();
+            mgr.apply_commit(
+                rocks,
+                token(2, 1),
+                token(2, 2),
+                1,
+                "/k",
+                1,
+                obj,
+                150,
+                777,
+                0,
+            )
+            .unwrap();
+        }
+
+        // PAUSED STALE OUTCOME: a corrupt report under s1 decides
+        // orphan for b1 (captured tag = s1's tag). It is NOT applied.
+        let stale = fs
+            .cache_service
+            .incr_block_report(
+                1,
+                "s1",
+                &[BlockReportInfo::new(
+                    b1,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    63, // corrupt length
+                )],
+            )
+            .unwrap();
+        assert_eq!(stale.remove_blocks.clone(), vec![b1]);
+        assert_ne!(stale.session_tag, 0);
+
+        // A Start swaps the session BEFORE the stale outcome reaches
+        // the WorkerManager.
+        fs.begin_worker_session(&addr, "s2").unwrap();
+
+        // The NEW session builds its own quarantine (corrupt b2 under
+        // s2) and its outcome applies through the fence.
+        let fresh = fs
+            .cache_service
+            .incr_block_report(
+                1,
+                "s2",
+                &[BlockReportInfo::new(
+                    b2,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    0, // corrupt length
+                )],
+            )
+            .unwrap();
+        assert_eq!(fresh.remove_blocks.clone(), vec![b2]);
+        assert_ne!(fresh.session_tag, stale.session_tag);
+        let fresh_tag = fresh.session_tag;
+        fs.apply_cache_incr_outcome(1, fresh);
+
+        // Release the paused stale outcome: it must be a no-op against
+        // the new session — b1 never reaches the BlockMap delete queue
+        // (heartbeat re-delivers every pending delete), and the s2
+        // quarantine for b2 survives untouched.
+        fs.apply_cache_incr_outcome(1, stale);
+        let cmds = fs
+            .worker_manager
+            .write()
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                addr.clone(),
+                1,
+                "s2".to_string(),
+                Default::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        let mut queued: Vec<i64> = Vec::new();
+        for cmd in cmds {
+            let WorkerCommand::DeleteBlock(c) = cmd;
+            queued.extend(c.blocks);
+        }
+        assert_eq!(queued, vec![b2], "stale outcome dropped, fresh applied");
+
+        let tag2 = fs.cache_service.cache_session_tag(1).unwrap();
+        assert_eq!(tag2, fresh_tag);
+        assert!(
+            fs.cache_service
+                .quarantine_contains(obj, 1, fresh_tag, 2),
+            "new-session quarantine survives the stale outcome release"
+        );
+
+        // Positive control — the Deleted ack releases the exact-tag
+        // quarantine and a same-tag Finalized re-report publishes again.
+        let acked = fs
+            .cache_service
+            .incr_block_report(
+                1,
+                "s2",
+                &[BlockReportInfo::with_deleted(b2, 64)],
+            )
+            .unwrap();
+        assert_eq!(acked.deleted_acks, vec![b2]);
+        fs.apply_cache_incr_outcome(1, acked);
+        assert!(
+            !fs.cache_service
+                .quarantine_contains(obj, 1, fresh_tag, 2),
+            "exact-tag ack releases the quarantine identity"
+        );
+        let republish = fs
+            .cache_service
+            .incr_block_report(
+                1,
+                "s2",
+                &[BlockReportInfo::new(
+                    b2,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    64,
+                )],
+            )
+            .unwrap();
+        assert!(republish.remove_blocks.is_empty());
+        assert!(fs.cache_service.live_contains(1, obj, 2));
     }
 }
