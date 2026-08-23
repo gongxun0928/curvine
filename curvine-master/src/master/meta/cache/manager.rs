@@ -1247,6 +1247,101 @@ impl CacheManager {
         Ok(())
     }
 
+    /// Lazy fenced reap of a dead load's Reserved lease (task #5 gate 2,
+    /// gpt56 `cfa2f0d7` blocker 3): a system op — no client tokens. The
+    /// CAS accepts ONLY the exact Reserved row (identity, generation, and
+    /// lease deadline) the leader observed; a row that already advanced
+    /// (a racing Commit/Abort/reap won) converges as a deterministic
+    /// no-op so journal replay never poisons the FSM. A later Commit of
+    /// the reaped load resolves terminal via the ordinary
+    /// strictly-later-generation rule.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_reserved_reap<S: LocalCacheIndexStore>(
+        &self,
+        store: &S,
+        incarnation: u64,
+        key: &str,
+        expected_generation: u64,
+        new_generation: u64,
+        expected_object_id: i64,
+        lease_expire_at: i64,
+    ) -> CommonResult<()> {
+        validate_incarnation(incarnation)?;
+        if Some(new_generation) != expected_generation.checked_add(1) {
+            return err_box!(
+                "cache reserved reap generations not adjacent: expected {}, new {}",
+                expected_generation,
+                new_generation
+            );
+        }
+
+        // Apply-time incarnation fence (4b): deterministic no-op.
+        if !Self::incarnation_active(store, incarnation)? {
+            return Ok(());
+        }
+
+        let cur = match store.cache_get_entry(incarnation, key).map_err(cv)? {
+            Some(v) => v,
+            // The row is gone entirely (vacuum raced): converge.
+            None => return Ok(()),
+        };
+        // Later state already advanced past this reap: the load's own
+        // Commit/Abort (or an earlier reap) won — converge, never fatal.
+        if cur.generation >= new_generation {
+            return Ok(());
+        }
+        if cur.generation != expected_generation {
+            return err_box!(
+                "cache reserved reap CAS violation for ({}, {}): committed generation {} vs expected {}",
+                incarnation,
+                key,
+                cur.generation,
+                expected_generation
+            );
+        }
+        // A non-Reserved row at the expected generation (the load's
+        // Commit turned it Valid between the leader's observation and
+        // this apply): the reap lost — converge, the readback reports it.
+        if cur.state != CacheEntryState::Reserved {
+            return Ok(());
+        }
+        if cur.object_id != expected_object_id {
+            return err_box!(
+                "cache reserved reap object identity mismatch for ({}, {})@{}: committed object {} vs expected {}",
+                incarnation,
+                key,
+                cur.generation,
+                cur.object_id,
+                expected_object_id
+            );
+        }
+        if cur.expire_at != lease_expire_at {
+            return err_box!(
+                "cache reserved reap lease divergence for ({}, {})@{}: committed lease {} vs journaled {}",
+                incarnation,
+                key,
+                cur.generation,
+                cur.expire_at,
+                lease_expire_at
+            );
+        }
+
+        let new = CacheEntry {
+            generation: new_generation,
+            state: CacheEntryState::Tombstoned,
+            object_id: cur.object_id,
+            len: 0,
+            ufs_mtime: cur.ufs_mtime,
+            block_size: cur.block_size,
+            expire_at: 0,
+        };
+        let mut w = store.cache_write();
+        w.put_entry(incarnation, key, &new).map_err(cv)?;
+        w.delete_object(cur.object_id).map_err(cv)?;
+        w.commit().map_err(cv)?;
+        Ok(())
+    }
+
     // ---- 4c.2 bounded mutation/journal apply paths. Every batch is
     // validated `1..=MUTATION_PAGE_CAP` at the boundary, mutates only the
     // journaled exact victim identities (the apply NEVER re-runs a range

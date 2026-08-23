@@ -425,6 +425,28 @@ pub struct CacheAbortEntry {
     pub(crate) expected_object_id: i64,
 }
 
+/// Lazy fenced reap of a dead load's Reserved lease (task #5 gate 2,
+/// gpt56 `cfa2f0d7` blocker 3): when a NEW allocate hits a Reserved row
+/// whose lease deadline has passed, the leader journals this system
+/// tombstone first (exact Reserved CAS) and then proceeds with the new
+/// allocation. No client tokens — this is a master-side system op; a
+/// late Commit/Abort of the reaped load converges (terminal no-op /
+/// Superseded) via the ordinary generation rules.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CacheReservedReapEntry {
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
+    pub(crate) incarnation: u64,
+    pub(crate) key: String,
+    pub(crate) expected_generation: u64,
+    pub(crate) new_generation: u64,
+    /// Object identity CAS (contract §2.3).
+    pub(crate) expected_object_id: i64,
+    /// The lease deadline observed on the row (exact-CAS component for
+    /// replay determinism).
+    pub(crate) lease_expire_at: i64,
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum JournalEntry {
     Mkdir(MkdirEntry),
@@ -458,6 +480,7 @@ pub enum JournalEntry {
     CacheVacuum(CacheVacuumEntry),
     CacheOutcomeGc(CacheOutcomeGcEntry),
     CacheAbort(CacheAbortEntry),
+    CacheReservedReap(CacheReservedReapEntry),
 }
 
 impl JournalEntry {
@@ -492,6 +515,7 @@ impl JournalEntry {
             JournalEntry::CacheTtlSweep(e) => e.op_id,
             JournalEntry::CacheVacuum(e) => e.op_id,
             JournalEntry::CacheOutcomeGc(e) => e.op_id,
+            JournalEntry::CacheReservedReap(e) => e.op_id,
             JournalEntry::CacheAbort(e) => e.op_id,
         }
     }
@@ -527,6 +551,7 @@ impl JournalEntry {
             JournalEntry::CacheTtlSweep(e) => e.rpc_id,
             JournalEntry::CacheVacuum(e) => e.rpc_id,
             JournalEntry::CacheOutcomeGc(e) => e.rpc_id,
+            JournalEntry::CacheReservedReap(e) => e.rpc_id,
             JournalEntry::CacheAbort(e) => e.rpc_id,
         }
     }
@@ -581,7 +606,8 @@ impl JournalEntry {
             | JournalEntry::CacheScopeRemove(_)
             | JournalEntry::CacheTtlSweep(_)
             | JournalEntry::CacheVacuum(_)
-            | JournalEntry::CacheOutcomeGc(_) => Vec::new(),
+            | JournalEntry::CacheOutcomeGc(_)
+            | JournalEntry::CacheReservedReap(_) => Vec::new(),
         }
     }
 
@@ -613,6 +639,7 @@ impl JournalEntry {
                 | JournalEntry::CacheTtlSweep(_)
                 | JournalEntry::CacheVacuum(_)
                 | JournalEntry::CacheOutcomeGc(_)
+                | JournalEntry::CacheReservedReap(_)
         )
     }
 }
@@ -1280,6 +1307,20 @@ mod tests {
                     expected_object_id: crate::master::meta::cache::BlockIdCodec::CACHE_OBJECT_MIN,
                 }),
                 29,
+            ),
+            // Task #5 gate-2 append: lazy fenced Reserved-lease reap.
+            (
+                JournalEntry::CacheReservedReap(CacheReservedReapEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    incarnation: 1,
+                    key: "/k".into(),
+                    expected_generation: 1,
+                    new_generation: 2,
+                    expected_object_id: crate::master::meta::cache::BlockIdCodec::CACHE_OBJECT_MIN,
+                    lease_expire_at: 100,
+                }),
+                30,
             ),
         ];
 

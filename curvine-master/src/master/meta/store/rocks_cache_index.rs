@@ -1432,10 +1432,24 @@ mod tests {
             let mut w = store.cache_write();
             assert!(w.put_entry(1, "/k", &e).is_err());
         }
-        // Reserved/Tombstoned with an expiry deadline rejected.
+        // A Reserved row MAY carry the load-lease deadline (task #5
+        // gate 2); a negative one and a Tombstoned deadline are rejected.
         {
             let mut e = entry(1, OBJ, 10, 8, 100);
             e.state = CacheEntryState::Reserved;
+            let mut w = store.cache_write();
+            w.put_entry(1, "/rk", &e).unwrap();
+            w.commit().unwrap();
+        }
+        {
+            let mut e = entry(1, OBJ, 10, 8, -1);
+            e.state = CacheEntryState::Reserved;
+            let mut w = store.cache_write();
+            assert!(w.put_entry(1, "/k", &e).is_err());
+        }
+        {
+            let mut e = entry(1, OBJ, 10, 8, 100);
+            e.state = CacheEntryState::Tombstoned;
             let mut w = store.cache_write();
             assert!(w.put_entry(1, "/k", &e).is_err());
         }

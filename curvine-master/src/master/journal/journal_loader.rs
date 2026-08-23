@@ -268,6 +268,7 @@ impl JournalLoader {
                 | JournalEntry::CacheCommit(_)
                 | JournalEntry::CacheRemove(_)
                 | JournalEntry::CacheAbort(_)
+                | JournalEntry::CacheReservedReap(_)
                 | JournalEntry::CacheIncarnationAllocateV2(_)
                 | JournalEntry::CacheScopeRemove(_)
                 | JournalEntry::CacheTtlSweep(_)

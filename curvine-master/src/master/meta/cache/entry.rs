@@ -343,8 +343,15 @@ pub fn decode_key(bytes: &[u8]) -> CommonResult<String> {
 /// - `object_id` in the cache domain, `block_size > 0`, `len >= 0`
 /// - `Valid` entries carry a real UFS fence timestamp (`ufs_mtime > 0`) and a
 ///   non-negative `expire_at` (0 = no TTL)
-/// - only `Valid` entries carry an expiry deadline: `Reserved`/`Tombstoned`
-///   must have `expire_at == 0` (no expiry row exists for them)
+/// - `Valid` entries carry a non-negative `expire_at` (0 = no TTL; a
+///   positive value is indexed by an expiry row for the ttl sweep);
+///   `Tombstoned` entries must have `expire_at == 0`
+/// - a `Reserved` entry may carry the load-lease deadline (task #5 gate
+///   2, gpt56 `cfa2f0d7`): 0 = no lease recorded (never reaped; only
+///   reachable from pre-lease journal history), positive = the fenced
+///   lazy-reap deadline. A Reserved row NEVER has an expiry row, so the
+///   ttl sweep (which scans the expiry index) can never see it — the
+///   two deadline meanings cannot alias
 /// - a full block layout must be derivable for `Reserved`/`Valid`
 pub fn validate_entry(entry: &CacheEntry) -> CommonResult<()> {
     if entry.generation < 1 {
@@ -380,11 +387,20 @@ pub fn validate_entry(entry: &CacheEntry) -> CommonResult<()> {
                 );
             }
         }
-        CacheEntryState::Reserved | CacheEntryState::Tombstoned => {
+        CacheEntryState::Tombstoned => {
             if entry.expire_at != 0 {
                 return err_box!(
-                    "only valid entries carry an expiry deadline, state {:?} has expire_at {}",
-                    entry.state,
+                    "tombstoned entries carry no deadline, expire_at {}",
+                    entry.expire_at
+                );
+            }
+        }
+        CacheEntryState::Reserved => {
+            // 0 = no lease recorded; positive = the load-lease deadline
+            // (lazy fenced reap). See the invariants above.
+            if entry.expire_at < 0 {
+                return err_box!(
+                    "reserved entry lease deadline must be non-negative: {}",
                     entry.expire_at
                 );
             }
@@ -633,12 +649,16 @@ mod tests {
         e.ufs_mtime = 0;
         assert!(validate_entry(&e).is_err());
 
-        // Reserved: no ufs_mtime fence required yet, no expiry allowed.
+        // Reserved: no ufs_mtime fence required yet; a positive
+        // expire_at is the load-lease deadline (lazy fenced reap), never
+        // a ttl-sweep expiry (Reserved rows have no expiry rows).
         let mut e = base.clone();
         e.state = CacheEntryState::Reserved;
         e.ufs_mtime = 0;
         validate_entry(&e).unwrap();
         e.expire_at = 100;
+        validate_entry(&e).unwrap();
+        e.expire_at = -1;
         assert!(validate_entry(&e).is_err());
 
         // Tombstoned: same expiry rule.

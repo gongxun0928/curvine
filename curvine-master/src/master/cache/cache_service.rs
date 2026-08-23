@@ -66,8 +66,8 @@ use crate::master::fs::WorkerManager;
 use crate::master::journal::{
     CacheAbortEntry, CacheAllocateEntry, CacheCommitEntry, CacheIdReserveEntry,
     CacheIncarnationAllocateV2Entry, CacheIncarnationRevokeEntry, CacheOutcomeGcEntry,
-    CacheRemoveEntry, CacheScopeRemoveEntry, CacheTtlSweepEntry, CacheVacuumEntry, JournalEntry,
-    JournalWriter,
+    CacheRemoveEntry, CacheReservedReapEntry, CacheScopeRemoveEntry, CacheTtlSweepEntry,
+    CacheVacuumEntry, JournalEntry, JournalWriter,
 };
 use crate::master::meta::cache::entry::{
     CacheEntry, CacheEntryState, ExpiryCursor, ExpiryRow, OpOutcome, OpToken, OutcomeGcGroup,
@@ -90,6 +90,16 @@ use std::sync::{Arc, Mutex};
 /// segment consumed), so the per-reserve outcome rows of the issuer
 /// client stay trivially small.
 const CACHE_RESERVE_SEGMENT: i64 = 4096;
+
+/// Load-lease deadline of a Reserved row (task #5 gate 2, gpt56
+/// `cfa2f0d7` blocker 3): a Reserved row is reclaimable by the fenced
+/// lazy reap once this deadline passes. The runner's own CacheAbort is
+/// the primary release; the lease is the durable last-resort escape for
+/// a runner that died (SIGKILL) between Allocate and Abort. Must exceed
+/// any task's total cache-load timeout budget (replan rounds included) —
+/// a live load whose lease expires is reaped underneath and its late
+/// Commit resolves terminal Superseded.
+const CACHE_RESERVED_LEASE_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// Hard cap on block location entries per commit / placement. Bounded so
 /// a malformed commit can never make the master build an unbounded
@@ -1847,6 +1857,56 @@ impl CacheService {
             });
         }
 
+        // Lazy fenced reap of a dead load's Reserved lease (task #5 gate
+        // 2, gpt56 `cfa2f0d7` blocker 3): a Reserved row whose lease
+        // deadline passed is a load whose runner died before any
+        // Commit/Abort — the key must not wedge. The leader journals the
+        // exact-CAS system tombstone FIRST, then continues with this
+        // allocation on the re-opened key. A racing late Commit of the
+        // reaped load converges terminal via the ordinary generation
+        // rules (apply no-op, service Superseded).
+        let dead_lease = {
+            let store = self.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            match rocks.cache_get_entry(incarnation, key).map_err(fs_err)? {
+                Some(cur)
+                    if cur.state == CacheEntryState::Reserved
+                        && cur.expire_at != 0
+                        && cur.expire_at <= LocalTime::mills() as i64 =>
+                {
+                    Some((cur.generation, cur.object_id, cur.expire_at))
+                }
+                _ => None,
+            }
+        };
+        if let Some((dead_generation, dead_object_id, dead_lease_at)) = dead_lease {
+            let dead_new_generation = dead_generation.checked_add(1).ok_or_else(|| {
+                cm_err("cache reserved reap generation overflow: entry is terminal")
+            })?;
+            let op_id = self.fs_dir.read().next_op_id();
+            let entry = JournalEntry::CacheReservedReap(CacheReservedReapEntry {
+                op_id,
+                rpc_id,
+                incarnation,
+                key: key.to_string(),
+                expected_generation: dead_generation,
+                new_generation: dead_new_generation,
+                expected_object_id: dead_object_id,
+                lease_expire_at: dead_lease_at,
+            });
+            self.journal_writer
+                .sync_propose_cache(entry)
+                .map_err(fs_err)?;
+            self.fire_barrier_hook();
+            if !self.incarnation_active(incarnation)? {
+                return Err(Self::fenced(incarnation));
+            }
+            // Fall through: the classification below re-reads the row —
+            // Tombstoned@dead_new_generation opens the key, and a racing
+            // survivor (the row re-classifies Reserved/Valid) surfaces as
+            // the ordinary loud wedge error, never a silent overwrite.
+        }
+
         // Fast-fail entry-state check and generation selection. The
         // committed apply re-checks the absolute transition, so a racing
         // mutation between here and the propose fails loudly there.
@@ -1933,7 +1993,12 @@ impl CacheService {
             len: 0,
             ufs_mtime: 0,
             block_size,
-            expire_at: 0,
+            // The load-lease deadline: the durable last-resort reclaim
+            // anchor for a runner that dies before Commit/Abort (gpt56
+            // `cfa2f0d7` blocker 3). Stored on the row itself; a
+            // Reserved row never has an expiry row, so the ttl sweep
+            // (expiry-index scan) can never see it.
+            expire_at: LocalTime::mills() as i64 + CACHE_RESERVED_LEASE_MS,
         };
         let op_id = self.fs_dir.read().next_op_id();
         let journal_entry = JournalEntry::CacheAllocate(CacheAllocateEntry {
@@ -7019,6 +7084,267 @@ mod tests {
         assert!(
             !msg.contains("raft"),
             "refusal is at the guard, before the barrier: {}",
+            msg
+        );
+    }
+
+    /// Gate-2 durable escape (gpt56 `cfa2f0d7` blocker 3): a load whose
+    /// runner died between Allocate and Abort (SIGKILL) leaves a Reserved
+    /// row; once its lease deadline passes, a NEW allocate on the key
+    /// journals the fenced system reap FIRST and then re-opens the key.
+    /// The reaped load's late Commit/Abort converge terminal.
+    #[test]
+    fn test_reserved_lease_lazy_reap_reopens_key() {
+        let service = build_service("reap-reopens-key", chooser(vec![worker(1)]));
+        seed_sessions(&service, &[worker(1)]);
+        mount_incarnation(&service, 1, 0);
+        // Task A: Reserved@1 with an EXPIRED lease (the runner died).
+        let dead_lease_at = LocalTime::mills() as i64 - 1_000;
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let mgr = &store.cache;
+            mgr.apply_id_reserve(rocks, token(1, 1), OBJ, OBJ + 100)
+                .unwrap();
+            let alloc = CacheEntry {
+                generation: 1,
+                state: CacheEntryState::Reserved,
+                object_id: OBJ,
+                len: 0,
+                ufs_mtime: 0,
+                block_size: 64,
+                expire_at: dead_lease_at,
+            };
+            mgr.apply_allocate(rocks, token(191, 1), 1, "/k", 130, &alloc)
+                .unwrap();
+        }
+
+        // Task B: the lazy reap fires inside allocate and reaches the
+        // raft barrier (fail-closed "raft" Err in this harness — the
+        // pre-wedge classification passed).
+        let err = service
+            .allocate(token(192, 1), 7, 1, "/k", 130, 64)
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("raft"),
+            "the reap must reach the raft barrier: {}",
+            err
+        );
+
+        // Simulate the barrier passing: the production dispatch applies
+        // the exact-CAS reap.
+        service
+            .fs_dir
+            .read()
+            .apply_cache_journal_entry(&JournalEntry::CacheReservedReap(CacheReservedReapEntry {
+                op_id: 1,
+                rpc_id: 7,
+                incarnation: 1,
+                key: "/k".to_string(),
+                expected_generation: 1,
+                new_generation: 2,
+                expected_object_id: OBJ,
+                lease_expire_at: dead_lease_at,
+            }))
+            .unwrap();
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let row = rocks.cache_get_entry(1, "/k").unwrap().unwrap();
+            assert_eq!(row.state, CacheEntryState::Tombstoned);
+            assert_eq!(row.generation, 2);
+            assert_eq!(row.expire_at, 0);
+        }
+
+        // Task B retries: the row gate now passes (Tombstoned), the
+        // failure is the harness raft barrier — never the Reserved wedge.
+        let err = service
+            .allocate(token(192, 1), 7, 1, "/k", 130, 64)
+            .unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("raft"), "task B allocate: {}", msg);
+        assert!(
+            !msg.contains("only None or Tombstoned"),
+            "the key must be re-allocatable after the reap: {}",
+            msg
+        );
+
+        // The dead load's LATE COMMIT converges terminal: apply no-op,
+        // row untouched (no publish over the reap tombstone).
+        service
+            .fs_dir
+            .read()
+            .apply_cache_journal_entry(&JournalEntry::CacheCommit(CacheCommitEntry {
+                op_id: 2,
+                rpc_id: 7,
+                token: token(191, 2),
+                load_token: token(191, 1),
+                incarnation: 1,
+                key: "/k".to_string(),
+                generation: 1,
+                expected_object_id: OBJ,
+                len: 130,
+                ufs_mtime: 777,
+                expire_at: 0,
+            }))
+            .unwrap();
+        // And its late abort converges too.
+        service
+            .fs_dir
+            .read()
+            .apply_cache_journal_entry(&JournalEntry::CacheAbort(CacheAbortEntry {
+                op_id: 3,
+                rpc_id: 7,
+                load_token: token(191, 1),
+                commit_token: token(191, 2),
+                incarnation: 1,
+                key: "/k".to_string(),
+                expected_generation: 1,
+                new_generation: 2,
+                expected_object_id: OBJ,
+            }))
+            .unwrap();
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let row = rocks.cache_get_entry(1, "/k").unwrap().unwrap();
+            assert_eq!(row.state, CacheEntryState::Tombstoned);
+            assert_eq!(row.generation, 2);
+        }
+    }
+
+    /// The reap apply CAS matrix: exact Reserved applies; lease mismatch
+    /// is loud divergence; a racing Commit's Valid row converges (never
+    /// fatal); replay is idempotent; a LIVE lease is never reaped (the
+    /// service branch refuses to even propose — asserted via the wedge
+    /// error staying the Reserved one).
+    #[test]
+    fn test_reserved_reap_apply_cas_matrix() {
+        let service = build_service("reap-cas", chooser(vec![worker(1)]));
+        mount_incarnation(&service, 1, 0);
+        // Each seed mints a DISTINCT object id so the reverse object
+        // rows never collide across keys.
+        let seed_reserved = |lease: i64, token_seq: u64| {
+            let object_id = OBJ + token_seq as i64;
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let mgr = &store.cache;
+            mgr.apply_id_reserve(rocks, token(1, 1), OBJ, OBJ + 200)
+                .unwrap();
+            let alloc = CacheEntry {
+                generation: 1,
+                state: CacheEntryState::Reserved,
+                object_id,
+                len: 0,
+                ufs_mtime: 0,
+                block_size: 64,
+                expire_at: lease,
+            };
+            let key = format!("/k{}", token_seq);
+            mgr.apply_allocate(rocks, token(token_seq, 1), 1, &key, 130, &alloc)
+                .unwrap();
+            key
+        };
+        let obj_of = |token_seq: u64| OBJ + token_seq as i64;
+        let reap = |key: &str, gen: u64, obj: i64, lease: i64| {
+            JournalEntry::CacheReservedReap(CacheReservedReapEntry {
+                op_id: 1,
+                rpc_id: 7,
+                incarnation: 1,
+                key: key.to_string(),
+                expected_generation: gen,
+                new_generation: gen + 1,
+                expected_object_id: obj,
+                lease_expire_at: lease,
+            })
+        };
+
+        // Exact Reserved: applies, idempotent on replay.
+        let k1 = seed_reserved(500, 101);
+        service
+            .fs_dir
+            .read()
+            .apply_cache_journal_entry(&reap(&k1, 1, obj_of(101), 500))
+            .unwrap();
+        service
+            .fs_dir
+            .read()
+            .apply_cache_journal_entry(&reap(&k1, 1, obj_of(101), 500))
+            .unwrap();
+        {
+            let store = service.fs_dir.read();
+            let row = store
+                .get_rocks_store()
+                .cache_get_entry(1, &k1)
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.state, CacheEntryState::Tombstoned);
+            assert_eq!(row.generation, 2);
+        }
+
+        // Lease mismatch at the same generation: loud divergence.
+        let k2 = seed_reserved(500, 102);
+        let err = service
+            .fs_dir
+            .read()
+            .apply_cache_journal_entry(&reap(&k2, 1, obj_of(102), 499))
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("lease divergence"),
+            "err: {}",
+            err
+        );
+
+        // Racing Commit turned the row Valid at the expected generation:
+        // the reap lost — deterministic converge, row preserved.
+        let k3 = seed_reserved(0, 103);
+        service
+            .fs_dir
+            .read()
+            .apply_cache_journal_entry(&JournalEntry::CacheCommit(CacheCommitEntry {
+                op_id: 1,
+                rpc_id: 7,
+                token: token(103, 2),
+                load_token: token(103, 1),
+                incarnation: 1,
+                key: k3.clone(),
+                generation: 1,
+                expected_object_id: obj_of(103),
+                len: 130,
+                ufs_mtime: 777,
+                expire_at: 0,
+            }))
+            .unwrap();
+        service
+            .fs_dir
+            .read()
+            .apply_cache_journal_entry(&reap(&k3, 1, obj_of(103), 0))
+            .unwrap();
+        {
+            let store = service.fs_dir.read();
+            let row = store
+                .get_rocks_store()
+                .cache_get_entry(1, &k3)
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.state, CacheEntryState::Valid);
+        }
+
+        // A LIVE lease never triggers the service branch: allocate hits
+        // the ordinary Reserved wedge (loud), no reap proposed.
+        let k4 = seed_reserved(LocalTime::mills() as i64 + 3_600_000, 104);
+        let err = service
+            .allocate(token(105, 1), 7, 1, &k4, 130, 64)
+            .unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("only None or Tombstoned"),
+            "a live Reserved lease must keep the loud wedge: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("raft"),
+            "no journal proposal may happen for a live lease: {}",
             msg
         );
     }

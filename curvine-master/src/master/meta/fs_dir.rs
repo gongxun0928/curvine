@@ -1072,6 +1072,15 @@ impl FsDir {
                 e.new_generation,
                 e.expected_object_id,
             ),
+            JournalEntry::CacheReservedReap(e) => self.cache.apply_reserved_reap(
+                store,
+                e.incarnation,
+                &e.key,
+                e.expected_generation,
+                e.new_generation,
+                e.expected_object_id,
+                e.lease_expire_at,
+            ),
             JournalEntry::CacheScopeRemove(e) => {
                 self.cache
                     .apply_scope_remove(store, e.incarnation, &e.scope, &e.victims)

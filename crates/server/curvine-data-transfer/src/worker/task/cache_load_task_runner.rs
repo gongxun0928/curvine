@@ -552,7 +552,7 @@ impl CacheLoadTaskRunner {
             ABORT_RETRY_ATTEMPTS,
             ABORT_RETRY_BACKOFF_MS,
             || async {
-                let _ = client
+                let resp = client
                     .cache_abort(
                         spec.load_token,
                         spec.commit_token,
@@ -560,11 +560,7 @@ impl CacheLoadTaskRunner {
                         &spec.key,
                     )
                     .await?;
-                // Applied / AlreadyApplied / Superseded are all terminal
-                // for the Reserved-at-fence this runner could own: the
-                // key is allocatable again (or owned by a fresher
-                // winner).
-                Ok(())
+                abort_outcome(&resp)
             },
         )
         .await;
@@ -670,6 +666,13 @@ where
                         timeout_ms
                     );
                 }
+                // Typed REPLAN_NEEDED definitively resolves the commit
+                // ambiguity (the master asserted the commit did NOT
+                // apply), so the failure path may abort again if the
+                // NEXT round fails before issuing another commit (gpt56
+                // `cfa2f0d7` blocker 1). Transport errors never clear
+                // the flag — only this typed outcome does.
+                commit_issued.store(false, Ordering::Release);
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 evidence = write_round(allocate().await?).await?;
             }
@@ -801,6 +804,25 @@ where
 /// restores that contract: a missing or unknown discriminator decodes to
 /// `None` and the caller must treat the commit outcome as
 /// uninterpretable.
+/// Terminal-status gate for a CacheAbort response (gpt56 `cfa2f0d7`
+/// blocker 2): ONLY Applied / AlreadyApplied / Superseded mean the
+/// Reserved row is released (or owned by a fresher winner). REPLAN_NEEDED
+/// (impossible today but wire-decodable), a missing discriminator, or an
+/// unknown value is a FAILURE that keeps the bounded retry going — never
+/// a silent "any Ok response means cleaned".
+fn abort_outcome(resp: &curvine_proto::CacheAbortResponse) -> FsResult<()> {
+    match cache_op_status(resp.status) {
+        Some(CacheOpStatusProto::Applied)
+        | Some(CacheOpStatusProto::AlreadyApplied)
+        | Some(CacheOpStatusProto::Superseded) => Ok(()),
+        other => err_box!(
+            "cache abort returned non-terminal status {:?} (raw {:?})",
+            other,
+            resp.status
+        ),
+    }
+}
+
 fn cache_op_status(v: Option<i32>) -> Option<CacheOpStatusProto> {
     match v {
         Some(s) if s == CacheOpStatusProto::Applied as i32 => Some(CacheOpStatusProto::Applied),
@@ -983,7 +1005,10 @@ mod tests {
     // plan, and rebuild the evidence; an applied commit (response loss)
     // must converge commit-side only and NEVER re-allocate.
 
-    use super::{best_effort_abort_after_failure, drive_cache_load, AbortOutcome, CommitEvidence};
+    use super::{
+        abort_outcome, best_effort_abort_after_failure, drive_cache_load, AbortOutcome,
+        CommitEvidence,
+    };
     use curvine_proto::CacheAllocateResponse;
 
     fn resp_with_status(s: i32) -> CacheCommitResponse {
@@ -1258,6 +1283,96 @@ mod tests {
         })
         .await;
         assert_eq!(outcome, AbortOutcome::Exhausted);
+        assert_eq!(sends.load(Ordering::SeqCst), 3);
+    }
+
+    // gpt56 `cfa2f0d7` blocker 1 seam: a REPLAN_NEEDED resolves the
+    // commit ambiguity (the master asserted the commit did NOT apply),
+    // so a failure in the SECOND write round may still abort the
+    // Reserved row — the flag is cleared only by this typed outcome,
+    // never by a transport error.
+
+    #[tokio::test]
+    async fn replan_resolves_commit_ambiguity_so_second_round_failure_aborts() {
+        let commit_issued = AtomicBool::new(false);
+        let rounds = AtomicU32::new(0);
+        let err = drive_cache_load(
+            || false,
+            10_000,
+            1,
+            &commit_issued,
+            || async {
+                Ok(CacheAllocateResponse {
+                    object_id: 5,
+                    generation: 1,
+                    blocks: Vec::new(),
+                })
+            },
+            |_alloc| {
+                let round = 1 + rounds.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if round == 1 {
+                        Ok(round_evidence(1))
+                    } else {
+                        Err(FsError::common("injected second-round write failure"))
+                    }
+                }
+            },
+            |_ev| async move { Ok(resp_with_status(4)) },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("second-round write failure"),
+            "err: {}",
+            err
+        );
+        // The typed REPLAN_NEEDED cleared the ambiguity flag: the abort
+        // is warranted again for the still-Reserved row.
+        assert!(!commit_issued.load(Ordering::Acquire));
+        let sends = AtomicU32::new(0);
+        let outcome = best_effort_abort_after_failure(&commit_issued, 3, 1, || {
+            sends.fetch_add(1, Ordering::SeqCst);
+            async { Ok(()) }
+        })
+        .await;
+        assert_eq!(outcome, AbortOutcome::Aborted);
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+    }
+
+    // gpt56 `cfa2f0d7` blocker 2 seam: only terminal statuses count as a
+    // cleaned row; anything else is a retryable failure.
+    #[test]
+    fn abort_outcome_accepts_only_terminal_statuses() {
+        let mk = |status: Option<i32>| curvine_proto::CacheAbortResponse {
+            status,
+            current_generation: Some(0),
+        };
+        for terminal in [1i32, 2, 3] {
+            abort_outcome(&mk(Some(terminal))).unwrap();
+        }
+        for non_terminal in [Some(4i32), None, Some(99)] {
+            let err = abort_outcome(&mk(non_terminal)).unwrap_err();
+            assert!(format!("{}", err).contains("non-terminal"), "err: {}", err);
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_retries_on_non_terminal_status_then_converges() {
+        let commit_issued = AtomicBool::new(false);
+        let sends = AtomicU32::new(0);
+        let outcome = best_effort_abort_after_failure(&commit_issued, 3, 1, || {
+            let n = sends.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n < 2 {
+                    Err(FsError::common("abort returned non-terminal status"))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert_eq!(outcome, AbortOutcome::Aborted);
         assert_eq!(sends.load(Ordering::SeqCst), 3);
     }
 }
