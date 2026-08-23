@@ -1049,33 +1049,89 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_expiry_frozen_4b_layout_bytes() -> FsResult<()> {
-        let store = new_store("expiry-frozen")?;
-        // A row exactly as 4a/4b (7e3f8a02..919756de) would have written
-        // it: key = (expire_at, incarnation, object_id) big-endian 24
-        // bytes, value = bincode (key, generation). The value bytes are
-        // pinned by the frozen hex below: string "/a" = u64-LE len 2 ++
-        // "2f61", then generation 1 = u64-LE.
-        const VALUE_HEX: &str = "02000000000000002f610100000000000000";
-        let frozen_value: (String, u64) = Serde::deserialize(&hex_bytes(VALUE_HEX))?;
-        assert_eq!(frozen_value, ("/a".to_string(), 1));
+    /// Literal frozen bytes of expiry row
+    /// `(expire_at=100, incarnation=1, object_id=OBJ, key="/a", generation=1)`
+    /// as any 4a/4b writer (7e3f8a02..919756de) committed it:
+    /// key = three big-endian fixed fields (100 || 1 || 1<<38), value =
+    /// bincode ("/a", 1) = u64-LE len 2 ++ "2f61" ++ u64-LE 1.
+    const FROZEN_KEY_HEX: &str = "000000000000006400000000000000010000004000000000";
+    const FROZEN_VALUE_HEX: &str = "02000000000000002f610100000000000000";
+    /// A second frozen row (200, 1, OBJ+1, "/b", generation 2), used as the
+    /// exclusive-cursor resume target past the first frozen position.
+    const FROZEN_KEY2_HEX: &str = "00000000000000c800000000000000010000004000000001";
+    const FROZEN_VALUE2_HEX: &str = "02000000000000002f620200000000000000";
 
-        let row = ExpiryRow {
+    /// Reader half: bytes written **raw** through the engine (never via
+    /// `expiry_key`/`put_expiry`) must decode through the public scan into
+    /// the frozen rows. Locks the reader against any encoding drift
+    /// without sharing an implementation with the writer.
+    #[test]
+    fn test_expiry_frozen_reader_decodes_raw_bytes() -> FsResult<()> {
+        let store = new_store("expiry-frozen-reader")?;
+        store.db.put_cf(
+            RocksInodeStore::CF_CACHE_EXPIRY,
+            hex_bytes(FROZEN_KEY_HEX),
+            hex_bytes(FROZEN_VALUE_HEX),
+        )?;
+        store.db.put_cf(
+            RocksInodeStore::CF_CACHE_EXPIRY,
+            hex_bytes(FROZEN_KEY2_HEX),
+            hex_bytes(FROZEN_VALUE2_HEX),
+        )?;
+
+        let row1 = ExpiryRow {
             expire_at: 100,
             incarnation: 1,
             object_id: OBJ,
             key: "/a".into(),
             generation: 1,
         };
+        let row2 = ExpiryRow {
+            expire_at: 200,
+            incarnation: 1,
+            object_id: OBJ + 1,
+            key: "/b".into(),
+            generation: 2,
+        };
+        assert_eq!(
+            store.cache_scan_expiry(200, None, 10)?,
+            vec![row1, row2.clone()]
+        );
+
+        // Exclusive cursor resume from the first frozen position.
+        let cursor = ExpiryCursor {
+            expire_at: 100,
+            incarnation: 1,
+            object_id: OBJ,
+        };
+        assert_eq!(store.cache_scan_expiry(200, Some(&cursor), 1)?, vec![row2]);
+        Ok(())
+    }
+
+    /// Writer half: on a fresh store, `put_expiry` must commit exactly the
+    /// frozen bytes. Locks the writer against any encoding drift.
+    #[test]
+    fn test_expiry_frozen_writer_emits_frozen_bytes() -> FsResult<()> {
+        let store = new_store("expiry-frozen-writer")?;
         {
             let mut w = store.cache_write();
-            w.put_expiry(&row)?;
+            w.put_expiry(&ExpiryRow {
+                expire_at: 100,
+                incarnation: 1,
+                object_id: OBJ,
+                key: "/a".into(),
+                generation: 1,
+            })?;
+            w.put_expiry(&ExpiryRow {
+                expire_at: 200,
+                incarnation: 1,
+                object_id: OBJ + 1,
+                key: "/b".into(),
+                generation: 2,
+            })?;
             w.commit()?;
         }
 
-        // The committed bytes are exactly the frozen layout, read back raw
-        // through the index's own range scan.
         let iter = store.db.range_scan(
             RocksInodeStore::CF_CACHE_EXPIRY,
             [0u8; 24].to_vec(),
@@ -1086,13 +1142,11 @@ mod tests {
             let (k, v) = item.map_err(rocks_err)?;
             raw.push((k, v));
         }
-        assert_eq!(raw.len(), 1);
-        let expected_key: Vec<u8> = RocksInodeStore::expiry_key(100, 1, OBJ).to_vec();
-        assert_eq!(raw[0].0.to_vec(), expected_key);
-        assert_eq!(raw[0].1.to_vec(), hex_bytes(VALUE_HEX));
-
-        // And the row decodes to itself through the public scan.
-        assert_eq!(store.cache_scan_expiry(200, None, 10)?, vec![row]);
+        assert_eq!(raw.len(), 2);
+        assert_eq!(raw[0].0.to_vec(), hex_bytes(FROZEN_KEY_HEX));
+        assert_eq!(raw[0].1.to_vec(), hex_bytes(FROZEN_VALUE_HEX));
+        assert_eq!(raw[1].0.to_vec(), hex_bytes(FROZEN_KEY2_HEX));
+        assert_eq!(raw[1].1.to_vec(), hex_bytes(FROZEN_VALUE2_HEX));
         Ok(())
     }
 
