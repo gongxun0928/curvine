@@ -2234,41 +2234,50 @@ impl CacheService {
         // Load binding: the durable Allocated outcome must record exactly
         // this load (identity AND geometry). The manager re-verifies this
         // atomically at apply; checking here keeps divergence off the wire.
-        {
-            let store = self.fs_dir.read();
-            let rocks = store.get_rocks_store();
-            match rocks.cache_get_outcome(load_token).map_err(fs_err)? {
-                Some(OpOutcome::Allocated {
-                    incarnation: out_inc,
-                    key: out_key,
-                    generation: out_generation,
-                    object_id: out_object,
-                    file_len: out_len,
-                    ..
-                }) => {
-                    if out_inc != incarnation
-                        || out_key != key
-                        || out_generation != generation
-                        || out_object != object_id
-                        || out_len != len
-                    {
-                        return err_box!(
-                            "cache commit does not match its recorded load allocation for load token {:?}: ({}, {})@{} object {} len {}",
-                            load_token,
-                            incarnation,
-                            key,
-                            generation,
-                            object_id,
-                            len
-                        );
+        // SKIPPED for an exact recorded Committed outcome: that outcome
+        // echoes the load token itself, so its exact-match comparison
+        // above has ALREADY bound identity and geometry — and the load
+        // outcome row is evictable by the bounded outcome window (its
+        // op_seq sits below the client watermark the commit itself pushed
+        // forward), so a response-loss retry must never depend on
+        // re-reading it (task #5 RC gpt56 `4ebcff5a`).
+        if !committed_outcome_exact {
+            {
+                let store = self.fs_dir.read();
+                let rocks = store.get_rocks_store();
+                match rocks.cache_get_outcome(load_token).map_err(fs_err)? {
+                    Some(OpOutcome::Allocated {
+                        incarnation: out_inc,
+                        key: out_key,
+                        generation: out_generation,
+                        object_id: out_object,
+                        file_len: out_len,
+                        ..
+                    }) => {
+                        if out_inc != incarnation
+                            || out_key != key
+                            || out_generation != generation
+                            || out_object != object_id
+                            || out_len != len
+                        {
+                            return err_box!(
+                                "cache commit does not match its recorded load allocation for load token {:?}: ({}, {})@{} object {} len {}",
+                                load_token,
+                                incarnation,
+                                key,
+                                generation,
+                                object_id,
+                                len
+                            );
+                        }
                     }
-                }
-                other => {
-                    return err_box!(
-                        "cache commit load token {:?} has no recorded allocation: {:?}",
-                        load_token,
-                        other
-                    )
+                    other => {
+                        return err_box!(
+                            "cache commit load token {:?} has no recorded allocation: {:?}",
+                            load_token,
+                            other
+                        )
+                    }
                 }
             }
         }
@@ -6052,6 +6061,103 @@ mod tests {
             service.commit(params).unwrap(),
             CacheOpStatus::AlreadyApplied
         );
+    }
+
+    /// Phase 3 task #5 RC (gpt56 `4ebcff5a`): the load outcome's op_seq
+    /// (1) sits below the client watermark the commit (2) itself pushed
+    /// forward, so the bounded outcome window may evict it — even while
+    /// the commit's own response is still in flight (response loss).
+    /// Recovery MUST converge from the commit side: the commit outcome
+    /// (at the watermark, boundary-excluded from eviction) plus the
+    /// committed Valid row answer AlreadyApplied WITHOUT re-reading the
+    /// evicted load outcome, and the cache-index row remains readable
+    /// for the master's re-create convergence when the whole task (not
+    /// just the response) was lost.
+    #[test]
+    fn test_commit_exact_retry_survives_load_outcome_gc() {
+        let service = build_service("commit-retry-after-gc", chooser(vec![worker(1)]));
+        seed_sessions(&service, &[worker(1)]);
+        mount_incarnation(&service, 1, 0);
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let mgr = &store.cache;
+            mgr.apply_id_reserve(rocks, token(1, 1), OBJ, OBJ + 100)
+                .unwrap();
+            let alloc = CacheEntry {
+                generation: 1,
+                state: CacheEntryState::Reserved,
+                object_id: OBJ,
+                len: 0,
+                ufs_mtime: 0,
+                block_size: 64,
+                expire_at: 0,
+            };
+            mgr.apply_allocate(rocks, token(30, 1), 1, "/g", 130, &alloc)
+                .unwrap();
+            // The commit applied (HW -> 2) but its response was lost.
+            mgr.apply_commit(
+                rocks,
+                token(30, 1),
+                token(30, 2),
+                1,
+                "/g",
+                1,
+                OBJ,
+                130,
+                777,
+                0,
+            )
+            .unwrap();
+            // The bounded outcome window evicts the load outcome (1 < 2);
+            // the watermark and the commit outcome survive.
+            let mut w = rocks.cache_write();
+            w.delete_outcome(token(30, 1)).unwrap();
+            w.commit().unwrap();
+        }
+
+        // Allocate-first recovery is a dead end by design — the evicted
+        // load token is TERMINAL below the watermark. This documents WHY
+        // the runner retries the commit verbatim instead of re-allocating.
+        let err = service
+            .allocate(token(30, 1), 7, 1, "/g", 130, 64)
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("expired (client watermark 2)"),
+            "{}",
+            err
+        );
+
+        // Commit-side recovery: the exact self-contained replay resolves
+        // from the commit outcome + committed Valid row alone.
+        let params = CacheCommitParams {
+            token: token(30, 2),
+            load_token: token(30, 1),
+            rpc_id: 7,
+            incarnation: 1,
+            key: "/g",
+            generation: 1,
+            object_id: OBJ,
+            len: 130,
+            ufs_mtime: 777,
+            ttl_ms: 0,
+            blocks: vec![],
+        };
+        assert_eq!(
+            service.commit(params).unwrap(),
+            CacheOpStatus::AlreadyApplied
+        );
+
+        // Whole-task loss (worker crash, not just response loss): the
+        // committed cache-index row still serves the master's
+        // check_already_loaded convergence — same len and ufs_mtime.
+        let hit = service
+            .get(1, "/g", false)
+            .unwrap()
+            .expect("row survives outcomes");
+        assert_eq!(hit.len, 130);
+        assert_eq!(hit.ufs_mtime, 777);
+        assert_eq!(hit.object_id, OBJ);
     }
 
     /// len=0 is a legal empty object end to end at the retry path: the

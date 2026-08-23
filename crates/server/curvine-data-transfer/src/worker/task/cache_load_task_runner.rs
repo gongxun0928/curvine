@@ -53,6 +53,9 @@ use std::sync::Arc;
 
 const READ_CHUNK_BYTES: i64 = 16 * 1024 * 1024;
 
+/// Backoff between verbatim CacheCommit retries (hard gate 3).
+const COMMIT_RETRY_BACKOFF_MS: u64 = 1_000;
+
 pub struct CacheLoadTaskRunner {
     task: Arc<TaskContext>,
     fs: CurvineFileSystem,
@@ -212,20 +215,34 @@ impl CacheLoadTaskRunner {
         }
 
         // Self-contained commit carrying the locations that ACTUALLY
-        // completed (worker ACKs), never the bare plan.
-        let commit = client
-            .cache_commit(
-                spec.commit_token,
-                spec.load_token,
-                spec.incarnation,
-                &spec.key,
-                alloc.generation,
-                alloc.object_id,
-                file_len,
-                ufs_mtime,
-                committed_blocks,
-            )
-            .await?;
+        // completed (worker ACKs), never the bare plan. Response loss
+        // (hard gate 3, RC `4ebcff5a`): the request is replayed VERBATIM
+        // under the task's timeout budget — an applied-but-lost commit
+        // converges to AlreadyApplied on the master, and a transient RPC
+        // error must not fail the task while the budget lasts. The retry
+        // never re-runs Allocate: once this commit applies, the master's
+        // per-client watermark (2) makes the load token (1) evictable by
+        // the bounded outcome window, so recovery rides the commit-side
+        // path alone.
+        let commit = commit_with_retry(
+            || self.task.is_cancel(),
+            self.task_timeout_ms,
+            COMMIT_RETRY_BACKOFF_MS,
+            || {
+                client.cache_commit(
+                    spec.commit_token,
+                    spec.load_token,
+                    spec.incarnation,
+                    &spec.key,
+                    alloc.generation,
+                    alloc.object_id,
+                    file_len,
+                    ufs_mtime,
+                    committed_blocks.clone(),
+                )
+            },
+        )
+        .await?;
         match cache_op_status(commit.status) {
             Some(CacheOpStatusProto::Applied) | Some(CacheOpStatusProto::AlreadyApplied) => {}
             Some(CacheOpStatusProto::Superseded) => {
@@ -458,6 +475,43 @@ fn completed_location(
     })
 }
 
+/// Bounded verbatim retry of the self-contained CacheCommit RPC (hard
+/// gate 3, RC `4ebcff5a`): retries transient RPC errors until the
+/// task-level timeout budget is spent or the task is canceled. The
+/// request is never mutated across attempts, so the master resolves an
+/// applied-but-response-lost commit as AlreadyApplied (or Superseded)
+/// from its durable outcome — never a second execution.
+async fn commit_with_retry<C, F, Fut>(
+    mut is_cancel: C,
+    timeout_ms: u64,
+    backoff_ms: u64,
+    mut attempt: F,
+) -> FsResult<curvine_proto::CacheCommitResponse>
+where
+    C: FnMut() -> bool,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = FsResult<curvine_proto::CacheCommitResponse>>,
+{
+    let start = LocalTime::mills();
+    loop {
+        match attempt().await {
+            Ok(resp) => return Ok(resp),
+            Err(e) => {
+                if is_cancel() {
+                    return err_box!(
+                        "cache commit retry aborted by task cancellation, last err: {}",
+                        e
+                    );
+                }
+                if LocalTime::mills() - start > timeout_ms {
+                    return Err(e);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            }
+        }
+    }
+}
+
 /// Fail-closed decode of the commit op status. The repo's prost codegen
 /// emits no `TryFrom<i32>` for proto2 enums, so this discriminated match
 /// restores that contract: a missing or unknown discriminator decodes to
@@ -478,9 +532,13 @@ fn cache_op_status(v: Option<i32>) -> Option<CacheOpStatusProto> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_op_status, completed_location};
+    use super::{cache_op_status, commit_with_retry, completed_location};
+    use curvine_error::FsError;
     use curvine_model::{BlockLocation, CommitBlock, StorageType};
-    use curvine_proto::{CacheBlockLocationProto, CacheOpStatusProto, WorkerAddressProto};
+    use curvine_proto::{
+        CacheBlockLocationProto, CacheCommitResponse, CacheOpStatusProto, WorkerAddressProto,
+    };
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     fn worker(id: u32) -> WorkerAddressProto {
         WorkerAddressProto {
@@ -554,5 +612,77 @@ mod tests {
 
         let err = completed_location(&planned, acked).unwrap_err().to_string();
         assert!(err.contains("unplanned worker 99"), "err: {}", err);
+    }
+
+    // ---- commit_with_retry fault seam (hard gate 3, RC `4ebcff5a`) ----
+    // A response-loss / transient RPC error must NOT fail the task while
+    // the retry budget lasts; the verbatim replay converges on the
+    // master's durable outcome.
+
+    #[tokio::test]
+    async fn commit_retry_converges_after_transient_failures() {
+        let attempts = AtomicU32::new(0);
+        let resp = commit_with_retry(
+            || false,
+            10_000,
+            1,
+            || {
+                let n = attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n < 2 {
+                        Err(FsError::common("injected transient rpc error"))
+                    } else {
+                        Ok(CacheCommitResponse::default())
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp, CacheCommitResponse::default());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn commit_retry_fails_loudly_after_budget() {
+        let attempts = AtomicU32::new(0);
+        let err = commit_with_retry(
+            || false,
+            20,
+            5,
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async { Err(FsError::common("commit endpoint down")) }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("commit endpoint down"),
+            "err: {}",
+            err
+        );
+        assert!(
+            attempts.load(Ordering::SeqCst) >= 2,
+            "budget must cover more than one attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_retry_stops_on_cancellation() {
+        let attempts = AtomicU32::new(0);
+        let err = commit_with_retry(
+            || true,
+            10_000,
+            1,
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async { Err(FsError::common("net")) }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("cancellation"), "err: {}", err);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 }
