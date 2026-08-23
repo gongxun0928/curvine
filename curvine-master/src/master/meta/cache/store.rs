@@ -31,9 +31,29 @@
 //! No in-memory entry table exists in Phase 1; every read hits the store.
 
 use crate::master::meta::cache::entry::{
-    CacheEntry, ExpiryRow, IncarnationPolicyRow, IncarnationRow, ObjectRow, OpOutcome, OpToken,
+    CacheEntry, ExpiryCursor, ExpiryRow, IncarnationPolicyRow, IncarnationRow, ObjectRow,
+    OpOutcome, OpToken,
 };
-use curvine_error::FsResult;
+use curvine_core_error::{err_msg, CommonError};
+use curvine_error::{FsError, FsResult};
+
+/// Hard upper bound for any single bounded scan page (4c.1). Every scan
+/// validates `1..=SCAN_HARD_CAP` at the boundary: a caller can never ask
+/// for an unbounded page, and every returned page holds at most `limit`
+/// rows with no lock held across pages.
+pub const SCAN_HARD_CAP: usize = 1024;
+
+/// Validate a scan page limit at the storage boundary (`1..=SCAN_HARD_CAP`).
+pub fn validate_scan_limit(limit: usize) -> FsResult<()> {
+    if limit == 0 || limit > SCAN_HARD_CAP {
+        return Err(FsError::from(CommonError::from(err_msg!(
+            "scan limit must be in 1..={}, got {}",
+            SCAN_HARD_CAP,
+            limit
+        ))));
+    }
+    Ok(())
+}
 
 /// Durable mutations for the CacheIndex, part of the local synchronous seam.
 /// All rows written through one batch commit atomically; a failed or
@@ -54,9 +74,25 @@ pub trait CacheWrite {
     /// superseded or reclaimed; stale rows are always safe to delete.
     fn delete_object(&mut self, object_id: i64) -> FsResult<()>;
 
+    /// Stale-safe CAS upsert into the ordered expiry index (4c.1): exactly
+    /// one current row exists per `(incarnation, key)` position. If the
+    /// committed row at this position already carries
+    /// `generation >= row.generation`, the write is a deterministic no-op —
+    /// a stale replay must never demote the index to an older version.
     fn put_expiry(&mut self, row: &ExpiryRow) -> FsResult<()>;
 
-    fn delete_expiry(&mut self, expire_at: i64, incarnation: u64, object_id: i64) -> FsResult<()>;
+    /// Stale-safe CAS delete (4c.1): removes the expiry index row at
+    /// `(expire_at, incarnation, key)` only while its committed
+    /// generation is `<= max_generation`; a newer overwrite that reused
+    /// the position makes the delete a no-op. Deleting a missing row is
+    /// always allowed (idempotent).
+    fn delete_expiry(
+        &mut self,
+        expire_at: i64,
+        incarnation: u64,
+        key: &str,
+        max_generation: u64,
+    ) -> FsResult<()>;
 
     /// Create/update an incarnation row. Incarnation rows are durable forever.
     fn put_incarnation(&mut self, incarnation: u64, row: IncarnationRow) -> FsResult<()>;
@@ -109,14 +145,42 @@ pub trait LocalCacheIndexStore {
     /// Reverse lookup: which entry version owns this object id.
     fn cache_get_object(&self, object_id: i64) -> FsResult<Option<ObjectRow>>;
 
-    /// Bounded scan of expiry rows with `expire_at <= now`, ascending.
-    fn cache_scan_expiry(&self, now: i64, limit: usize) -> FsResult<Vec<ExpiryRow>>;
+    /// Bounded, resumable scan of expiry rows with `expire_at <= now`, in
+    /// deterministic `(expire_at, incarnation, key)` index order, starting
+    /// strictly after `after` (None = from the beginning). Rows sharing an
+    /// `expire_at` page stably by `(incarnation, key)`. `limit` is
+    /// validated `1..=SCAN_HARD_CAP`.
+    fn cache_scan_expiry(
+        &self,
+        now: i64,
+        after: Option<&ExpiryCursor>,
+        limit: usize,
+    ) -> FsResult<Vec<ExpiryRow>>;
 
-    /// Bounded, resumable scan of entry rows of one incarnation, in key
-    /// order, starting strictly after `after` (None = from the beginning).
+    /// Bounded, resumable scan of entry rows of one incarnation (the Mount
+    /// scope), in key order, starting strictly after `after` (None = from
+    /// the beginning). `limit` is validated `1..=SCAN_HARD_CAP`.
     fn cache_scan_entries(
         &self,
         incarnation: u64,
+        after: Option<&str>,
+        limit: usize,
+    ) -> FsResult<Vec<(String, CacheEntry)>>;
+
+    /// Bounded, resumable Prefix-scope scan (4c.1). `scope` is a
+    /// mount-relative path: `/a` matches exactly `/a` and every descendant
+    /// `/a/...`, never `/ab` — membership is judged only by
+    /// [`key_in_scope`](crate::master::meta::cache::key_in_scope) on
+    /// decoded keys, never by RocksDB byte-prefix bounds (`encode_key` is
+    /// deliberately not component-safe). The Key scope is the point read
+    /// `cache_get_entry`; the Mount scope is `cache_scan_entries`. Starts
+    /// strictly after `after` (None = from the scope itself) and stops as
+    /// soon as iteration passes the scope's whole key family, so a page
+    /// never scans unrelated keys beyond the boundary.
+    fn cache_scan_entries_in_scope(
+        &self,
+        incarnation: u64,
+        scope: &str,
         after: Option<&str>,
         limit: usize,
     ) -> FsResult<Vec<(String, CacheEntry)>>;

@@ -996,7 +996,12 @@ impl CacheManager {
         let mut w = store.cache_write();
         w.put_entry(incarnation, key, &new).map_err(cv)?;
         if cur.expire_at > 0 {
-            w.delete_expiry(cur.expire_at, incarnation, cur.object_id)
+            // Stale-safe CAS delete (4c.1): the position is
+            // (expire_at, incarnation, key) and the row at it can only be
+            // this version's (cur.generation == expected_generation);
+            // a hypothetical newer overwrite at the same position must
+            // survive.
+            w.delete_expiry(cur.expire_at, incarnation, key, cur.generation)
                 .map_err(cv)?;
         }
         // The reverse row is only a GC hint for the superseded version.
@@ -1255,7 +1260,7 @@ mod tests {
             (300, 12345, 5000)
         );
         assert_eq!(committed.generation, 1);
-        let due = store.cache_scan_expiry(5000, 10).unwrap();
+        let due = store.cache_scan_expiry(5000, None, 10).unwrap();
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].key, "/a/b");
 
@@ -1314,7 +1319,10 @@ mod tests {
         let removed = store.cache_get_entry(1, "/a/b").unwrap().unwrap();
         assert_eq!(removed.state, CacheEntryState::Tombstoned);
         assert_eq!(removed.generation, 2);
-        assert!(store.cache_scan_expiry(100000, 10).unwrap().is_empty());
+        assert!(store
+            .cache_scan_expiry(100000, None, 10)
+            .unwrap()
+            .is_empty());
         assert!(store.cache_get_object(OBJ).unwrap().is_none());
 
         // Late commit against the superseded generation: terminal no-op

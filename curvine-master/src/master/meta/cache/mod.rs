@@ -22,9 +22,11 @@ pub mod manager;
 pub mod store;
 
 pub use self::entry::{
-    key_in_scope, CacheEntry, CacheEntryState, CasOutcome, ExpiryRow, IncarnationRow, ObjectRow,
-    OpOutcome, OpToken, TokenOutcome,
+    key_in_scope, CacheEntry, CacheEntryState, CasOutcome, ExpiryCursor, ExpiryRow, IncarnationRow,
+    ObjectRow, OpOutcome, OpToken, TokenOutcome,
 };
 pub use self::manager::{CacheManager, MAX_ISSUABLE_INCARNATION};
-pub use self::store::{state_tags, CacheWrite, LocalCacheIndexStore};
+pub use self::store::{
+    state_tags, validate_scan_limit, CacheWrite, LocalCacheIndexStore, SCAN_HARD_CAP,
+};
 pub use crate::master::meta::block_id::{BlockIdCodec, CacheBlockLayout, CacheObjectId};

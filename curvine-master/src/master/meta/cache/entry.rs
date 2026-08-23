@@ -34,8 +34,12 @@
 //!           or reclaimed by GC; only a reverse hint for GC.
 //!
 //! CF_CACHE_EXPIRY
-//!   key   = expire_at:i64 ++ mount_incarnation:u64 ++ object_id:i64
-//!   value = ExpiryRow {key, generation}
+//!   key   = expire_at:i64 ++ mount_incarnation:u64 ++ encoded_key
+//!           (deterministic (expire_at, incarnation, key) order, 4c.1;
+//!            exactly one current row per (incarnation, key) position —
+//!            same-position overwrites are generation-CAS'd, a stale
+//!            put/delete is a no-op)
+//!   value = (object_id:i64, generation:u64)
 //!   life  = written with a Valid entry carrying expire_at; deleted on
 //!           supersede/remove; stale rows no-op against the entry CAS.
 //!
@@ -102,8 +106,11 @@ pub struct ObjectRow {
     pub generation: u64,
 }
 
-/// Expiry row. The key is carried in the value because the reverse row may
-/// already be gone when a stale expiry row is scanned (contract §4 rev2).
+/// Expiry row. The ordered secondary index position is the full
+/// `(expire_at, incarnation, key)` triple (4c.1); the stored value carries
+/// `(object_id, generation)` so a scanned row identifies the exact entry
+/// version that produced it even after the reverse row is gone (contract
+/// §4 rev2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExpiryRow {
     pub expire_at: i64,
@@ -111,6 +118,29 @@ pub struct ExpiryRow {
     pub object_id: i64,
     pub key: String,
     pub generation: u64,
+}
+
+/// Exclusive continuation cursor for the ordered expiry index scan (4c.1):
+/// the position of the last row a page returned. The next page starts
+/// strictly after `(expire_at, incarnation, key)` in index order, so rows
+/// sharing an `expire_at` page deterministically by `(incarnation, key)`,
+/// and a cursor whose row has since been deleted still resumes with no
+/// skips and no duplicates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpiryCursor {
+    pub expire_at: i64,
+    pub incarnation: u64,
+    pub key: String,
+}
+
+impl From<&ExpiryRow> for ExpiryCursor {
+    fn from(row: &ExpiryRow) -> Self {
+        ExpiryCursor {
+            expire_at: row.expire_at,
+            incarnation: row.incarnation,
+            key: row.key.clone(),
+        }
+    }
 }
 
 /// Durable mount incarnation row. `mount_id` is a reusable routing id;
