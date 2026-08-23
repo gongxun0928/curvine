@@ -89,6 +89,7 @@ pub enum RpcCode {
     CacheCommit = 57,
     CacheInvalidate = 58,
     CacheRemove = 59,
+    CacheAbort = 61,
 
     // block interface.
     WriteBlock = 80,

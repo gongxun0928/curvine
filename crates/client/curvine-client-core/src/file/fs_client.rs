@@ -812,6 +812,32 @@ impl FsClient {
         self.rpc(RpcCode::CacheCommit, req).await
     }
 
+    /// Phase 3 recovery path: abort an in-flight cache load whose commit was
+    /// never issued (runner write failure / cancellation). Server resolves the
+    /// row identity from the load outcome and refuses the abort once the
+    /// shared commit token has a recorded outcome (commit may have landed).
+    pub async fn cache_abort(
+        &self,
+        load_token: CacheOpTokenId,
+        commit_token: CacheOpTokenId,
+        incarnation: u64,
+        key: &str,
+    ) -> FsResult<CacheAbortResponse> {
+        let req = CacheAbortRequest {
+            incarnation,
+            key: key.to_string(),
+            load_token: CacheOpTokenProto {
+                client_id: load_token.client_id,
+                op_seq: load_token.op_seq,
+            },
+            commit_token: CacheOpTokenProto {
+                client_id: commit_token.client_id,
+                op_seq: commit_token.op_seq,
+            },
+        };
+        self.rpc(RpcCode::CacheAbort, req).await
+    }
+
     pub async fn metrics_report(&self, metrics: Vec<MetricValue>) -> FsResult<()> {
         if metrics.is_empty() {
             return Ok(());

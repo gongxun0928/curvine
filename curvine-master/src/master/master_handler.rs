@@ -1076,6 +1076,32 @@ impl MasterHandler {
         })
     }
 
+    fn cache_abort(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let request: CacheAbortRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(request.key.to_string()), None);
+
+        let load_token = crate::master::meta::cache::OpToken {
+            client_id: request.load_token.client_id,
+            op_seq: request.load_token.op_seq,
+        };
+        let commit_token = crate::master::meta::cache::OpToken {
+            client_id: request.commit_token.client_id,
+            op_seq: request.commit_token.op_seq,
+        };
+        let status = self.fs.cache_service.abort(
+            ctx.msg.req_id(),
+            load_token,
+            commit_token,
+            request.incarnation,
+            &request.key,
+        )?;
+        let (status, current_generation) = Self::cache_op_status_to_pb(status);
+        ctx.response(CacheAbortResponse {
+            status: Some(status.into()),
+            current_generation,
+        })
+    }
+
     fn cache_remove(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let request: CacheRemoveRequest = ctx.parse_header()?;
         ctx.set_audit(Some(request.key.to_string()), None);
@@ -1355,6 +1381,7 @@ impl MessageHandler for MasterHandler {
                 RpcCode::CacheCommit => self.cache_commit(ctx),
                 RpcCode::CacheInvalidate => self.cache_invalidate(ctx),
                 RpcCode::CacheRemove => self.cache_remove(ctx),
+                RpcCode::CacheAbort => self.cache_abort(ctx),
 
                 RpcCode::MetricsReport => self.metrics_report(ctx),
 

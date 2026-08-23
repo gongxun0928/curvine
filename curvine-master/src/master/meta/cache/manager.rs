@@ -730,6 +730,16 @@ impl CacheManager {
         validate_incarnation(incarnation)?;
         Self::check_token(token)?;
 
+        // Abort first-winner (task #5 gate 2, gpt56 `21bb7129`): this
+        // load's commit token was consumed by a durable abort — the
+        // commit lost the race and is a terminal no-op (the row is
+        // Tombstoned by the abort; nothing may publish). Checked BEFORE
+        // the load binding so the abort outcome is authoritative history
+        // for this token, never divergence.
+        if let Some(OpOutcome::Aborted { .. }) = store.cache_get_outcome(token).map_err(cv)? {
+            return Ok(());
+        }
+
         // Load binding first: this commit may only land on the object its
         // allocate reserved (identity AND geometry), recorded under the
         // load token.
@@ -1015,6 +1025,195 @@ impl CacheManager {
         }
         // The reverse row is only a GC hint for the superseded version.
         w.delete_object(cur.object_id).map_err(cv)?;
+        w.commit().map_err(cv)?;
+        Ok(())
+    }
+
+    /// Durable load abort (task #5 gate 2, gpt56 `21bb7129`):
+    /// `Reserved@expected -> Tombstoned@new` for a load that failed
+    /// BEFORE its commit was issued, releasing the key for later
+    /// allocates. First-winner classification runs on the load's COMMIT
+    /// token — shared with `apply_commit`. Commit applied first
+    /// (recorded `Committed`) is a loud refusal — a Valid row is NEVER
+    /// removed by an abort; abort applied first (recorded `Aborted`)
+    /// makes a later commit of the same token a terminal no-op (see
+    /// `apply_commit`). The row CAS accepts ONLY an exact
+    /// `Reserved@expected` row with the load's object identity; a Valid
+    /// row at the fence is fail-closed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_abort<S: LocalCacheIndexStore>(
+        &self,
+        store: &S,
+        load_token: OpToken,
+        commit_token: OpToken,
+        incarnation: u64,
+        key: &str,
+        expected_generation: u64,
+        new_generation: u64,
+        expected_object_id: i64,
+    ) -> CommonResult<()> {
+        validate_incarnation(incarnation)?;
+        Self::check_token(load_token)?;
+        Self::check_token(commit_token)?;
+        if Some(new_generation) != expected_generation.checked_add(1) {
+            return err_box!(
+                "cache abort generations not adjacent: expected {}, new {}",
+                expected_generation,
+                new_generation
+            );
+        }
+
+        // First-winner classification on the SHARED commit token.
+        let aborted = OpOutcome::Aborted {
+            incarnation,
+            key: key.to_string(),
+            generation: expected_generation,
+            object_id: expected_object_id,
+            load_token,
+        };
+        match store.cache_get_outcome(commit_token).map_err(cv)? {
+            Some(recorded) => {
+                if recorded == aborted {
+                    return Ok(()); // exact abort replay: strict no-op
+                }
+                // A Committed outcome (or anything else) under this token
+                // means the commit side won the race: fail closed, the
+                // row is not ours to release.
+                return err_box!(
+                    "cache abort first-winner refusal for commit token {:?}: recorded {:?}, abort would record {:?}",
+                    commit_token,
+                    recorded,
+                    aborted
+                );
+            }
+            None => {
+                match store
+                    .cache_client_watermark(commit_token.client_id)
+                    .map_err(cv)?
+                {
+                    // Expired: another op already advanced the window and
+                    // the parameters are not trusted history. Terminal
+                    // no-op (mirrors the commit gate).
+                    Some(hw) if commit_token.op_seq <= hw => return Ok(()),
+                    _ => (),
+                }
+            }
+        }
+
+        // Load binding: the abort may only release its own allocation
+        // (identity AND geometry).
+        match store.cache_get_outcome(load_token).map_err(cv)? {
+            Some(OpOutcome::Allocated {
+                incarnation: out_inc,
+                key: out_key,
+                generation: out_gen,
+                object_id: out_obj,
+                ..
+            }) => {
+                if out_inc != incarnation
+                    || out_key != key
+                    || out_gen != expected_generation
+                    || out_obj != expected_object_id
+                {
+                    return err_box!(
+                        "cache abort does not match its load allocation: load token {:?} recorded ({}, {})@{} object {}, abort targets ({}, {})@{} object {}",
+                        load_token,
+                        out_inc,
+                        out_key,
+                        out_gen,
+                        out_obj,
+                        incarnation,
+                        key,
+                        expected_generation,
+                        expected_object_id
+                    );
+                }
+            }
+            other => {
+                return err_box!(
+                    "cache abort load token {:?} has no recorded allocation: {:?}",
+                    load_token,
+                    other
+                )
+            }
+        }
+
+        // Apply-time incarnation fence (4b): deterministic no-op.
+        if !Self::incarnation_active(store, incarnation)? {
+            return Ok(());
+        }
+
+        let cur = match store.cache_get_entry(incarnation, key).map_err(cv)? {
+            Some(v) => v,
+            None => return err_box!("cache abort for missing entry ({}, {})", incarnation, key),
+        };
+
+        // Later state already advanced past this abort: converge.
+        if cur.generation > new_generation {
+            return Ok(());
+        }
+        if cur.generation == new_generation {
+            if cur.state == CacheEntryState::Tombstoned {
+                return Ok(()); // already applied (or an equivalent fence)
+            }
+            return err_box!(
+                "cache abort replay divergence for ({}, {}): state {:?} at new generation {}",
+                incarnation,
+                key,
+                cur.state,
+                new_generation
+            );
+        }
+        if cur.generation != expected_generation {
+            return err_box!(
+                "cache abort CAS violation for ({}, {}): committed generation {} vs expected {}",
+                incarnation,
+                key,
+                cur.generation,
+                expected_generation
+            );
+        }
+        // Object identity CAS (contract §2.3).
+        if cur.object_id != expected_object_id {
+            return err_box!(
+                "cache abort object identity mismatch for ({}, {})@{}: committed object {} vs expected {}",
+                incarnation,
+                key,
+                cur.generation,
+                cur.object_id,
+                expected_object_id
+            );
+        }
+        // STRICTLY Reserved: an abort never removes a Valid (committed)
+        // row — that case is the apply-level first-winner fence.
+        if cur.state != CacheEntryState::Reserved {
+            return err_box!(
+                "cache abort CAS violation for ({}, {})@{}: committed state {:?} (only Reserved rows are abortable)",
+                incarnation,
+                key,
+                cur.generation,
+                cur.state
+            );
+        }
+
+        let new = CacheEntry {
+            generation: new_generation,
+            state: CacheEntryState::Tombstoned,
+            object_id: cur.object_id,
+            len: 0,
+            ufs_mtime: cur.ufs_mtime,
+            block_size: cur.block_size,
+            expire_at: 0,
+        };
+
+        let mut w = store.cache_write();
+        w.put_entry(incarnation, key, &new).map_err(cv)?;
+        // A Reserved row carries no expiry row (entry invariant), so no
+        // delete_expiry is needed; the reverse row is only a GC hint.
+        w.delete_object(cur.object_id).map_err(cv)?;
+        w.put_outcome(commit_token, &aborted).map_err(cv)?;
+        w.set_client_watermark(commit_token.client_id, commit_token.op_seq)
+            .map_err(cv)?;
         w.commit().map_err(cv)?;
         Ok(())
     }

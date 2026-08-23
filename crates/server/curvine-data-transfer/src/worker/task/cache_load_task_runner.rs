@@ -57,12 +57,18 @@ use curvine_proto::CacheOpStatusProto;
 use curvine_runtime::common::LocalTime;
 use curvine_unified_fs::{UfsFileSystem, UnifiedReader};
 use log::{error, info, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 const READ_CHUNK_BYTES: i64 = 16 * 1024 * 1024;
 
 /// Backoff between verbatim CacheCommit retries (hard gate 3).
 const COMMIT_RETRY_BACKOFF_MS: u64 = 1_000;
+
+/// Best-effort CacheAbort budget after a failed/canceled run whose
+/// commit was never issued (gate-2 escape, gpt56 `fca627f5`).
+const ABORT_RETRY_ATTEMPTS: u32 = 3;
+const ABORT_RETRY_BACKOFF_MS: u64 = 500;
 
 pub struct CacheLoadTaskRunner {
     task: Arc<TaskContext>,
@@ -244,15 +250,30 @@ impl CacheLoadTaskRunner {
             }
         };
 
-        let (commit, evidence) = drive_cache_load(
+        // gpt56 `21bb7129`: set by `drive_cache_load` BEFORE the first
+        // commit send and never reset. Once a commit may have reached
+        // the master its outcome is unknown and the failure path MUST
+        // NOT abort the load's Reserved row (the server-side
+        // commit-token first-winner guard is the backstop).
+        let commit_issued = AtomicBool::new(false);
+        let (commit, evidence) = match drive_cache_load(
             || self.task.is_cancel(),
             self.task_timeout_ms,
             COMMIT_RETRY_BACKOFF_MS,
+            &commit_issued,
             allocate,
             write,
             commit,
         )
-        .await?;
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                self.abort_reserved_row(&client, &spec, &commit_issued)
+                    .await;
+                return Err(e);
+            }
+        };
         match cache_op_status(commit.status) {
             Some(CacheOpStatusProto::Applied) | Some(CacheOpStatusProto::AlreadyApplied) => {}
             Some(CacheOpStatusProto::Superseded) => {
@@ -268,6 +289,8 @@ impl CacheLoadTaskRunner {
             // drive_cache_load loops on ReplanNeeded and never surfaces
             // it; treat a leak-through as uninterpretable, fail closed.
             Some(CacheOpStatusProto::ReplanNeeded) => {
+                self.abort_reserved_row(&client, &spec, &commit_issued)
+                    .await;
                 return err_box!(
                     "cache commit returned REPLAN_NEEDED past the recovery loop: {}",
                     self.log_context()
@@ -276,6 +299,10 @@ impl CacheLoadTaskRunner {
             // Missing or unknown discriminator: the commit outcome is not
             // interpretable — fail closed instead of assuming Applied.
             None => {
+                // Uninterpretable outcome: `commit_issued` is already
+                // set, so this never aborts — recorded for symmetry.
+                self.abort_reserved_row(&client, &spec, &commit_issued)
+                    .await;
                 return err_box!(
                     "cache commit returned unrecognized status {:?}: {}",
                     commit.status,
@@ -505,6 +532,58 @@ impl CacheLoadTaskRunner {
             .await
     }
 
+    /// Durable escape for the gate-2 wedge (gpt56 `fca627f5`): a failed
+    /// or canceled run may leave the master's cache row Reserved under
+    /// this load's token, permanently refusing new allocations of the
+    /// key. When — and ONLY when — no commit was ever issued, tombstone
+    /// the row via CacheAbort (bounded retries, log-only failure). Once
+    /// `commit_issued` is set this is a no-op: the server-side
+    /// commit-token first-winner guard (`21bb7129`) is the backstop, the
+    /// flag is the primary fence.
+    async fn abort_reserved_row(
+        &self,
+        client: &curvine_client_core::file::FsClient,
+        spec: &CacheLoadSpec,
+        commit_issued: &AtomicBool,
+    ) {
+        let context = self.log_context();
+        let outcome = best_effort_abort_after_failure(
+            commit_issued,
+            ABORT_RETRY_ATTEMPTS,
+            ABORT_RETRY_BACKOFF_MS,
+            || async {
+                let _ = client
+                    .cache_abort(
+                        spec.load_token,
+                        spec.commit_token,
+                        spec.incarnation,
+                        &spec.key,
+                    )
+                    .await?;
+                // Applied / AlreadyApplied / Superseded are all terminal
+                // for the Reserved-at-fence this runner could own: the
+                // key is allocatable again (or owned by a fresher
+                // winner).
+                Ok(())
+            },
+        )
+        .await;
+        match outcome {
+            AbortOutcome::Aborted => info!(
+                "cache load Reserved row aborted after failed run: {}",
+                context
+            ),
+            AbortOutcome::Forbidden => info!(
+                "cache load commit outcome unknown; abort of Reserved row forbidden: {}",
+                context
+            ),
+            AbortOutcome::Exhausted => error!(
+                "cache load abort retries exhausted; Reserved row left for TTL sweep/manual reclaim: {}",
+                context
+            ),
+        }
+    }
+
     async fn finish_canceled(&self) -> FsResult<bool> {
         let progress = self.task.set_canceled("task canceled");
         if let Err(err) = self.report_progress(progress).await {
@@ -546,6 +625,7 @@ async fn drive_cache_load<C, A, AFut, W, WFut, K, KFut>(
     mut is_cancel: C,
     timeout_ms: u64,
     backoff_ms: u64,
+    commit_issued: &AtomicBool,
     mut allocate: A,
     mut write_round: W,
     mut commit: K,
@@ -566,6 +646,11 @@ where
             return err_box!("cache load aborted by task cancellation before commit");
         }
         let commit_resp = {
+            // Mark BEFORE the first send and never reset (gpt56
+            // `21bb7129`): a transport error after this point leaves
+            // the commit outcome unknown — aborting the Reserved row
+            // could tombstone a row the commit just published over.
+            commit_issued.store(true, Ordering::Release);
             let evidence = evidence.clone();
             commit_with_retry(&mut is_cancel, timeout_ms, backoff_ms, || {
                 commit(evidence.clone())
@@ -596,6 +681,49 @@ where
             }
         }
     }
+}
+
+/// Outcome of the post-failure best-effort abort decision.
+#[derive(Debug, PartialEq, Eq)]
+enum AbortOutcome {
+    /// Abort was warranted (no commit ever issued) and the master
+    /// accepted it (Applied / AlreadyApplied / Superseded).
+    Aborted,
+    /// A commit was issued at least once — its outcome may be unknown;
+    /// aborting is forbidden (gpt56 `fca627f5` / `21bb7129`).
+    Forbidden,
+    /// Abort was warranted but every bounded attempt failed; the row is
+    /// left for the TTL sweep / manual reclaim (loud, never silent).
+    Exhausted,
+}
+
+/// Decision core for the gate-2 durable escape: attempt the abort ONLY
+/// while no commit was ever issued, with a small bounded retry budget.
+/// Closure-generic so the runner seam (abort iff `!commit_issued`,
+/// including after a commit transport error) is unit-testable.
+async fn best_effort_abort_after_failure<F, Fut>(
+    commit_issued: &AtomicBool,
+    attempts: u32,
+    backoff_ms: u64,
+    mut send: F,
+) -> AbortOutcome
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = FsResult<()>>,
+{
+    if commit_issued.load(Ordering::Acquire) {
+        return AbortOutcome::Forbidden;
+    }
+    for attempt in 1..=attempts {
+        match send().await {
+            Ok(()) => return AbortOutcome::Aborted,
+            Err(_) if attempt == attempts => return AbortOutcome::Exhausted,
+            Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            }
+        }
+    }
+    unreachable!("bounded loop always returns")
 }
 
 /// Assembles the commit evidence for one block from the writer's ACTUAL
@@ -697,7 +825,7 @@ mod tests {
     use curvine_proto::{
         CacheBlockLocationProto, CacheCommitResponse, CacheOpStatusProto, WorkerAddressProto,
     };
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     fn worker(id: u32) -> WorkerAddressProto {
         WorkerAddressProto {
@@ -855,7 +983,7 @@ mod tests {
     // plan, and rebuild the evidence; an applied commit (response loss)
     // must converge commit-side only and NEVER re-allocate.
 
-    use super::{drive_cache_load, CommitEvidence};
+    use super::{best_effort_abort_after_failure, drive_cache_load, AbortOutcome, CommitEvidence};
     use curvine_proto::CacheAllocateResponse;
 
     fn resp_with_status(s: i32) -> CacheCommitResponse {
@@ -886,10 +1014,12 @@ mod tests {
         let commits = AtomicU32::new(0);
         let committed_rounds = std::sync::Mutex::new(Vec::new());
 
+        let commit_issued = AtomicBool::new(false);
         let (resp, evidence) = drive_cache_load(
             || false,
             10_000,
             1,
+            &commit_issued,
             || {
                 allocs.fetch_add(1, Ordering::SeqCst);
                 async {
@@ -945,10 +1075,12 @@ mod tests {
         let rounds = AtomicU32::new(0);
         let attempts = AtomicU32::new(0);
 
+        let commit_issued = AtomicBool::new(false);
         let (resp, _evidence) = drive_cache_load(
             || false,
             10_000,
             1,
+            &commit_issued,
             || {
                 allocs.fetch_add(1, Ordering::SeqCst);
                 async {
@@ -995,10 +1127,12 @@ mod tests {
     #[tokio::test]
     async fn drive_replan_budget_exhaustion_is_loud() {
         let allocs = AtomicU32::new(0);
+        let commit_issued = AtomicBool::new(false);
         let err = drive_cache_load(
             || false,
             30,
             1,
+            &commit_issued,
             || {
                 allocs.fetch_add(1, Ordering::SeqCst);
                 async {
@@ -1019,5 +1153,111 @@ mod tests {
             allocs.load(Ordering::SeqCst) >= 2,
             "at least one full replan round before the budget error"
         );
+    }
+
+    // gpt56 `fca627f5` gate-2 runner seam: abort is warranted ONLY when
+    // no commit was ever issued — including after a commit transport
+    // error, where the outcome is unknown and aborting could tombstone a
+    // row the (lost-response) commit just published over.
+
+    #[tokio::test]
+    async fn drive_marks_commit_issued_before_first_send_even_on_transport_err() {
+        let commit_issued = AtomicBool::new(false);
+        let flag_at_entry = std::sync::Mutex::new(Vec::new());
+        let err = drive_cache_load(
+            || false,
+            20,
+            1,
+            &commit_issued,
+            || async {
+                Ok(CacheAllocateResponse {
+                    object_id: 5,
+                    generation: 1,
+                    blocks: Vec::new(),
+                })
+            },
+            |_alloc| async move { Ok(round_evidence(1)) },
+            |_ev| {
+                flag_at_entry
+                    .lock()
+                    .unwrap()
+                    .push(commit_issued.load(Ordering::Acquire));
+                async move { Err(FsError::common("injected commit transport loss")) }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("commit transport loss"),
+            "err: {}",
+            err
+        );
+        assert!(
+            !flag_at_entry.lock().unwrap().is_empty(),
+            "commit was attempted"
+        );
+        assert!(
+            flag_at_entry.lock().unwrap().iter().all(|v| *v),
+            "flag must be set BEFORE every commit send, observed: {:?}",
+            flag_at_entry.lock().unwrap()
+        );
+        // After the transport error the flag stays set: abort forbidden.
+        let sends = AtomicU32::new(0);
+        let outcome = best_effort_abort_after_failure(&commit_issued, 3, 1, || {
+            sends.fetch_add(1, Ordering::SeqCst);
+            async { Ok(()) }
+        })
+        .await;
+        assert_eq!(outcome, AbortOutcome::Forbidden);
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn abort_is_attempted_after_write_failure_with_no_commit_issued() {
+        let commit_issued = AtomicBool::new(false);
+        let err = drive_cache_load(
+            || false,
+            10_000,
+            1,
+            &commit_issued,
+            || async {
+                Ok(CacheAllocateResponse {
+                    object_id: 5,
+                    generation: 1,
+                    blocks: Vec::new(),
+                })
+            },
+            |_alloc| async move { Err(FsError::common("injected worker write failure")) },
+            |_ev| async move { Ok(resp_with_status(1)) },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("worker write failure"),
+            "err: {}",
+            err
+        );
+        assert!(!commit_issued.load(Ordering::Acquire));
+        let sends = AtomicU32::new(0);
+        let outcome = best_effort_abort_after_failure(&commit_issued, 3, 1, || {
+            sends.fetch_add(1, Ordering::SeqCst);
+            async { Ok(()) }
+        })
+        .await;
+        assert_eq!(outcome, AbortOutcome::Aborted);
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn abort_retry_budget_is_bounded_and_loud() {
+        let commit_issued = AtomicBool::new(false);
+        let sends = AtomicU32::new(0);
+        let outcome = best_effort_abort_after_failure(&commit_issued, 3, 1, || {
+            sends.fetch_add(1, Ordering::SeqCst);
+            async { Err(FsError::common("master unreachable")) }
+        })
+        .await;
+        assert_eq!(outcome, AbortOutcome::Exhausted);
+        assert_eq!(sends.load(Ordering::SeqCst), 3);
     }
 }

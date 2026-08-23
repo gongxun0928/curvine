@@ -275,6 +275,21 @@ pub enum OpOutcome {
         mount_id: u32,
         ttl_ms: i64,
     },
+    /// Per-key load abort (task #5 gate 2): `Reserved@g -> Tombstoned@g+1`
+    /// after a pre-commit load failure. The abort records its outcome
+    /// under the load's COMMIT token — the shared first-winner token of
+    /// Commit/Abort (gpt56 `21bb7129`): a commit that applied first keeps
+    /// its Committed outcome and the abort is refused; an abort that
+    /// applied first makes any later commit of the same token a terminal
+    /// no-op. Appended at the enum tail so earlier outcome bytes keep
+    /// decoding.
+    Aborted {
+        incarnation: u64,
+        key: String,
+        generation: u64,
+        object_id: i64,
+        load_token: OpToken,
+    },
 }
 
 /// Terminal result of a token-indexed idempotent operation. `Expired` is

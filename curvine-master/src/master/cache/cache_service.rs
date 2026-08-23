@@ -64,9 +64,10 @@
 use crate::master::fs::policy::ChooseContext;
 use crate::master::fs::WorkerManager;
 use crate::master::journal::{
-    CacheAllocateEntry, CacheCommitEntry, CacheIdReserveEntry, CacheIncarnationAllocateV2Entry,
-    CacheIncarnationRevokeEntry, CacheOutcomeGcEntry, CacheRemoveEntry, CacheScopeRemoveEntry,
-    CacheTtlSweepEntry, CacheVacuumEntry, JournalEntry, JournalWriter,
+    CacheAbortEntry, CacheAllocateEntry, CacheCommitEntry, CacheIdReserveEntry,
+    CacheIncarnationAllocateV2Entry, CacheIncarnationRevokeEntry, CacheOutcomeGcEntry,
+    CacheRemoveEntry, CacheScopeRemoveEntry, CacheTtlSweepEntry, CacheVacuumEntry, JournalEntry,
+    JournalWriter,
 };
 use crate::master::meta::cache::entry::{
     CacheEntry, CacheEntryState, ExpiryCursor, ExpiryRow, OpOutcome, OpToken, OutcomeGcGroup,
@@ -2954,6 +2955,277 @@ impl CacheService {
             }
             other => err_box!(
                 "cache invalidate barrier readback failed for ({}, {}): {:?}",
+                incarnation,
+                key,
+                other
+            ),
+        }
+    }
+
+    /// Runner-side durable escape for a load that failed BEFORE its
+    /// commit was issued (task #5 gate 2, gpt56 `fca627f5`): the
+    /// allocate persisted a Reserved row, and without an abort that row
+    /// would wedge the key forever (allocate only accepts None/Tombstoned
+    /// rows). The expected generation/object_id are resolved from the
+    /// durable load outcome — never client-supplied — and the abort is
+    /// REFUSED fail-closed when the load's commit token already has a
+    /// recorded (applied) outcome: a commit that may have applied must be
+    /// resolved by its own verbatim retry, never aborted underneath.
+    pub fn abort(
+        &self,
+        rpc_id: i64,
+        load_token: OpToken,
+        commit_token: OpToken,
+        incarnation: u64,
+        key: &str,
+    ) -> CommonResult<CacheOpStatus> {
+        self.require_enabled()?;
+        self.require_leader()?;
+        validate_key(key)?;
+        validate_client_token(load_token)?;
+        validate_client_token(commit_token)?;
+        if load_token.client_id != commit_token.client_id {
+            return err_box!(
+                "cache abort token domain mismatch: load {:?} vs commit {:?}",
+                load_token,
+                commit_token
+            );
+        }
+        // Incarnation gate first: a revoked/stale namespace is terminal.
+        if !self.incarnation_active(incarnation)? {
+            return Err(Self::fenced(incarnation));
+        }
+
+        // Load binding: the abort may only release the row its own
+        // allocate reserved, resolved from the durable outcome (never a
+        // client-supplied identity).
+        let (expected_generation, expected_object_id) = {
+            let store = self.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            match rocks.cache_get_outcome(load_token).map_err(fs_err)? {
+                Some(OpOutcome::Allocated {
+                    incarnation: out_inc,
+                    key: out_key,
+                    generation,
+                    object_id,
+                    ..
+                }) => {
+                    if out_inc != incarnation || out_key != key {
+                        return err_box!(
+                            "cache abort load token {:?} recorded ({}, {}) but abort says ({}, {})",
+                            load_token,
+                            out_inc,
+                            out_key,
+                            incarnation,
+                            key
+                        );
+                    }
+                    (generation, object_id)
+                }
+                _other => {
+                    // No recorded allocation: this load never reserved
+                    // anything (a Reserved row on the key, if any, belongs
+                    // to another load and must not be touched). Terminal
+                    // no-op classified from the live row.
+                    let cur = rocks.cache_get_entry(incarnation, key).map_err(fs_err)?;
+                    return Ok(CacheOpStatus::Superseded {
+                        expected: 0,
+                        current: cur.map(|c| c.generation).unwrap_or(0),
+                    });
+                }
+            }
+        };
+        let new_generation = expected_generation
+            .checked_add(1)
+            .ok_or_else(|| cm_err("cache abort generation overflow: entry is terminal"))?;
+
+        // Commit-outcome guard (gpt56 gate-#2 constraint): a recorded
+        // Committed outcome means the load's commit applied (outcome
+        // eviction keeps the row at the client watermark), so the entry
+        // may be Valid — aborting underneath it is refused fail-closed.
+        // A recorded Aborted outcome for THIS load is the abort's own
+        // durable record (the commit token is the shared first-winner
+        // token): the replay continues to the row classification, which
+        // resolves AlreadyApplied from the tombstoned fence.
+        {
+            let store = self.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            if let Some(outcome) = rocks.cache_get_outcome(commit_token).map_err(fs_err)? {
+                let own_abort = matches!(
+                    &outcome,
+                    OpOutcome::Aborted {
+                        incarnation: out_inc,
+                        key: out_key,
+                        generation: out_gen,
+                        object_id: out_obj,
+                        load_token: out_load,
+                    }
+                        if *out_inc == incarnation
+                            && out_key == key
+                            && *out_gen == expected_generation
+                            && *out_obj == expected_object_id
+                            && *out_load == load_token
+                );
+                if !own_abort {
+                    return err_box!(
+                        "cache abort for load {:?} refused: its commit token {:?} has a recorded outcome (the commit may have applied — resolve it with a verbatim commit retry): {:?}",
+                        load_token,
+                        commit_token,
+                        outcome
+                    );
+                }
+            }
+        }
+
+        // Row classification before the propose.
+        {
+            let store = self.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            match rocks.cache_get_entry(incarnation, key).map_err(fs_err)? {
+                None => {
+                    // Vacuumed while the load held it: nothing to release.
+                    drop(store);
+                    self.lock_volatile().plans.remove(&load_token);
+                    return Ok(CacheOpStatus::Superseded {
+                        expected: new_generation,
+                        current: 0,
+                    });
+                }
+                Some(cur) if cur.generation == new_generation => {
+                    if cur.state == CacheEntryState::Tombstoned
+                        && cur.object_id == expected_object_id
+                    {
+                        // Idempotent abort replay: the fence already
+                        // applied; just re-run the terminal cleanup.
+                        drop(store);
+                        self.retire_object_state(incarnation, expected_object_id, None)?;
+                        self.lock_volatile().plans.remove(&load_token);
+                        return Ok(CacheOpStatus::AlreadyApplied);
+                    }
+                    return err_box!(
+                        "cache abort replay divergence for ({}, {})@{}: state {:?} object {} (expected {})",
+                        incarnation,
+                        key,
+                        cur.generation,
+                        cur.state,
+                        cur.object_id,
+                        expected_object_id
+                    );
+                }
+                Some(cur) if cur.generation == expected_generation => {
+                    if cur.object_id != expected_object_id {
+                        return err_box!(
+                            "cache abort identity mismatch for ({}, {})@{}: committed object {} vs load allocation {}",
+                            incarnation,
+                            key,
+                            cur.generation,
+                            cur.object_id,
+                            expected_object_id
+                        );
+                    }
+                    match cur.state {
+                        CacheEntryState::Reserved => (), // the wedge to release
+                        CacheEntryState::Valid => {
+                            // Contradicts the commit-outcome guard (a
+                            // Valid row implies an applied commit): someone
+                            // else wrote this generation — refuse.
+                            return err_box!(
+                                "cache abort for ({}, {})@{} refused: row is already committed (Valid)",
+                                incarnation,
+                                key,
+                                cur.generation
+                            );
+                        }
+                        other => {
+                            return err_box!(
+                                "cache abort for ({}, {})@{} refused: row state {:?}",
+                                incarnation,
+                                key,
+                                cur.generation,
+                                other
+                            );
+                        }
+                    }
+                }
+                Some(cur) if cur.generation > new_generation => {
+                    // Someone else fenced far past this load: it is dead,
+                    // nothing of ours to release.
+                    drop(store);
+                    self.lock_volatile().plans.remove(&load_token);
+                    return Ok(CacheOpStatus::Superseded {
+                        expected: new_generation,
+                        current: cur.generation,
+                    });
+                }
+                Some(cur) => {
+                    // Between our fence generations: another mutation took
+                    // new_generation, or the row is behind the load's
+                    // allocation — both are divergence, not silent pass.
+                    return err_box!(
+                        "cache abort generation divergence for ({}, {}): row {}@{:?} vs load allocation {}@{}",
+                        incarnation,
+                        key,
+                        cur.object_id,
+                        cur.generation,
+                        expected_object_id,
+                        expected_generation
+                    );
+                }
+            }
+        }
+
+        // Dedicated durable abort entry (gpt56 `21bb7129`): the commit
+        // token is the shared first-winner token of Commit/Abort, and the
+        // apply CAS accepts ONLY an exact Reserved row — the apply layer
+        // (not just this precheck) refuses to remove a committed row.
+        let op_id = self.fs_dir.read().next_op_id();
+        let entry = JournalEntry::CacheAbort(CacheAbortEntry {
+            op_id,
+            rpc_id,
+            load_token,
+            commit_token,
+            incarnation,
+            key: key.to_string(),
+            expected_generation,
+            new_generation,
+            expected_object_id,
+        });
+        self.journal_writer
+            .sync_propose_cache(entry)
+            .map_err(fs_err)?;
+        self.fire_barrier_hook();
+
+        if !self.incarnation_active(incarnation)? {
+            return Err(Self::fenced(incarnation));
+        }
+
+        // Readback from committed state, re-classified from the row and
+        // the durable outcome.
+        let store = self.fs_dir.read();
+        let rocks = store.get_rocks_store();
+        let cur = rocks.cache_get_entry(incarnation, key).map_err(fs_err)?;
+        match cur {
+            Some(cur)
+                if cur.state == CacheEntryState::Tombstoned
+                    && cur.generation == new_generation
+                    && cur.object_id == expected_object_id =>
+            {
+                drop(store);
+                self.retire_object_state(incarnation, expected_object_id, None)?;
+                self.lock_volatile().plans.remove(&load_token);
+                Ok(CacheOpStatus::Applied)
+            }
+            Some(cur) if cur.generation > new_generation => {
+                let current = cur.generation;
+                drop(store);
+                self.lock_volatile().plans.remove(&load_token);
+                Ok(CacheOpStatus::Superseded {
+                    expected: new_generation,
+                    current,
+                })
+            }
+            other => err_box!(
+                "cache abort barrier readback failed for ({}, {}): {:?}",
                 incarnation,
                 key,
                 other
@@ -6495,6 +6767,291 @@ mod tests {
             "re-commit must reach the raft barrier: {}",
             err
         );
+    }
+
+    /// Gate-2 red test (gpt56 `fca627f5`): task A's allocate persists a
+    /// Reserved row, the runner's write fails before ANY commit, and the
+    /// abort releases the row — after which task B (a NEW token on the
+    /// same key) passes the row gate instead of wedging on "only None or
+    /// Tombstoned rows allocate", and CacheGet has no Valid hit.
+    #[test]
+    fn test_abort_releases_reserved_row_and_reopens_the_key() {
+        let service = build_service("abort-reopens-key", chooser(vec![worker(1)]));
+        seed_sessions(&service, &[worker(1)]);
+        mount_incarnation(&service, 1, 0);
+        // Task A: durable Reserved row + recorded load outcome (what
+        // apply_allocate leaves behind after the raft barrier).
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let mgr = &store.cache;
+            mgr.apply_id_reserve(rocks, token(1, 1), OBJ, OBJ + 100)
+                .unwrap();
+            let alloc = CacheEntry {
+                generation: 1,
+                state: CacheEntryState::Reserved,
+                object_id: OBJ,
+                len: 0,
+                ufs_mtime: 0,
+                block_size: 64,
+                expire_at: 0,
+            };
+            mgr.apply_allocate(rocks, token(31, 1), 1, "/k", 130, &alloc)
+                .unwrap();
+        }
+
+        // The abort passes every service precheck and reaches the raft
+        // barrier (fail-closed "raft" Err in this harness).
+        let err = service
+            .abort(7, token(31, 1), token(31, 2), 1, "/k")
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("raft"),
+            "abort must reach the raft barrier: {}",
+            err
+        );
+
+        // Simulate the barrier passing: the applied abort tombstones the
+        // Reserved row, records the Aborted outcome under the SHARED
+        // commit token, and advances the client watermark.
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            store
+                .cache
+                .apply_abort(rocks, token(31, 1), token(31, 2), 1, "/k", 1, 2, OBJ)
+                .unwrap();
+        }
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let row = rocks.cache_get_entry(1, "/k").unwrap().unwrap();
+            assert_eq!(row.state, CacheEntryState::Tombstoned);
+            assert_eq!(row.generation, 2);
+            assert!(matches!(
+                rocks.cache_get_outcome(token(31, 2)).unwrap(),
+                Some(OpOutcome::Aborted { .. })
+            ));
+        }
+        // No Valid hit for readers.
+        assert!(service.get(1, "/k", false).unwrap().is_none());
+
+        // Abort replay through the service: the tombstoned fence is
+        // AlreadyApplied (idempotent, plan cleared).
+        let lay = layout(OBJ, 130);
+        service.install_plan(token(31, 1), plan_for(&lay));
+        assert_eq!(
+            service
+                .abort(7, token(31, 1), token(31, 2), 1, "/k")
+                .unwrap(),
+            CacheOpStatus::AlreadyApplied
+        );
+        assert!(
+            !service
+                .state
+                .lock()
+                .unwrap()
+                .plans
+                .contains_key(&token(31, 1)),
+            "abort replay must clear the load's plan"
+        );
+        // And the applied replay is a strict no-op.
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            store
+                .cache
+                .apply_abort(rocks, token(31, 1), token(31, 2), 1, "/k", 1, 2, OBJ)
+                .unwrap();
+        }
+
+        // Task B: a NEW token on the same key passes the row gate — the
+        // failure is the harness raft barrier (id issuance), never the
+        // Reserved wedge.
+        let err = service
+            .allocate(token(32, 1), 7, 1, "/k", 130, 64)
+            .unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("raft"), "task B allocate: {}", msg);
+        assert!(
+            !msg.contains("only None or Tombstoned"),
+            "the key must be re-allocatable after the abort: {}",
+            msg
+        );
+    }
+
+    /// The commit-outcome guard (gpt56 `fca627f5`): once the load's
+    /// commit token has a recorded outcome the abort is refused BEFORE
+    /// the raft barrier — a commit that may have applied must be
+    /// resolved by its own verbatim retry, never aborted underneath.
+    #[test]
+    fn test_abort_refused_when_commit_outcome_recorded() {
+        let service = build_service("abort-refused", chooser(vec![worker(1)]));
+        mount_incarnation(&service, 1, 0);
+        // A fully applied commit: Valid row + Committed outcome under the
+        // commit token.
+        committed_entry(&service, token(41, 1), token(41, 2), "/k", OBJ, 130, 0);
+        let err = service
+            .abort(7, token(41, 1), token(41, 2), 1, "/k")
+            .unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("refused"),
+            "abort must be refused on a recorded commit outcome: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("raft"),
+            "refusal is at the guard, before the barrier: {}",
+            msg
+        );
+        // The Valid row survives untouched.
+        assert!(service.get(1, "/k", false).unwrap().is_some());
+    }
+
+    /// Apply-order race, commit-first (gpt56 `21bb7129`): both Commit and
+    /// Abort passed the service precheck, the Commit journal entry lands
+    /// first — the Abort apply MUST fail closed on the first-winner
+    /// classification and the Valid row is preserved (the generic-remove
+    /// TOCTOU is closed by the dedicated entry + shared commit token).
+    #[test]
+    fn test_apply_race_commit_first_keeps_valid_row() {
+        let service = build_service("race-commit-first", chooser(vec![worker(1)]));
+        mount_incarnation(&service, 1, 0);
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let mgr = &store.cache;
+            mgr.apply_id_reserve(rocks, token(1, 1), OBJ, OBJ + 100)
+                .unwrap();
+            let alloc = CacheEntry {
+                generation: 1,
+                state: CacheEntryState::Reserved,
+                object_id: OBJ,
+                len: 0,
+                ufs_mtime: 0,
+                block_size: 64,
+                expire_at: 0,
+            };
+            mgr.apply_allocate(rocks, token(51, 1), 1, "/k", 130, &alloc)
+                .unwrap();
+        }
+        // Commit lands first: Reserved@1 → Valid@1 with a Committed
+        // outcome under the shared commit token.
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            store
+                .cache
+                .apply_commit(
+                    rocks,
+                    token(51, 1),
+                    token(51, 2),
+                    1,
+                    "/k",
+                    1,
+                    OBJ,
+                    130,
+                    777,
+                    0,
+                )
+                .unwrap();
+        }
+        // The racing abort apply loses: fail-closed refusal, not a
+        // silent generic removal of the just-committed row.
+        let err = {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            store
+                .cache
+                .apply_abort(rocks, token(51, 1), token(51, 2), 1, "/k", 1, 2, OBJ)
+        }
+        .unwrap_err();
+        assert!(
+            format!("{}", err).contains("first-winner"),
+            "abort apply must refuse under a recorded commit outcome: {}",
+            err
+        );
+        // The Valid row survives: published data is never deleted.
+        assert!(service.get(1, "/k", false).unwrap().is_some());
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let row = rocks.cache_get_entry(1, "/k").unwrap().unwrap();
+            assert_eq!(row.state, CacheEntryState::Valid);
+            assert_eq!(row.generation, 1);
+        }
+    }
+
+    /// Apply-order race, abort-first (gpt56 `21bb7129`): the Abort entry
+    /// lands first — the row is Tombstoned@2 with an Aborted outcome
+    /// under the shared commit token, and the racing Commit apply is a
+    /// terminal no-op that must NOT publish over the tombstone.
+    #[test]
+    fn test_apply_race_abort_first_never_publishes() {
+        let service = build_service("race-abort-first", chooser(vec![worker(1)]));
+        mount_incarnation(&service, 1, 0);
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let mgr = &store.cache;
+            mgr.apply_id_reserve(rocks, token(1, 1), OBJ, OBJ + 100)
+                .unwrap();
+            let alloc = CacheEntry {
+                generation: 1,
+                state: CacheEntryState::Reserved,
+                object_id: OBJ,
+                len: 0,
+                ufs_mtime: 0,
+                block_size: 64,
+                expire_at: 0,
+            };
+            mgr.apply_allocate(rocks, token(61, 1), 1, "/k", 130, &alloc)
+                .unwrap();
+        }
+        // Abort lands first: Reserved@1 → Tombstoned@2, Aborted outcome
+        // under the shared commit token.
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            store
+                .cache
+                .apply_abort(rocks, token(61, 1), token(61, 2), 1, "/k", 1, 2, OBJ)
+                .unwrap();
+        }
+        // The racing commit apply is a terminal no-op (checked before
+        // the load binding), never a publish.
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            store
+                .cache
+                .apply_commit(
+                    rocks,
+                    token(61, 1),
+                    token(61, 2),
+                    1,
+                    "/k",
+                    1,
+                    OBJ,
+                    130,
+                    777,
+                    0,
+                )
+                .unwrap();
+        }
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let row = rocks.cache_get_entry(1, "/k").unwrap().unwrap();
+            assert_eq!(row.state, CacheEntryState::Tombstoned);
+            assert_eq!(row.generation, 2);
+            assert!(matches!(
+                rocks.cache_get_outcome(token(61, 2)).unwrap(),
+                Some(OpOutcome::Aborted { .. })
+            ));
+        }
+        assert!(service.get(1, "/k", false).unwrap().is_none());
     }
 
     /// A lost-response commit retry resolves to its recorded Committed

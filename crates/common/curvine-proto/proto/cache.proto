@@ -147,3 +147,30 @@ message CacheRemoveResponse {
     // Present when status = SUPERSEDED: the committed row generation.
     optional uint64 current_generation = 2;
 }
+
+// Runner-side durable escape for a load that failed BEFORE its commit
+// was issued (task #5 gate 2): CacheAllocate persists a Reserved row,
+// and a partial write failure without an abort would wedge the key
+// forever (the service only allocates on None/Tombstoned rows). The
+// expected generation/object_id are NOT client-supplied — the master
+// resolves them from the durable load outcome, so a forged id cannot
+// fence another object and the runner does not need to track identity
+// across replan rounds.
+message CacheAbortRequest {
+    required uint64 incarnation = 1;
+    required string key = 2;
+    // The load identity token from CacheAllocate (binds the abort to
+    // its allocate outcome).
+    required CacheOpTokenProto load_token = 3;
+    // The load's independent commit token: the abort is REFUSED
+    // fail-closed when this token already has a recorded (applied)
+    // commit outcome — a commit that may have applied must be resolved
+    // by its own retry, never aborted underneath.
+    required CacheOpTokenProto commit_token = 4;
+}
+
+message CacheAbortResponse {
+    optional CacheOpStatusProto status = 1 [default = APPLIED];
+    // Present when status = SUPERSEDED: the committed row generation.
+    optional uint64 current_generation = 2;
+}

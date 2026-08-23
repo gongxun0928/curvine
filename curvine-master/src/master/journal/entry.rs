@@ -399,6 +399,32 @@ pub struct CacheOutcomeGcEntry {
     pub(crate) groups: Vec<OutcomeGcGroup>,
 }
 
+/// Runner-side durable escape for a load that failed before its commit
+/// was issued (task #5 gate 2): `Reserved@g -> Tombstoned@g+1` so a
+/// partial write failure cannot wedge the key against later allocates.
+/// The commit token is the SHARED first-winner token of Commit/Abort
+/// (gpt56 `21bb7129`): whichever applies first records its outcome under
+/// it; the apply CAS accepts ONLY an exact Reserved row and never
+/// removes a Valid (committed) one.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct CacheAbortEntry {
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
+    /// The load identity token from the allocate; binds the abort to its
+    /// recorded Allocated outcome.
+    pub(crate) load_token: OpToken,
+    /// The load's independent commit token, doubling as the durable
+    /// first-winner token of this abort.
+    pub(crate) commit_token: OpToken,
+    pub(crate) incarnation: u64,
+    pub(crate) key: String,
+    pub(crate) expected_generation: u64,
+    pub(crate) new_generation: u64,
+    /// Object identity CAS (contract §2.3): resolved by the leader from
+    /// the load outcome — never client-supplied on the wire.
+    pub(crate) expected_object_id: i64,
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum JournalEntry {
     Mkdir(MkdirEntry),
@@ -431,6 +457,7 @@ pub enum JournalEntry {
     CacheTtlSweep(CacheTtlSweepEntry),
     CacheVacuum(CacheVacuumEntry),
     CacheOutcomeGc(CacheOutcomeGcEntry),
+    CacheAbort(CacheAbortEntry),
 }
 
 impl JournalEntry {
@@ -465,6 +492,7 @@ impl JournalEntry {
             JournalEntry::CacheTtlSweep(e) => e.op_id,
             JournalEntry::CacheVacuum(e) => e.op_id,
             JournalEntry::CacheOutcomeGc(e) => e.op_id,
+            JournalEntry::CacheAbort(e) => e.op_id,
         }
     }
 
@@ -499,6 +527,7 @@ impl JournalEntry {
             JournalEntry::CacheTtlSweep(e) => e.rpc_id,
             JournalEntry::CacheVacuum(e) => e.rpc_id,
             JournalEntry::CacheOutcomeGc(e) => e.rpc_id,
+            JournalEntry::CacheAbort(e) => e.rpc_id,
         }
     }
 
@@ -547,6 +576,7 @@ impl JournalEntry {
             | JournalEntry::CacheAllocate(_)
             | JournalEntry::CacheCommit(_)
             | JournalEntry::CacheRemove(_)
+            | JournalEntry::CacheAbort(_)
             | JournalEntry::CacheIncarnationAllocateV2(_)
             | JournalEntry::CacheScopeRemove(_)
             | JournalEntry::CacheTtlSweep(_)
@@ -577,6 +607,7 @@ impl JournalEntry {
                 | JournalEntry::CacheAllocate(_)
                 | JournalEntry::CacheCommit(_)
                 | JournalEntry::CacheRemove(_)
+                | JournalEntry::CacheAbort(_)
                 | JournalEntry::CacheIncarnationAllocateV2(_)
                 | JournalEntry::CacheScopeRemove(_)
                 | JournalEntry::CacheTtlSweep(_)
@@ -1234,6 +1265,21 @@ mod tests {
                     groups: vec![],
                 }),
                 28,
+            ),
+            // Task #5 gate-2 append: durable load abort at the tail.
+            (
+                JournalEntry::CacheAbort(CacheAbortEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    load_token: token(),
+                    commit_token: token(),
+                    incarnation: 1,
+                    key: "/k".into(),
+                    expected_generation: 1,
+                    new_generation: 2,
+                    expected_object_id: crate::master::meta::cache::BlockIdCodec::CACHE_OBJECT_MIN,
+                }),
+                29,
             ),
         ];
 
