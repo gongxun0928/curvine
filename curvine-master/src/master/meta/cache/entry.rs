@@ -150,12 +150,18 @@ pub enum OpOutcome {
     },
     /// Per-key load commit (`Reserved@g -> Valid`): lets a lost-response
     /// commit retry resolve to its recorded result instead of re-judging
-    /// the already-advanced entry row.
+    /// the already-advanced entry row. Binds the FULL immutable request
+    /// (load token + geometry + fence): a token replayed with any
+    /// different parameter is divergence, never AlreadyApplied.
     Committed {
         incarnation: u64,
         key: String,
         generation: u64,
         object_id: i64,
+        load_token: OpToken,
+        len: i64,
+        ufs_mtime: i64,
+        expire_at: i64,
     },
 }
 

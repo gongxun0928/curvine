@@ -1063,7 +1063,7 @@ mod tests {
     use super::*;
     use crate::master::fs::{MasterFilesystem, WorkerManager};
     use crate::master::meta::cache::{
-        state_tags, BlockIdCodec, LocalCacheIndexStore, OpOutcome, OpToken,
+        state_tags, BlockIdCodec, CacheEntryState, LocalCacheIndexStore, OpOutcome, OpToken,
     };
     use crate::master::meta::inode::ttl::TtlBucketList;
     use crate::master::meta::store::RocksInodeStore;
@@ -1072,6 +1072,8 @@ mod tests {
     use crate::master::quota::eviction::EvictionConf;
     use crate::master::{MasterMonitor, MetaRaftJournal, SyncFsDir, SyncWorkerManager};
     use curvine_config::{ClusterConf, JournalConf, MasterConf};
+    use curvine_model::state::{WorkerAddress, WorkerStatus};
+    use curvine_model::WorkerInfo;
     use curvine_raft::raft::RoleMonitor;
     use curvine_runtime::common::{FileUtils, SerdeUtils, Utils};
     use curvine_runtime::sync::StateCtl;
@@ -1618,6 +1620,361 @@ mod tests {
         // destructors (loader/raft runtime/RocksDB), which is a graceful
         // shutdown, not the crash this fault test simulates. The crash point
         // is "immediately after the barrier response, before anything else".
+        std::process::exit(0);
+    }
+
+    /// Real single-voter Raft barrier coverage for the CacheService
+    /// allocate path (4a rework, real-barrier test gap): the FIRST
+    /// allocate reserves the first id segment and issues its first id
+    /// through the real `sync_propose_cache` barrier; a second allocate
+    /// consumes the SAME segment (exactly one reserve); a lost-response
+    /// retry of the same token resolves to the committed identity with a
+    /// regenerated plan; and an epoch change burns the live segment so
+    /// the next allocate reserves a fresh contiguous one under the new
+    /// epoch — the P0-1 regression: the reserve loop re-reads the epoch
+    /// every attempt and converges, it never burns forever.
+    #[test]
+    fn real_raft_allocate_segment_retry_and_epoch_burn() {
+        let leader_mode_env = "CURVINE_TEST_CACHE_ALLOC_LEADER";
+        let meta_dir_env = "CURVINE_TEST_CACHE_ALLOC_META_DIR";
+        let journal_dir_env = "CURVINE_TEST_CACHE_ALLOC_JOURNAL_DIR";
+
+        if std::env::var(leader_mode_env).is_ok() {
+            real_raft_allocate_lifetime(meta_dir_env, journal_dir_env);
+            return;
+        }
+
+        // Parent: fresh dirs, spawn the leader process on them, wait.
+        Master::init_test_metrics();
+        let base = Utils::cur_dir_sub(format!(
+            "../target/testing/real-raft-alloc-{}-{}",
+            std::process::id(),
+            Utils::rand_str(6)
+        ));
+        let meta_dir = format!("{}/meta", base);
+        let journal_dir = format!("{}/journal", base);
+        let _ = FileUtils::delete_path(&base, true);
+
+        let exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("master::journal::journal_loader::tests::real_raft_allocate_segment_retry_and_epoch_burn")
+            .env(leader_mode_env, "1")
+            .env(meta_dir_env, &meta_dir)
+            .env(journal_dir_env, &journal_dir)
+            .output()
+            .expect("spawn allocate-leader test process");
+        assert!(
+            output.status.success(),
+            "leader lifetime failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // cache_service::CACHE_RESERVE_SEGMENT (private there): the id
+        // segment length the leader reserves each time.
+        const SEG: i64 = 4096;
+        let min = BlockIdCodec::CACHE_OBJECT_MIN;
+        let conf = || {
+            let mut journal = JournalConf::with_test();
+            journal.enable = true;
+            journal.journal_dir = journal_dir.clone();
+            ClusterConf {
+                testing: true,
+                format_master: false,
+                journal,
+                master: MasterConf {
+                    meta_dir: meta_dir.clone(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        };
+
+        // Exactly the expected committed data entries: reserve#1,
+        // allocate /a, allocate /b, (same-token retry: no new entry),
+        // reserve#2 after the epoch burn, allocate /c.
+        {
+            let log_store = RocksLogStorage::from_conf(&conf().journal, false);
+            let last = log_store.read().last_index();
+            assert!(last >= 1, "journal log must exist after leader exit");
+            let entries = log_store.scan_entries(1, last + 1).unwrap();
+            drop(log_store);
+            let data_entries: Vec<Entry> = entries
+                .into_iter()
+                .filter(|e| e.get_entry_type() == EntryType::EntryNormal && !e.data.is_empty())
+                .collect();
+            assert_eq!(
+                data_entries.len(),
+                5,
+                "expected exactly reserve/alloc/reserve/alloc + alloc entries"
+            );
+        }
+
+        // Durable committed state: the burned segment's tail [MIN+1,
+        // MIN+SEG) is permanently lost, the new segment starts contiguous,
+        // and every issued identity is exactly as the leader observed.
+        {
+            let rocks = RocksInodeStore::new(conf().db_conf(), false).unwrap();
+            assert_eq!(
+                rocks.cache_get_state(state_tags::CACHE_OBJECT_ID).unwrap(),
+                Some(min + 2 * SEG - 1),
+                "two contiguous reserves [MIN, MIN+SEG) and [MIN+SEG, MIN+2*SEG)"
+            );
+            for (key, object_id) in [("/a", min), ("/b", min + 1), ("/c", min + SEG)] {
+                let entry = rocks.cache_get_entry(1, key).unwrap().expect("row");
+                assert_eq!(entry.state, CacheEntryState::Reserved, "{}", key);
+                assert_eq!(entry.generation, 1, "{}", key);
+                assert_eq!(entry.object_id, object_id, "{}", key);
+                assert_eq!(entry.len, 0, "{}", key);
+            }
+            for (op_seq, object_id) in [(1, min), (2, min + 1), (3, min + SEG)] {
+                match rocks
+                    .cache_get_outcome(OpToken {
+                        client_id: 9,
+                        op_seq,
+                    })
+                    .unwrap()
+                {
+                    Some(OpOutcome::Allocated { object_id: out, .. }) => {
+                        assert_eq!(out, object_id, "op_seq {}", op_seq)
+                    }
+                    other => panic!("op_seq {} outcome: {:?}", op_seq, other),
+                }
+            }
+            // The internal issuer client (id 0) performed exactly two
+            // reserves across the epoch burn.
+            assert_eq!(rocks.cache_client_watermark(0).unwrap(), Some(2));
+        }
+
+        let _ = FileUtils::delete_path(&base, true);
+    }
+
+    /// The leader lifetime for the allocate barrier test: a REAL
+    /// single-voter raft node (production writer, apply worker) with one
+    /// live worker registered, driving CacheService::allocate through the
+    /// full propose/apply barrier.
+    fn real_raft_allocate_lifetime(meta_dir_env: &str, journal_dir_env: &str) {
+        Master::init_test_metrics();
+        let meta_dir = std::env::var(meta_dir_env).unwrap();
+        let journal_dir = std::env::var(journal_dir_env).unwrap();
+
+        let mut journal = JournalConf::with_test();
+        journal.enable = true;
+        journal.journal_dir = journal_dir;
+        let conf = ClusterConf {
+            testing: true,
+            format_master: true,
+            journal,
+            master: MasterConf {
+                meta_dir,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let rt = conf.journal.create_runtime();
+        let log_store = RocksLogStorage::from_conf(&conf.journal, true);
+        let role_monitor = RoleMonitor::new();
+        let master_monitor = MasterMonitor::with_epoch(
+            role_monitor.read_ctl(),
+            StateCtl::new(0),
+            role_monitor.epoch_ctl(),
+        );
+
+        let client = RaftClient::from_conf(rt.clone(), &conf.journal);
+        let journal_writer = Arc::new(JournalWriter::new(false, client, &conf.journal).unwrap());
+
+        let ttl_bucket_list =
+            Arc::new(TtlBucketList::new(conf.master.ttl_bucket_interval_ms() as i64).unwrap());
+        let eviction_conf = EvictionConf::from_conf(&conf);
+        let evictor: Arc<dyn Evictor> = Arc::new(LRUEvictor::new(eviction_conf.clone()));
+        let fs_dir = SyncFsDir::new(
+            FsDir::new(&conf, journal_writer.clone(), ttl_bucket_list, evictor).unwrap(),
+        );
+        let fs = MasterFilesystem::new(
+            &conf,
+            fs_dir.clone(),
+            SyncWorkerManager::new(WorkerManager::new(&conf).unwrap()),
+            master_monitor,
+        )
+        .unwrap();
+        // Captured before the moves below: the epoch handle the raft layer
+        // advances on role transitions, and the cache service under test.
+        let epoch_ctl = role_monitor.epoch_ctl();
+        let cache = fs.cache_service.clone();
+
+        // One live worker so the production PolicyWorkerChooser can plan.
+        let mut worker = WorkerInfo::new(
+            WorkerAddress {
+                worker_id: 1,
+                ..Default::default()
+            },
+            1,
+        );
+        worker.status = WorkerStatus::Live;
+        worker.capacity = 1 << 30;
+        worker.available = 1 << 30;
+        fs.add_test_worker(worker);
+
+        let mount_manager = Arc::new(MountManager::new(fs.clone()));
+        let job_manager = Arc::new(JobManager::from_cluster_conf(
+            fs,
+            mount_manager.clone(),
+            rt.clone(),
+            &conf,
+        ));
+
+        let loader = JournalLoader::new(
+            rt.clone(),
+            fs_dir.clone(),
+            mount_manager,
+            &conf.journal,
+            job_manager,
+            log_store.clone(),
+            journal_writer.clone(),
+        )
+        .unwrap();
+        let raft = MetaRaftJournal::new(
+            rt.clone(),
+            log_store,
+            loader.clone(),
+            conf.journal.clone(),
+            role_monitor,
+        );
+        let mut listener = rt.block_on(raft.run()).unwrap();
+        rt.block_on(listener.wait_leader()).unwrap();
+
+        const SEG: i64 = 4096; // cache_service::CACHE_RESERVE_SEGMENT
+        let min = BlockIdCodec::CACHE_OBJECT_MIN;
+        let epoch_before = epoch_ctl.value();
+
+        // 1. First allocate: reserves [MIN, MIN+SEG) through the real
+        //    barrier and issues MIN.
+        let a = cache
+            .allocate(
+                OpToken {
+                    client_id: 9,
+                    op_seq: 1,
+                },
+                11,
+                1,
+                "/a",
+                128,
+                64,
+            )
+            .unwrap();
+        assert_eq!(a.object_id, min);
+        assert_eq!(a.generation, 1);
+        assert_eq!(a.blocks.len(), 2, "128 bytes at block size 64");
+        {
+            let store = fs_dir.read();
+            let rocks = store.get_rocks_store();
+            assert_eq!(
+                rocks.cache_get_state(state_tags::CACHE_OBJECT_ID).unwrap(),
+                Some(min + SEG - 1),
+                "first reserve must cover [MIN, MIN+SEG)"
+            );
+            let entry = rocks.cache_get_entry(1, "/a").unwrap().unwrap();
+            assert_eq!(entry.state, CacheEntryState::Reserved);
+            assert_eq!(entry.object_id, min);
+        }
+
+        // 2. Second allocate: same segment, next id, still ONE reserve.
+        let b = cache
+            .allocate(
+                OpToken {
+                    client_id: 9,
+                    op_seq: 2,
+                },
+                11,
+                1,
+                "/b",
+                64,
+                64,
+            )
+            .unwrap();
+        assert_eq!(
+            b.object_id,
+            min + 1,
+            "second id comes from the same segment"
+        );
+        {
+            let store = fs_dir.read();
+            let rocks = store.get_rocks_store();
+            assert_eq!(
+                rocks.cache_client_watermark(0).unwrap(),
+                Some(1),
+                "exactly one issuer reserve so far"
+            );
+        }
+
+        // 3. Lost-response retry: the same token resolves to the committed
+        //    identity, plan replayed — no new journal entry, no second id.
+        let a_retry = cache
+            .allocate(
+                OpToken {
+                    client_id: 9,
+                    op_seq: 1,
+                },
+                11,
+                1,
+                "/a",
+                128,
+                64,
+            )
+            .unwrap();
+        assert_eq!(a_retry.object_id, min);
+        assert_eq!(a_retry.generation, 1);
+        assert_eq!(
+            a_retry.blocks.len(),
+            2,
+            "re-plan must rebuild the placement"
+        );
+
+        // 4. Epoch crossing burns the segment: the next allocate re-reserves
+        //    contiguously under the NEW epoch. This is the exact P0-1
+        //    regression — the loop must re-read the epoch per attempt, not
+        //    keep comparing (and burning) against a stale one forever.
+        epoch_ctl.advance();
+        assert_ne!(
+            epoch_ctl.value(),
+            epoch_before,
+            "epoch handle must be the one the cache service reads"
+        );
+        let c = cache
+            .allocate(
+                OpToken {
+                    client_id: 9,
+                    op_seq: 3,
+                },
+                11,
+                1,
+                "/c",
+                64,
+                64,
+            )
+            .unwrap();
+        assert_eq!(
+            c.object_id,
+            min + SEG,
+            "the burned segment's tail is lost; the fresh segment starts at MIN+SEG"
+        );
+        {
+            let store = fs_dir.read();
+            let rocks = store.get_rocks_store();
+            assert_eq!(
+                rocks.cache_get_state(state_tags::CACHE_OBJECT_ID).unwrap(),
+                Some(min + 2 * SEG - 1),
+                "the second reserve must be contiguous: [MIN+SEG, MIN+2*SEG)"
+            );
+            assert_eq!(
+                rocks.cache_client_watermark(0).unwrap(),
+                Some(2),
+                "exactly one further issuer reserve after the burn"
+            );
+        }
+
         std::process::exit(0);
     }
 }

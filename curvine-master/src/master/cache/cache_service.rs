@@ -77,6 +77,12 @@ pub const MAX_LOCATIONS_PER_BLOCK: usize = 16;
 /// Hard cap on the UTF-8 size of a cache key across all cache RPCs.
 pub const MAX_KEY_BYTES: usize = 4096;
 
+/// Conservative cap on the serialized byte size of an Allocate response
+/// plan (65536 blocks x 16 workers x variable-length addresses can exceed
+/// the transport's 16 MiB header cap, which only bounds INBOUND messages).
+/// The plan is estimated and rejected BEFORE any object id is issued.
+pub const MAX_PLAN_WIRE_BYTES: usize = 8 << 20;
+
 /// The internal client identity used for segment reserves. It is disjoint
 /// from any RPC client id space in use (client ids are random u64s; the
 /// watermark of this client only advances via reserves, which lazily
@@ -494,6 +500,20 @@ impl CacheService {
         // selection (no workers / below replica policy) must not burn an
         // object id.
         let layout_worker_sets = self.plan_worker_sets(block_count as usize, block_size)?;
+        // Wire-size gate before issuance: the response carries the whole
+        // plan, and the transport's inbound cap does not protect responses.
+        // A plan whose serialized estimate exceeds the cap is rejected
+        // without issuing (or burning) any identity.
+        let plan_wire_estimate = estimate_plan_wire_bytes(&layout_worker_sets);
+        if plan_wire_estimate > MAX_PLAN_WIRE_BYTES {
+            return err_box!(
+                "cache allocate plan would serialize to ~{} bytes, above the response cap {}: block count {}, file_len {}",
+                plan_wire_estimate,
+                MAX_PLAN_WIRE_BYTES,
+                block_count,
+                file_len
+            );
+        }
         let replicas = self.chooser.replica_policy();
 
         // Ensure the volatile segment cursor is valid (burning stale
@@ -665,9 +685,17 @@ impl CacheService {
             );
         }
 
+        // 4a pins ttl_ms to 0, so the journaled expire_at is always 0;
+        // 4b will compute a real deadline and bind it here the same way.
+        let expire_at = 0i64;
+
         // Commit-token durable idempotency first: a retry after a lost
         // response resolves to its recorded Committed outcome regardless
-        // of how far the entry row has advanced since.
+        // of how far the entry row has advanced since. The outcome binds
+        // the FULL immutable request (load token + geometry + fence):
+        // AlreadyApplied requires an exact match of every field — a token
+        // replayed with any different parameter is divergence, never a
+        // silent AlreadyApplied.
         {
             let store = self.fs_dir.read();
             let rocks = store.get_rocks_store();
@@ -677,21 +705,37 @@ impl CacheService {
                     key: out_key,
                     generation: out_generation,
                     object_id: out_object,
+                    load_token: out_load_token,
+                    len: out_len,
+                    ufs_mtime: out_mtime,
+                    expire_at: out_expire_at,
                 }) => {
                     if out_inc == incarnation
                         && out_key == key
                         && out_generation == generation
                         && out_object == object_id
+                        && out_load_token == load_token
+                        && out_len == len
+                        && out_mtime == ufs_mtime
+                        && out_expire_at == expire_at
                     {
+                        // The load this token committed is terminal: its
+                        // volatile plan is spent.
+                        drop(store);
+                        self.plans.lock().unwrap().remove(&load_token);
                         return Ok(CacheOpStatus::AlreadyApplied);
                     }
                     return err_box!(
-                        "cache commit token {:?} replayed with different parameters: committed ({}, {})@{} object {}",
+                        "cache commit token {:?} replayed with different parameters: committed ({}, {})@{} object {} load {:?} len {} mtime {} expire_at {}",
                         token,
                         out_inc,
                         out_key,
                         out_generation,
-                        out_object
+                        out_object,
+                        out_load_token,
+                        out_len,
+                        out_mtime,
+                        out_expire_at
                     );
                 }
                 Some(other) => {
@@ -795,18 +839,26 @@ impl CacheService {
         }
 
         // Committed row classification. The plan is volatile, so the
-        // committed row remains the authority for identity.
+        // committed row remains the authority for identity. Every terminal
+        // classification below clears the plan for this load token — the
+        // load binding above already verified the plan's identity against
+        // the durable Allocated outcome, so this can never delete another
+        // load's plan.
         {
             let store = self.fs_dir.read();
             let rocks = store.get_rocks_store();
             match rocks.cache_get_entry(incarnation, key).map_err(fs_err)? {
                 None => {
+                    drop(store);
+                    self.plans.lock().unwrap().remove(&load_token);
                     return Ok(CacheOpStatus::Superseded {
                         expected: generation,
                         current: 0,
-                    })
+                    });
                 }
                 Some(cur) if cur.generation > generation => {
+                    drop(store);
+                    self.plans.lock().unwrap().remove(&load_token);
                     return Ok(CacheOpStatus::Superseded {
                         expected: generation,
                         current: cur.generation,
@@ -832,6 +884,8 @@ impl CacheService {
                     );
                 }
                 Some(cur) if cur.state == CacheEntryState::Tombstoned => {
+                    drop(store);
+                    self.plans.lock().unwrap().remove(&load_token);
                     return Ok(CacheOpStatus::Superseded {
                         expected: generation,
                         current: cur.generation,
@@ -841,6 +895,8 @@ impl CacheService {
                     // Same generation and object: only this load's commit
                     // could have written it.
                     if cur.len == len && cur.ufs_mtime == ufs_mtime {
+                        drop(store);
+                        self.plans.lock().unwrap().remove(&load_token);
                         return Ok(CacheOpStatus::AlreadyApplied);
                     }
                     return err_box!(
@@ -874,15 +930,18 @@ impl CacheService {
             expected_object_id: object_id,
             len,
             ufs_mtime,
-            expire_at: 0,
+            expire_at,
         });
         self.journal_writer
             .sync_propose_cache(entry)
             .map_err(fs_err)?;
 
-        // Readback from committed state: the row must now be Valid at the
-        // committed generation with the committed object identity. Only
-        // then are the volatile locations published.
+        // Readback from committed state, re-classified from the committed
+        // row: another mutation (invalidate, a later allocation) may have
+        // fenced the entry between our propose barrier and this read.
+        // Only an exact Valid readback publishes the volatile locations;
+        // a fenced or advanced row is terminal Superseded for this load —
+        // never a generic error that a client would keep retrying.
         {
             let store = self.fs_dir.read();
             let rocks = store.get_rocks_store();
@@ -890,10 +949,36 @@ impl CacheService {
                 .cache_get_entry(incarnation, key)
                 .map_err(fs_err)?
                 .ok_or_else(|| cm_err("cache commit readback: entry vanished"))?;
-            if cur.state != CacheEntryState::Valid
-                || cur.generation != generation
-                || cur.object_id != object_id
+            if cur.state == CacheEntryState::Valid
+                && cur.generation == generation
+                && cur.object_id == object_id
             {
+                if cur.len != len || cur.ufs_mtime != ufs_mtime {
+                    return err_box!(
+                        "cache commit readback divergence for ({}, {})@{}: committed len {} mtime {} vs request len {} mtime {}",
+                        incarnation,
+                        key,
+                        generation,
+                        cur.len,
+                        cur.ufs_mtime,
+                        len,
+                        ufs_mtime
+                    );
+                }
+                // Exact Valid readback (this propose or an identical
+                // replay): publish below.
+            } else if cur.generation > generation
+                || (cur.generation == generation && cur.state == CacheEntryState::Tombstoned)
+            {
+                // The load is dead: a later generation fenced it mid-
+                // barrier. Terminal, no retry.
+                drop(store);
+                self.plans.lock().unwrap().remove(&load_token);
+                return Ok(CacheOpStatus::Superseded {
+                    expected: generation,
+                    current: cur.generation,
+                });
+            } else {
                 return err_box!(
                     "cache commit barrier readback failed for ({}, {}): {:?}",
                     incarnation,
@@ -903,6 +988,10 @@ impl CacheService {
             }
         }
 
+        // Publishing the client-reported set is safe here: every reported
+        // worker was just verified field-wise against the planned worker,
+        // so the published endpoints are byte-identical to the plan's
+        // canonical addresses (the subset that actually holds the block).
         let mut locations = self.locations.lock().unwrap();
         let object_locations = locations.entry(object_id).or_default();
         object_locations.blocks.clear();
@@ -950,15 +1039,38 @@ impl CacheService {
                     })
                 }
                 Some(cur) if cur.generation > new_generation => {
+                    // Fenced far past our target: terminal Superseded.
+                    // Volatile cleanup only when the live row confirms the
+                    // object identity we were told to fence — never on an
+                    // unverified id.
+                    let verified = cur.object_id == expected_object_id;
+                    drop(store);
+                    if verified {
+                        self.drop_object_state(&cur.object_id);
+                    }
                     return Ok(CacheOpStatus::Superseded {
                         expected: new_generation,
                         current: cur.generation,
-                    })
+                    });
                 }
                 Some(cur) if cur.generation == new_generation => {
                     if cur.state == CacheEntryState::Tombstoned {
+                        // Identity must be confirmed against the live row
+                        // before any volatile state is dropped: a forged
+                        // invalidate quoting another object's tombstone
+                        // generation must not clear that object's state.
+                        if cur.object_id != expected_object_id {
+                            return err_box!(
+                                "cache invalidate identity mismatch for ({}, {})@{}: committed object {} vs expected {}",
+                                incarnation,
+                                key,
+                                cur.generation,
+                                cur.object_id,
+                                expected_object_id
+                            );
+                        }
                         drop(store);
-                        self.drop_object_state(&expected_object_id);
+                        self.drop_object_state(&cur.object_id);
                         return Ok(CacheOpStatus::AlreadyApplied);
                     }
                     // Some other mutation wrote the fenced generation:
@@ -972,10 +1084,18 @@ impl CacheService {
                     );
                 }
                 Some(cur) if cur.generation > expected_generation => {
+                    // Our fence generation was taken by another mutation
+                    // (e.g. a UFS-write fence): terminal Superseded, with
+                    // the same verified-identity cleanup rule.
+                    let verified = cur.object_id == expected_object_id;
+                    drop(store);
+                    if verified {
+                        self.drop_object_state(&cur.object_id);
+                    }
                     return Ok(CacheOpStatus::Superseded {
                         expected: new_generation,
                         current: cur.generation,
-                    })
+                    });
                 }
                 Some(cur) if cur.generation < expected_generation => {
                     return err_box!(
@@ -1014,16 +1134,41 @@ impl CacheService {
             .sync_propose_cache(entry)
             .map_err(fs_err)?;
 
+        // Readback from committed state, re-classified from the committed
+        // row: another mutation may have fenced past ours between the
+        // propose barrier and this read. `generation >= new` is NOT enough
+        // for Applied — a later tombstone must report terminal Superseded,
+        // and volatile state is dropped only on a verified object identity.
         let store = self.fs_dir.read();
         let rocks = store.get_rocks_store();
         let cur = rocks.cache_get_entry(incarnation, key).map_err(fs_err)?;
         match cur {
             Some(cur)
-                if cur.state == CacheEntryState::Tombstoned && cur.generation >= new_generation =>
+                if cur.state == CacheEntryState::Tombstoned
+                    && cur.generation == new_generation
+                    && cur.object_id == expected_object_id =>
             {
                 drop(store);
-                self.drop_object_state(&expected_object_id);
+                self.drop_object_state(&cur.object_id);
                 Ok(CacheOpStatus::Applied)
+            }
+            Some(cur)
+                if cur.generation > new_generation
+                    || (cur.generation == new_generation
+                        && cur.state == CacheEntryState::Tombstoned) =>
+            {
+                // Someone else fenced at/after our target generation: our
+                // invalidate is terminal Superseded (its load, if any, is
+                // dead). Cleanup only on a verified identity.
+                let verified = cur.object_id == expected_object_id;
+                drop(store);
+                if verified {
+                    self.drop_object_state(&cur.object_id);
+                }
+                Ok(CacheOpStatus::Superseded {
+                    expected: new_generation,
+                    current: cur.generation,
+                })
             }
             other => err_box!(
                 "cache invalidate barrier readback failed for ({}, {}): {:?}",
@@ -1095,13 +1240,16 @@ impl CacheService {
     ///   reserved segment is dropped and the loop reserves again under
     ///   the new epoch).
     ///
-    /// A burned/exhausted segment triggers a fresh durable reserve
-    /// `[HW+1, HW+1+SEG)` through the sync barrier; the old tail is
-    /// permanently lost to this leader.
+    /// The epoch is re-read at the top of EVERY attempt: an attempt that
+    /// lost leadership mid-barrier must bind the next reserve to the new
+    /// epoch, never keep comparing against a stale one (which would burn
+    /// segments forever). A burned/exhausted segment triggers a fresh
+    /// durable reserve `[HW+1, HW+1+SEG)` through the sync barrier; the
+    /// old tail is permanently lost to this leader.
     fn ensure_segment_and_issue(&self, rpc_id: i64) -> CommonResult<(i64, u64)> {
-        let epoch = self.monitor.journal_epoch();
         let mut seg = self.segment.lock().unwrap();
         loop {
+            let epoch = self.monitor.journal_epoch();
             let durable_hw = {
                 let store = self.fs_dir.read();
                 store
@@ -1166,7 +1314,8 @@ impl CacheService {
             }
             // Leadership may have transitioned while the barrier ran:
             // never install a segment reserved by a previous epoch —
-            // burn it (and the tail) and reserve again under this one.
+            // burn it (and the tail) and reserve again under the current
+            // one (the next attempt re-reads the epoch at the loop top).
             if !self.monitor.is_active() || self.monitor.journal_epoch() != epoch {
                 *seg = None;
                 continue;
@@ -1325,10 +1474,15 @@ fn validate_commit_against_plan(
         }
         let mut seen = Vec::with_capacity(block.workers.len());
         for worker in &block.workers {
+            // Full address comparison, NOT `==`: WorkerAddress's PartialEq
+            // compares worker_id only, and a spoofed hostname/ip/port with
+            // a genuine worker id must not pass evidence validation (a
+            // forged endpoint would be published verbatim into CacheGet
+            // locations otherwise).
             if !planned
                 .workers
                 .iter()
-                .any(|p| p.worker_id == worker.worker_id)
+                .any(|p| same_worker_address(p, worker))
             {
                 return err_box!(
                     "cache commit block {} reports worker {} which is not in the allocate plan",
@@ -1347,6 +1501,36 @@ fn validate_commit_against_plan(
         }
     }
     Ok(())
+}
+
+/// Field-wise worker address equality. `WorkerAddress: PartialEq` compares
+/// only `worker_id` (routing semantics); evidence validation needs the full
+/// endpoint to match the plan exactly.
+fn same_worker_address(a: &WorkerAddress, b: &WorkerAddress) -> bool {
+    a.worker_id == b.worker_id
+        && a.hostname == b.hostname
+        && a.ip_addr == b.ip_addr
+        && a.rpc_port == b.rpc_port
+        && a.web_port == b.web_port
+}
+
+/// Conservative serialized-size estimate of a planned block list on the
+/// Allocate response wire: fixed overhead per block and per worker plus
+/// the variable-length hostname/ip bytes. Deliberately overestimates
+/// (tags, varints, nesting) so a plan under the estimate can never exceed
+/// the real wire encoding.
+fn estimate_plan_wire_bytes(sets: &[Vec<WorkerAddress>]) -> usize {
+    const BLOCK_FIXED: usize = 32;
+    const WORKER_FIXED: usize = 32;
+    sets.iter()
+        .map(|workers| {
+            BLOCK_FIXED
+                + workers
+                    .iter()
+                    .map(|w| WORKER_FIXED + w.hostname.len() + w.ip_addr.len())
+                    .sum::<usize>()
+        })
+        .sum()
 }
 
 fn fs_err(e: curvine_error::FsError) -> CommonError {
@@ -1952,9 +2136,11 @@ mod tests {
     }
 
     /// A lost-response commit retry resolves to its recorded Committed
-    /// outcome as AlreadyApplied, regardless of the entry row. A commit
-    /// that does not match its recorded load allocation is rejected before
-    /// any plan lookup.
+    /// outcome as AlreadyApplied, regardless of the entry row — but ONLY
+    /// on an exact match of the FULL immutable request (load token, len,
+    /// ufs_mtime, expire_at): any divergence is rejected, never silently
+    /// resolved. A commit that does not match its recorded load allocation
+    /// is rejected before any plan lookup.
     #[test]
     fn test_commit_outcome_retry_already_applied() {
         let service = build_service("commit-retry", chooser(vec![worker(1)]));
@@ -1966,15 +2152,46 @@ mod tests {
             let rocks = store.get_rocks_store();
             store.cache.apply_remove(rocks, 1, "/k", 1, 2, OBJ).unwrap();
         }
+        // A live plan for the load exists: the AlreadyApplied resolution
+        // must spend it (terminal cleanup).
+        let lay = layout(OBJ, 130);
+        service.install_plan(token(2, 1), plan_for(&lay));
         let status = service
             .commit(commit_params(token(2, 1), token(2, 2), vec![]))
             .unwrap();
         assert_eq!(status, CacheOpStatus::AlreadyApplied);
-        // Same commit token with different parameters: resolved by the
-        // recorded outcome.
+        assert!(
+            !service.plans.lock().unwrap().contains_key(&token(2, 1)),
+            "recorded-outcome AlreadyApplied must clear the load's plan"
+        );
+
+        // Same commit token with ANY different parameter is divergence,
+        // never AlreadyApplied: the outcome binds the full request.
         let mut p = commit_params(token(2, 1), token(2, 2), vec![]);
         p.len = 999;
-        assert_eq!(service.commit(p).unwrap(), CacheOpStatus::AlreadyApplied);
+        let err = service.commit(p.clone()).unwrap_err();
+        assert!(
+            format!("{}", err).contains("replayed with different parameters"),
+            "{}",
+            err
+        );
+        let mut p = commit_params(token(2, 1), token(2, 2), vec![]);
+        p.ufs_mtime = 888;
+        let err = service.commit(p).unwrap_err();
+        assert!(
+            format!("{}", err).contains("replayed with different parameters"),
+            "{}",
+            err
+        );
+        // Geometry intact, only the load token differs: still divergence.
+        let err = service
+            .commit(commit_params(token(9, 9), token(2, 2), vec![]))
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("replayed with different parameters"),
+            "{}",
+            err
+        );
 
         // An unknown load token has no recorded allocation: fail closed
         // before the plan lookup.
@@ -2008,6 +2225,10 @@ mod tests {
                 expected: 1,
                 current: 2
             }
+        );
+        assert!(
+            !service.plans.lock().unwrap().contains_key(&token(2, 1)),
+            "pre-read Superseded must clear the load's plan"
         );
     }
 
@@ -2073,6 +2294,18 @@ mod tests {
             ("unplanned worker", {
                 let mut v = full_locations(&lay);
                 v[0].workers = vec![worker(1), worker(99)];
+                v
+            }),
+            // Spoofed endpoint: genuine planned worker_id with a forged
+            // hostname/ip/port. `WorkerAddress: PartialEq` compares only
+            // worker_id, so this must be rejected by the field-wise check.
+            ("spoofed worker address", {
+                let mut spoof = worker(1);
+                spoof.hostname = "evil-host".into();
+                spoof.ip_addr = "6.6.6.6".into();
+                spoof.rpc_port = 6666;
+                let mut v = full_locations(&lay);
+                v[0].workers = vec![spoof, worker(2)];
                 v
             }),
             ("duplicate worker", {
@@ -2240,6 +2473,138 @@ mod tests {
         assert!(
             format!("{}", err).contains("raft"),
             "live fence must reach the fail-closed barrier: {}",
+            err
+        );
+    }
+
+    /// P1-4 regression: a forged invalidate quoting ANOTHER object's id
+    /// against a matching tombstone fence must NOT clear that object's
+    /// volatile state — identity is confirmed against the live row before
+    /// any drop.
+    #[test]
+    fn test_invalidate_forged_object_identity() {
+        let service = build_service("invalidate-forged-id", chooser(vec![worker(1)]));
+        // Object A committed then removed: row is Tombstoned@2.
+        committed_entry(&service, token(2, 1), token(2, 2), "/k", OBJ, 64, 0);
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            store.cache.apply_remove(rocks, 1, "/k", 1, 2, OBJ).unwrap();
+        }
+        // Object B (a different id) has live volatile state: locations and
+        // an in-flight load plan.
+        let b = OBJ + 50;
+        let b_lay = layout(b, 64);
+        service
+            .install_locations(b, full_locations(&b_lay))
+            .unwrap();
+        service.install_plan(token(6, 1), plan_for(&b_lay));
+
+        // Forged invalidate: expected_generation 1 fences at 2, which
+        // matches A's tombstone, but the caller quotes B's object id.
+        let err = service.invalidate(7, 1, "/k", 1, b).unwrap_err();
+        assert!(format!("{}", err).contains("identity mismatch"), "{}", err);
+        assert!(
+            service.locations.lock().unwrap().contains_key(&b),
+            "forged invalidate must not clear another object's locations"
+        );
+        assert!(
+            service.plans.lock().unwrap().contains_key(&token(6, 1)),
+            "forged invalidate must not clear another object's plan"
+        );
+
+        // Positive control: quoting the row's real object id resolves
+        // AlreadyApplied and drops A's own state.
+        service
+            .install_locations(OBJ, full_locations(&layout(OBJ, 64)))
+            .unwrap();
+        assert_eq!(
+            service.invalidate(7, 1, "/k", 1, OBJ).unwrap(),
+            CacheOpStatus::AlreadyApplied
+        );
+        assert!(!service.locations.lock().unwrap().contains_key(&OBJ));
+        // B is untouched by A's terminal resolution.
+        assert!(service.locations.lock().unwrap().contains_key(&b));
+    }
+
+    /// Invalidate Superseded branches clean volatile state ONLY when the
+    /// live row confirms the quoted object identity (P1-7 rule): verified
+    /// ids drop, unverified ids never do.
+    #[test]
+    fn test_invalidate_superseded_cleanup_verified_only() {
+        let service = build_service("invalidate-superseded-cleanup", chooser(vec![worker(1)]));
+        // Row fenced twice: Tombstoned@3.
+        committed_entry(&service, token(2, 1), token(2, 2), "/k", OBJ, 64, 0);
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            store.cache.apply_remove(rocks, 1, "/k", 1, 2, OBJ).unwrap();
+            store.cache.apply_remove(rocks, 1, "/k", 2, 3, OBJ).unwrap();
+        }
+        service
+            .install_locations(OBJ, full_locations(&layout(OBJ, 64)))
+            .unwrap();
+
+        // expected_generation 1 fences at 2; the row is already at 3:
+        // terminal Superseded with a VERIFIED identity -> state dropped.
+        assert_eq!(
+            service.invalidate(7, 1, "/k", 1, OBJ).unwrap(),
+            CacheOpStatus::Superseded {
+                expected: 2,
+                current: 3
+            }
+        );
+        assert!(!service.locations.lock().unwrap().contains_key(&OBJ));
+
+        // Same fence quoting a different object id: still terminal
+        // Superseded (the row advanced regardless), but the OTHER object's
+        // volatile state survives.
+        let b = OBJ + 51;
+        let b_lay = layout(b, 64);
+        service
+            .install_locations(b, full_locations(&b_lay))
+            .unwrap();
+        assert_eq!(
+            service.invalidate(7, 1, "/k", 1, b).unwrap(),
+            CacheOpStatus::Superseded {
+                expected: 2,
+                current: 3
+            }
+        );
+        assert!(
+            service.locations.lock().unwrap().contains_key(&b),
+            "unverified identity must not clear volatile state"
+        );
+    }
+
+    /// P1-6: the Allocate response plan is wire-size capped BEFORE any
+    /// object id is issued — the transport's inbound cap does not protect
+    /// responses. A plan over the cap is rejected pre-issue; a plan under
+    /// it proceeds to the (fail-closed) barrier.
+    #[test]
+    fn test_allocate_plan_wire_cap() {
+        let mut big = worker(1);
+        big.hostname = "h".repeat(200);
+        let service = build_service("allocate-wire-cap", chooser(vec![big]));
+        let block_size: i64 = 64;
+
+        // 65536 blocks x (fixed overhead + 200-byte hostname) far exceeds
+        // the 8 MiB plan cap: rejected before issuance.
+        let file_len = (MAX_COMMIT_BLOCKS as i64) * block_size;
+        let err = service
+            .allocate(token(3, 1), 7, 1, "/big", file_len, block_size)
+            .unwrap_err();
+        assert!(format!("{}", err).contains("response cap"), "{}", err);
+        assert!(!format!("{}", err).contains("raft"), "{}", err);
+
+        // Under the cap: passes the wire gate and reaches the fail-closed
+        // barrier (rejected there only because unit tests have no raft).
+        let err = service
+            .allocate(token(3, 2), 7, 1, "/ok", 4096 * block_size, block_size)
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("raft"),
+            "under-cap plan must proceed to the barrier: {}",
             err
         );
     }

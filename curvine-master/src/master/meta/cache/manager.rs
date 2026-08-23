@@ -628,7 +628,9 @@ impl CacheManager {
 
         // Commit-token gate: an exact recorded history wins over the entry
         // row (whose state this commit itself may have advanced), so a
-        // lost-response retry resolves to its recorded result.
+        // lost-response retry resolves to its recorded result. The
+        // comparison covers the FULL immutable request: any parameter
+        // difference is divergence.
         let gate = Self::classify_token(
             store,
             token,
@@ -637,6 +639,10 @@ impl CacheManager {
                 key: key.to_string(),
                 generation,
                 object_id: expected_object_id,
+                load_token,
+                len,
+                ufs_mtime,
+                expire_at,
             },
         )?;
         match gate {
@@ -739,6 +745,10 @@ impl CacheManager {
                 key: key.to_string(),
                 generation,
                 object_id: cur.object_id,
+                load_token,
+                len,
+                ufs_mtime,
+                expire_at,
             },
         )
         .map_err(cv)?;

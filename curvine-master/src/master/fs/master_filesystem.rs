@@ -162,20 +162,31 @@ impl MasterFilesystem {
 
     /// Production cache placement chooser: the cluster worker policy at
     /// the server-configured cache replication factor. The factor must be
-    /// a valid replication inside the master's min/max bounds — a
-    /// misconfigured cluster fails closed at construction instead of
-    /// planning under-replicated or over-cap placements.
+    /// a valid replication inside the master's min/max bounds AND no more
+    /// than `MAX_LOCATIONS_PER_BLOCK` — a misconfigured cluster fails
+    /// closed at construction instead of planning under-replicated or
+    /// over-cap placements (an over-cap plan would be truncated at commit
+    /// time and could then never be satisfied).
     fn cache_chooser(
         conf: &ClusterConf,
         workers: &SyncWorkerManager,
     ) -> FsResult<Arc<crate::master::cache::PolicyWorkerChooser>> {
         let raw = conf.client.replicas;
         let replicas = match u16::try_from(raw) {
-            Ok(r) if r >= conf.master.min_replication && r <= conf.master.max_replication => r,
+            Ok(r)
+                if r >= conf.master.min_replication
+                    && r <= conf.master.max_replication
+                    && (r as usize) <= crate::master::cache::MAX_LOCATIONS_PER_BLOCK =>
+            {
+                r
+            }
             _ => {
                 return err_ext!(FsError::invalid_argument(format!(
-                    "cache placement replicas {} is outside the master replication bounds [{}, {}]",
-                    raw, conf.master.min_replication, conf.master.max_replication
+                    "cache placement replicas {} is outside the master replication bounds [{}, {}] or above the per-block location cap {}",
+                    raw,
+                    conf.master.min_replication,
+                    conf.master.max_replication,
+                    crate::master::cache::MAX_LOCATIONS_PER_BLOCK
                 )))
             }
         };
@@ -1836,6 +1847,37 @@ mod tests {
         let opts = FileAllocOpts::with_alloc(200, FileAllocMode::DEFAULT);
         let err = MasterFilesystem::validate_alloc_capacity(20, 2, &opts, 359).unwrap_err();
         assert!(matches!(err, FsError::DiskOutOfSpace(_)));
+    }
+
+    /// P1-6: the production cache chooser fails closed at construction
+    /// when `client.replicas` exceeds the per-block location cap — the
+    /// replication bounds alone would let a 17-replica plan be built and
+    /// then truncated to 16, making the commit's replica-policy check
+    /// permanently unsatisfiable.
+    #[test]
+    fn cache_chooser_rejects_replicas_above_location_cap() {
+        Master::init_test_metrics();
+        let workers = SyncWorkerManager::new(
+            crate::master::fs::WorkerManager::new(&ClusterConf::default()).unwrap(),
+        );
+        let mut conf = ClusterConf::format();
+        // Inside the default replication bounds [1, 100], but above the
+        // per-block cap of MAX_LOCATIONS_PER_BLOCK (16).
+        conf.client.replicas = (crate::master::cache::MAX_LOCATIONS_PER_BLOCK + 1) as i32;
+        let err = match MasterFilesystem::cache_chooser(&conf, &workers) {
+            Err(e) => e,
+            Ok(_) => panic!("replicas above the location cap must fail closed"),
+        };
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("per-block location cap"),
+            "expected the location-cap rejection, got: {}",
+            msg
+        );
+
+        // Exactly at the cap is accepted.
+        conf.client.replicas = crate::master::cache::MAX_LOCATIONS_PER_BLOCK as i32;
+        assert!(MasterFilesystem::cache_chooser(&conf, &workers).is_ok());
     }
 
     #[test]
