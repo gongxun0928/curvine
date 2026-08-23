@@ -42,6 +42,24 @@
 //! CacheIndex row). They are not journaled: `CacheGet` treats any missing
 //! block location as a whole-object miss so the caller falls back to the
 //! UFS.
+//!
+//! # Lock-order invariant (4c.3, review `327b30d2` item 3)
+//!
+//! All leader-volatile state (published locations + the physical-GC work
+//! queue) lives under ONE lock, `CacheService::state`. The lock order is
+//! strictly **`state` (volatile) → `fs_dir` read**: a path MAY hold the
+//! volatile lock and then take the fs_dir read guard (the commit publish
+//! recheck), but NO path may hold the fs_dir guard while acquiring the
+//! volatile lock — every store read is scoped and dropped first (see
+//! `get`, `classify_dead_victim`, and every invalidate/commit arm). The
+//! `plans` map is a separate leaf lock and is never held across either
+//! of the other two. While holding the volatile lock it is FORBIDDEN to
+//! propose journal entries (`sync_propose_cache`): the GC queue is fed
+//! only after the barrier returns. `gc_handoff_tick` extracts a bounded
+//! batch under the volatile lock, RELEASES it, and only then takes the
+//! WorkerManager write lock — the same release-before-wm rule the
+//! worker-heartbeat handler follows when it invokes the tick before its
+//! own wm lock.
 
 use crate::master::fs::policy::ChooseContext;
 use crate::master::fs::WorkerManager;
@@ -64,7 +82,7 @@ use curvine_core_error::{err_box, err_msg, CommonError, CommonResult};
 use curvine_model::WorkerAddress;
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::sync::ArcRwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 /// Object ids per durable reserve segment. Reserves are rare (one per
@@ -213,7 +231,162 @@ impl CacheWorkerChooser for PolicyWorkerChooser {
 
 #[derive(Default)]
 struct ObjectLocations {
+    /// Geometry recorded at commit publish (4c.3): the authoritative
+    /// `(len, block_size)` of THIS object_id. A committed row is the
+    /// other geometry source, but tombstones zero `len` — this recorded
+    /// geometry lets the GC handoff freeze work for an object whose row
+    /// has already advanced past it.
+    len: i64,
+    block_size: i64,
     blocks: HashMap<i64, Vec<WorkerAddress>>,
+}
+
+/// Per-tick hard cap on the number of block ids the GC handoff derives
+/// and enqueues into the delete queue in one tick (review `6bc4f569`
+/// gate 1). Worker-facing enqueues are bounded by this cap times the
+/// per-block replica bound; a full block-id list is never materialized.
+pub const GC_HANDOFF_BLOCKS_PER_TICK: usize = 1024;
+
+/// One volatile physical-GC work item (4c.3, review `6bc4f569` gate 1):
+/// constant size, deduplicated by `object_id`, resumed via `next_seq`.
+/// Block ids are DERIVED from the frozen geometry on demand
+/// (`CacheBlockLayout::block_id`), so a million-block object costs the
+/// same memory as a one-block one. Nothing here is journaled: crash
+/// loses pending work and the 4d full-report/orphan pass re-derives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CacheGcWork {
+    incarnation: u64,
+    object_id: i64,
+    len: i64,
+    block_size: i64,
+    /// Next 1-based block index whose delete should be enqueued.
+    /// `> block_count` (derived from the frozen geometry) means done.
+    next_seq: u32,
+}
+
+impl CacheGcWork {
+    fn layout(&self) -> CommonResult<CacheBlockLayout> {
+        CacheBlockLayout::derive(self.object_id, self.len, self.block_size)
+    }
+}
+
+/// Per-object, per-turn bound of the round-robin GC handoff (review
+/// `327b30d2` item 2): one tick gives every unfinished object at most
+/// this many derived block ids before rotating it to the back, so a
+/// max-layout object cannot monopolize the tick budget and starve
+/// later, smaller objects.
+pub const GC_HANDOFF_QUANTUM: usize = 256;
+
+/// Volatile FIFO of dead-object GC work items, deduplicated by
+/// `object_id` (an object id is never reused, so one item per id fully
+/// dedups response-loss retries and repeated handoffs). `order` is the
+/// round-robin deque; `items` keeps each work item constant-size.
+#[derive(Default)]
+struct CacheGcQueue {
+    items: HashMap<i64, CacheGcWork>,
+    order: VecDeque<i64>,
+}
+
+impl CacheGcQueue {
+    /// Enqueue one work item. An existing item for the same object_id
+    /// with the SAME frozen geometry is an idempotent no-op (the
+    /// existing `next_seq` cursor is kept — a response-loss retry never
+    /// restarts a drain); the same object_id with DIFFERENT geometry is
+    /// impossible for an immutable object and fails loud (review
+    /// `6bc4f569` gate 1).
+    fn enqueue(&mut self, work: CacheGcWork) -> CommonResult<()> {
+        if let Some(existing) = self.items.get(&work.object_id) {
+            if existing.incarnation != work.incarnation
+                || existing.len != work.len
+                || existing.block_size != work.block_size
+            {
+                return err_box!(
+                    "cache gc work geometry divergence for object {}: existing ({}, {}, {}) vs new ({}, {}, {})",
+                    work.object_id,
+                    existing.incarnation,
+                    existing.len,
+                    existing.block_size,
+                    work.incarnation,
+                    work.len,
+                    work.block_size
+                );
+            }
+            return Ok(());
+        }
+        self.order.push_back(work.object_id);
+        self.items.insert(work.object_id, work);
+        Ok(())
+    }
+}
+
+/// All leader-volatile cache state under ONE lock (4c.3 lock-order
+/// contract, review `6bc4f569` gate 3/4): the published locations of
+/// live objects and the GC work queue. The lock order is strictly
+/// `volatile -> fs_dir read`: no code path may hold the fs_dir read
+/// guard while acquiring this lock, which is what makes the
+/// commit-publish recheck + GC drain serialization sound.
+#[derive(Default)]
+struct CacheVolatile {
+    locations: HashMap<i64, ObjectLocations>,
+    gc: CacheGcQueue,
+}
+
+impl CacheVolatile {
+    /// Round-robin extraction of one tick's delete work (review
+    /// `327b30d2` item 2 / `6bc4f569` gate 3): walk the object deque
+    /// from the front, give every unfinished object at most one
+    /// `GC_HANDOFF_QUANTUM` of derived block ids, rotate unfinished
+    /// objects to the back, and stop at the global
+    /// `GC_HANDOFF_BLOCKS_PER_TICK` cap. Block ids are derived on
+    /// demand from the frozen geometry — never materialized as a full
+    /// list. The retained locations entry supplies the target workers:
+    /// a block index with NO retained location is SKIPPED (the cursor
+    /// still advances; the 4d full report re-derives that replica), and
+    /// a replica whose worker set is empty is skipped the same way.
+    /// Completing an object (`next_seq > block_count`) removes its work
+    /// item AND its retained locations entry — that is the ONLY removal
+    /// point, so locations survive exactly until the drain finishes.
+    fn gc_take_batch(&mut self) -> CommonResult<Vec<(u32, i64)>> {
+        let mut out: Vec<(u32, i64)> = Vec::new();
+        let mut budget: usize = GC_HANDOFF_BLOCKS_PER_TICK;
+        let mut turns = self.gc.order.len();
+        while budget > 0 && turns > 0 {
+            turns -= 1;
+            let Some(object_id) = self.gc.order.pop_front() else {
+                break;
+            };
+            let Some(mut work) = self.gc.items.get(&object_id).copied() else {
+                continue;
+            };
+            let layout = work.layout()?;
+            let start = work.next_seq;
+            let end =
+                (start + GC_HANDOFF_QUANTUM.min(budget) as u32).min(layout.block_count as u32 + 1);
+            let locations = self.locations.get(&object_id);
+            for index in start..end {
+                let block_id = layout.block_id(i64::from(index))?;
+                if let Some(object_locations) = locations {
+                    if let Some(workers) = object_locations.blocks.get(&i64::from(index)) {
+                        for w in workers {
+                            out.push((w.worker_id, block_id));
+                        }
+                    }
+                }
+                // No retained location for this index: skip the replica,
+                // advance the cursor (4d full report re-derives it).
+            }
+            budget -= (end - start) as usize;
+            work.next_seq = end;
+            if work.next_seq > layout.block_count as u32 {
+                self.gc.items.remove(&object_id);
+                self.locations.remove(&object_id);
+            } else {
+                self.gc.items.insert(object_id, work);
+                self.gc.order.push_back(object_id);
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Volatile leader-scoped segment cursor for the object id issuer.
@@ -262,7 +435,10 @@ pub struct CacheService {
     segment: Mutex<Option<Segment>>,
     /// Volatile load plans by allocate token.
     plans: Mutex<HashMap<OpToken, LoadPlan>>,
-    locations: Mutex<HashMap<i64, ObjectLocations>>,
+    /// Published locations + GC work queue under one lock (4c.3). The
+    /// `plans` map stays a separate leaf lock: it is always accessed
+    /// without holding this lock (and vice versa).
+    state: Mutex<CacheVolatile>,
     /// One-shot fault-injection seam fired between a sync-propose
     /// barrier's return and the code's post-barrier verification (reserve
     /// epoch check / commit-invalidate readback). Tests use it to make
@@ -270,6 +446,13 @@ pub struct CacheService {
     /// production; compiled out entirely outside `cfg(test)`.
     #[cfg(test)]
     barrier_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// One-shot fault-injection seam fired between a commit's barrier
+    /// readback (exact Valid) and the locked locations publish (4c.3,
+    /// review `6bc4f569` gate 4). Tests use it to make "the row was
+    /// fenced between readback and publish" deterministic. Never set in
+    /// production; compiled out entirely outside `cfg(test)`.
+    #[cfg(test)]
+    publish_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 /// Per-call upper bound on proposed pages for every 4c.2 bounded-mutation
@@ -339,9 +522,11 @@ impl CacheService {
             issue_lock: Mutex::new(()),
             segment: Mutex::new(None),
             plans: Mutex::new(HashMap::new()),
-            locations: Mutex::new(HashMap::new()),
+            state: Mutex::new(CacheVolatile::default()),
             #[cfg(test)]
             barrier_hook: Mutex::new(None),
+            #[cfg(test)]
+            publish_hook: Mutex::new(None),
         }
     }
 
@@ -408,6 +593,29 @@ impl CacheService {
     #[inline(always)]
     fn fire_barrier_hook(&self) {}
 
+    /// Arm the one-shot publish-race seam (test-only): fires between a
+    /// commit's exact-Valid readback and its locked locations publish.
+    #[cfg(test)]
+    pub(crate) fn set_publish_hook(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        *self.publish_hook.lock().unwrap() = Some(hook);
+    }
+
+    /// Fire (and disarm) the publish hook if armed. The guard is released
+    /// before invoking the hook (same rule as the barrier hook: a hook
+    /// that re-enters the service must not re-lock this mutex).
+    #[cfg(test)]
+    fn fire_publish_hook(&self) {
+        let hook = self.publish_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Production no-op (see `fire_publish_hook`).
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn fire_publish_hook(&self) {}
+
     /// Whole-object lookup. `hit` requires a `Valid`, unexpired entry AND
     /// (when `need_locations`) a complete volatile location set for the
     /// derived block layout — anything missing is a miss (caller falls
@@ -428,9 +636,13 @@ impl CacheService {
         if !self.incarnation_active(incarnation)? {
             return Err(Self::fenced(incarnation));
         }
-        let store = self.fs_dir.read();
-        let rocks = store.get_rocks_store();
-        let entry = rocks.cache_get_entry(incarnation, key).map_err(fs_err)?;
+        // Lock order (4c.3 invariant): the fs_dir guard is scoped to
+        // this read and dropped before the volatile lock below.
+        let entry = {
+            let store = self.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            rocks.cache_get_entry(incarnation, key).map_err(fs_err)?
+        };
         let Some(entry) = entry else {
             return Ok(None);
         };
@@ -445,7 +657,7 @@ impl CacheService {
         let layout = CacheBlockLayout::derive(entry.object_id, entry.len, entry.block_size)?;
         let mut blocks = Vec::new();
         if need_locations {
-            let locations = self.locations.lock().unwrap();
+            let locations = &self.state.lock().unwrap().locations;
             let Some(object_locations) = locations.get(&entry.object_id) else {
                 return Ok(None);
             };
@@ -1215,88 +1427,170 @@ impl CacheService {
             .sync_propose_cache(entry)
             .map_err(fs_err)?;
         // Test seam: "another mutation raced the barrier" lands
-        // deterministically here, before the terminal readback.
+        // deterministically here, before the terminal settlement.
         self.fire_barrier_hook();
+        self.commit_barrier_settle(
+            &load_token,
+            incarnation,
+            key,
+            generation,
+            object_id,
+            len,
+            ufs_mtime,
+            expire_at,
+            plan.block_size,
+            blocks,
+        )
+    }
 
-        // Barrier readback: if a revoke/remount fenced the incarnation
-        // while the barrier ran, the apply was a deterministic no-op (the
-        // entry stays Reserved) — report the terminal fence, never a
-        // generic readback failure a client would keep retrying.
-        if !self.incarnation_active(incarnation)? {
-            self.plans.lock().unwrap().remove(&load_token);
-            return Err(Self::fenced(incarnation));
+    /// Post-barrier settlement of one validated commit (4c.3, reviews
+    /// `6bc4f569` gate 4 / `4b2e2a72` P0-2): the propose barrier has
+    /// returned and the plan + block evidence are already validated. Every
+    /// DEAD terminal branch — revoked incarnation, vanished row, advanced
+    /// or tombstoned row, fenced-at-publish race — hands the validated
+    /// evidence to physical GC under the volatile lock with an
+    /// authoritative recheck before the plan is spent; only an exact-Valid
+    /// row publishes. Without this, a commit that raced an
+    /// invalidate/revoke would strand the workers' physical blocks until
+    /// the 4d orphan pass. Lock order (4c.3 invariant): volatile →
+    /// fs_dir read, and no propose / WorkerManager access under volatile.
+    /// Test seam: unit tests call this directly to reproduce the
+    /// propose→readback race deterministically (the raft barrier itself
+    /// fails closed in testing mode).
+    #[allow(clippy::too_many_arguments)]
+    fn commit_barrier_settle(
+        &self,
+        load_token: &OpToken,
+        incarnation: u64,
+        key: &str,
+        generation: u64,
+        object_id: i64,
+        len: i64,
+        ufs_mtime: i64,
+        expire_at: i64,
+        block_size: i64,
+        blocks: Vec<CacheBlockLocation>,
+    ) -> CommonResult<CacheOpStatus> {
+        // Test seam (4c.3, review `6bc4f569` gate 4): "the row was fenced
+        // between the barrier and the locked publish below" lands
+        // deterministically here. Compiled out in production.
+        self.fire_publish_hook();
+
+        // Coordinated decision (review `618498f7`): read the
+        // authoritative incarnation state AND the entry row while holding
+        // the volatile lock (order: volatile → fs_dir read), so an
+        // inactive namespace can never be outrun by an exact-Valid
+        // publish — a fenced incarnation wins even over an exact row,
+        // and the workers' blocks still go to GC:
+        //
+        // - namespace active AND row exact-Valid full match → publish
+        //   (recording the geometry for the later GC handoff of THIS
+        //   object);
+        // - namespace active, exact identity but divergent immutable
+        //   fields → loud divergence (plan kept for triage);
+        // - anything else (revoked/stale namespace, missing, advanced,
+        //   tombstoned row) → NEVER publish: merge the commit's block
+        //   evidence into the retained locations (so the GC drain can
+        //   target the workers that actually hold the blocks) and ensure
+        //   a work item exists — re-seeding both if the drain already
+        //   completed. A late publish would otherwise resurrect a dead
+        //   object's locations after GC finished.
+        enum Settlement {
+            Applied,
+            Superseded { current: u64 },
+            Fenced,
+            Divergence(CacheEntry),
         }
-
-        // Readback from committed state, re-classified from the committed
-        // row: another mutation (invalidate, a later allocation) may have
-        // fenced the entry between our propose barrier and this read.
-        // Only an exact Valid readback publishes the volatile locations;
-        // a fenced or advanced row is terminal Superseded for this load —
-        // never a generic error that a client would keep retrying.
-        {
-            let store = self.fs_dir.read();
-            let rocks = store.get_rocks_store();
-            let cur = rocks
-                .cache_get_entry(incarnation, key)
-                .map_err(fs_err)?
-                .ok_or_else(|| cm_err("cache commit readback: entry vanished"))?;
-            if cur.state == CacheEntryState::Valid
-                && cur.generation == generation
-                && cur.object_id == object_id
-            {
-                if cur.len != len || cur.ufs_mtime != ufs_mtime || cur.expire_at != expire_at {
-                    return err_box!(
-                        "cache commit readback divergence for ({}, {})@{}: committed len {} mtime {} expire_at {} vs request len {} mtime {} expire_at {}",
-                        incarnation,
-                        key,
-                        generation,
-                        cur.len,
-                        cur.ufs_mtime,
-                        cur.expire_at,
-                        len,
-                        ufs_mtime,
-                        expire_at
-                    );
-                }
-                // Exact Valid readback (this propose or an identical
-                // replay): publish below.
-            } else if cur.generation > generation
-                || (cur.generation == generation && cur.state == CacheEntryState::Tombstoned)
-            {
-                // The load is dead: a later generation fenced it mid-
-                // barrier. Terminal, no retry.
-                drop(store);
-                self.plans.lock().unwrap().remove(&load_token);
-                return Ok(CacheOpStatus::Superseded {
-                    expected: generation,
-                    current: cur.generation,
-                });
-            } else {
-                return err_box!(
-                    "cache commit barrier readback failed for ({}, {}): {:?}",
+        let settlement = {
+            let mut volatile = self.state.lock().unwrap();
+            let active = self.incarnation_active(incarnation)?;
+            let cur = {
+                let store = self.fs_dir.read();
+                let rocks = store.get_rocks_store();
+                rocks.cache_get_entry(incarnation, key).map_err(fs_err)?
+            };
+            if !active {
+                self.merge_dead_commit_evidence(
+                    &mut volatile,
                     incarnation,
-                    key,
-                    cur
-                );
+                    object_id,
+                    len,
+                    block_size,
+                    &blocks,
+                )?;
+                Settlement::Fenced
+            } else if cur.as_ref().is_some_and(|cur| {
+                cur.state == CacheEntryState::Valid
+                    && cur.generation == generation
+                    && cur.object_id == object_id
+                    && cur.len == len
+                    && cur.ufs_mtime == ufs_mtime
+                    && cur.expire_at == expire_at
+            }) {
+                let object_locations = volatile.locations.entry(object_id).or_default();
+                object_locations.len = len;
+                object_locations.block_size = block_size;
+                object_locations.blocks.clear();
+                for (index, block) in blocks.into_iter().enumerate() {
+                    object_locations
+                        .blocks
+                        .insert((index + 1) as i64, block.workers);
+                }
+                Settlement::Applied
+            } else if cur.as_ref().is_some_and(|cur| {
+                cur.state == CacheEntryState::Valid
+                    && cur.generation == generation
+                    && cur.object_id == object_id
+            }) {
+                Settlement::Divergence(cur.unwrap())
+            } else {
+                // Dead (missing / advanced / tombstoned) exactly as the
+                // race gate describes: hand the evidence to GC instead
+                // of publishing.
+                self.merge_dead_commit_evidence(
+                    &mut volatile,
+                    incarnation,
+                    object_id,
+                    len,
+                    block_size,
+                    &blocks,
+                )?;
+                Settlement::Superseded {
+                    current: cur.map_or(0, |cur| cur.generation),
+                }
             }
+        };
+        match settlement {
+            Settlement::Applied => {
+                // Terminal state reached: the plan is spent.
+                self.plans.lock().unwrap().remove(load_token);
+                Ok(CacheOpStatus::Applied)
+            }
+            Settlement::Superseded { current } => {
+                // The load is terminal: the plan is spent either way.
+                self.plans.lock().unwrap().remove(load_token);
+                Ok(CacheOpStatus::Superseded {
+                    expected: generation,
+                    current,
+                })
+            }
+            Settlement::Fenced => {
+                self.plans.lock().unwrap().remove(load_token);
+                Err(Self::fenced(incarnation))
+            }
+            Settlement::Divergence(cur) => err_box!(
+                "cache commit readback divergence for ({}, {})@{}: committed len {} mtime {} expire_at {} vs request len {} mtime {} expire_at {}",
+                incarnation,
+                key,
+                generation,
+                cur.len,
+                cur.ufs_mtime,
+                cur.expire_at,
+                len,
+                ufs_mtime,
+                expire_at
+            ),
         }
-
-        // Publishing the client-reported set is safe here: every reported
-        // worker was just verified field-wise against the planned worker,
-        // so the published endpoints are byte-identical to the plan's
-        // canonical addresses (the subset that actually holds the block).
-        let mut locations = self.locations.lock().unwrap();
-        let object_locations = locations.entry(object_id).or_default();
-        object_locations.blocks.clear();
-        for (index, block) in blocks.into_iter().enumerate() {
-            object_locations
-                .blocks
-                .insert((index + 1) as i64, block.workers);
-        }
-        drop(locations);
-        // Terminal state reached: the plan is spent.
-        self.plans.lock().unwrap().remove(&load_token);
-        Ok(CacheOpStatus::Applied)
     }
 
     /// Invalidate / remove one cache object: a generation fence to
@@ -1333,10 +1627,19 @@ impl CacheService {
             let rocks = store.get_rocks_store();
             match rocks.cache_get_entry(incarnation, key).map_err(fs_err)? {
                 None => {
+                    // The whole row is gone (vacuum). The object is dead,
+                    // but a MISSING row proves nothing about which object
+                    // this key owned — `expected_object_id` is
+                    // client-supplied, so it must NOT drive any volatile
+                    // cleanup (a forged id would delete a live object's
+                    // locations; review `4b2e2a72` P0-1). Physical GC for
+                    // vacuumed objects comes from the vacuum driver's
+                    // server-derived frozen victims.
+                    drop(store);
                     return Ok(CacheOpStatus::Superseded {
                         expected: new_generation,
                         current: 0,
-                    })
+                    });
                 }
                 Some(cur) if cur.generation > new_generation => {
                     // Fenced far past our target: terminal Superseded.
@@ -1344,9 +1647,14 @@ impl CacheService {
                     // object identity we were told to fence — never on an
                     // unverified id.
                     let verified = cur.object_id == expected_object_id;
+                    let geometry = if verified && cur.len > 0 {
+                        Some((cur.len, cur.block_size))
+                    } else {
+                        None
+                    };
                     drop(store);
                     if verified {
-                        self.drop_object_state(&cur.object_id);
+                        self.retire_object_state(incarnation, cur.object_id, geometry)?;
                     }
                     return Ok(CacheOpStatus::Superseded {
                         expected: new_generation,
@@ -1369,8 +1677,10 @@ impl CacheService {
                                 expected_object_id
                             );
                         }
+                        // A tombstone zeroes len: geometry falls back to
+                        // the commit-published one inside the retire.
                         drop(store);
-                        self.drop_object_state(&cur.object_id);
+                        self.retire_object_state(incarnation, cur.object_id, None)?;
                         return Ok(CacheOpStatus::AlreadyApplied);
                     }
                     // Some other mutation wrote the fenced generation:
@@ -1388,9 +1698,14 @@ impl CacheService {
                     // (e.g. a UFS-write fence): terminal Superseded, with
                     // the same verified-identity cleanup rule.
                     let verified = cur.object_id == expected_object_id;
+                    let geometry = if verified && cur.len > 0 {
+                        Some((cur.len, cur.block_size))
+                    } else {
+                        None
+                    };
                     drop(store);
                     if verified {
-                        self.drop_object_state(&cur.object_id);
+                        self.retire_object_state(incarnation, cur.object_id, geometry)?;
                     }
                     return Ok(CacheOpStatus::Superseded {
                         expected: new_generation,
@@ -1458,8 +1773,10 @@ impl CacheService {
                     && cur.generation == new_generation
                     && cur.object_id == expected_object_id =>
             {
+                // Our fence applied; the tombstone zeroes len, so the GC
+                // geometry falls back to the commit-published one.
                 drop(store);
-                self.drop_object_state(&cur.object_id);
+                self.retire_object_state(incarnation, cur.object_id, None)?;
                 Ok(CacheOpStatus::Applied)
             }
             Some(cur)
@@ -1471,9 +1788,14 @@ impl CacheService {
                 // invalidate is terminal Superseded (its load, if any, is
                 // dead). Cleanup only on a verified identity.
                 let verified = cur.object_id == expected_object_id;
+                let geometry = if verified && cur.len > 0 {
+                    Some((cur.len, cur.block_size))
+                } else {
+                    None
+                };
                 drop(store);
                 if verified {
-                    self.drop_object_state(&cur.object_id);
+                    self.retire_object_state(incarnation, cur.object_id, geometry)?;
                 }
                 Ok(CacheOpStatus::Superseded {
                     expected: new_generation,
@@ -1511,6 +1833,71 @@ impl CacheService {
                     MAX_KEY_BYTES,
                     a.len()
                 );
+            }
+        }
+        Ok(())
+    }
+
+    /// Post-propose dead-identity classification (4c.3, review
+    /// `6bc4f569` gate 2): a successful propose does NOT mean every
+    /// journaled victim's CAS applied — classify each victim from the
+    /// COMMITTED row after the barrier. Dead = the row is missing
+    /// (vacuumed), already belongs to a different object, the whole
+    /// incarnation is inactive (revoked), or the same object sits
+    /// Tombstoned. A same-object Reserved/Valid row in a LIVE incarnation
+    /// means the victim's fence did not apply — the object is alive and
+    /// is NEVER handed to physical GC. Returns the victim object's
+    /// geometry when the committed row still carries it (a tombstone
+    /// zeroes `len`; callers fall back to geometry frozen earlier from a
+    /// full row or to the commit-published one).
+    fn classify_dead_victim(
+        &self,
+        incarnation: u64,
+        key: &str,
+        object_id: i64,
+    ) -> CommonResult<(bool, Option<(i64, i64)>)> {
+        let active = self.incarnation_active(incarnation)?;
+        let row = {
+            let store = self.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            // Lock order (4c.3 invariant): the fs_dir guard is dropped
+            // before the caller takes the volatile lock in retire.
+            rocks.cache_get_entry(incarnation, key).map_err(fs_err)?
+        };
+        let geometry = |cur: &CacheEntry| (cur.len > 0).then_some((cur.len, cur.block_size));
+        Ok(match row {
+            None => (true, None),
+            Some(cur) if cur.object_id != object_id => (true, None),
+            Some(cur) if !active => (true, geometry(&cur)),
+            Some(cur) if cur.state == CacheEntryState::Tombstoned => (true, geometry(&cur)),
+            // Same-object Reserved/Valid in a live incarnation: alive.
+            Some(_) => (false, None),
+        })
+    }
+
+    /// Shared post-propose physical handoff of the sweep/scope/vacuum
+    /// drivers (4c.3, review `6bc4f569` gate 2): classify each journaled
+    /// victim from the COMMITTED row and retire only PROVEN-dead
+    /// identities to the GC queue. A successful propose does not mean
+    /// every victim's CAS applied — a live same-object row is never
+    /// handed to physical GC. Geometry falls back to the driver-frozen
+    /// pre-propose geometry when the committed row no longer carries it
+    /// (a tombstone zeroes `len`). Extracted so unit tests drive the
+    /// exact production loop with an apply stand-in (the raft barrier
+    /// itself fails closed in testing mode).
+    fn retire_dead_victims(
+        &self,
+        victims: &[(u64, String, i64)],
+        frozen: &HashMap<(String, i64), (i64, i64)>,
+    ) -> CommonResult<()> {
+        for (incarnation, key, object_id) in victims {
+            let (dead, row_geometry) = self.classify_dead_victim(*incarnation, key, *object_id)?;
+            if dead {
+                self.retire_object_state(
+                    *incarnation,
+                    *object_id,
+                    row_geometry.or(frozen.get(&(key.clone(), *object_id)).copied()),
+                )?;
             }
         }
         Ok(())
@@ -1601,6 +1988,20 @@ impl CacheService {
             let last_key = page.last().unwrap().0.clone();
             let journaled = victims.len();
             if !victims.is_empty() {
+                // 4c.3 (review `6bc4f569` gate 5): freeze each victim's
+                // geometry from the raw page row — the applied tombstone
+                // will zero `len`, and this row (object ids are immutable
+                // and never reused) carries the victim object's exact
+                // geometry.
+                let frozen: HashMap<(String, i64), (i64, i64)> = page
+                    .iter()
+                    .filter(|(_, e)| e.state != CacheEntryState::Tombstoned && e.len > 0)
+                    .map(|(k, e)| ((k.clone(), e.object_id), (e.len, e.block_size)))
+                    .collect();
+                let victim_ids: Vec<(u64, String, i64)> = victims
+                    .iter()
+                    .map(|v| (incarnation, v.key.clone(), v.object_id))
+                    .collect();
                 let op_id = self.fs_dir.read().next_op_id();
                 let entry = JournalEntry::CacheScopeRemove(CacheScopeRemoveEntry {
                     op_id,
@@ -1612,6 +2013,10 @@ impl CacheService {
                 self.journal_writer
                     .sync_propose_cache(entry)
                     .map_err(fs_err)?;
+                // 4c.3 physical handoff (review `6bc4f569` gate 2):
+                // classify each journaled victim from the committed row
+                // — only a PROVEN-dead identity is retired to GC.
+                self.retire_dead_victims(&victim_ids, &frozen)?;
             }
             // Counts journaled victims only: an all-tombstone (already
             // applied) page journals nothing.
@@ -1661,6 +2066,28 @@ impl CacheService {
                 });
             }
             let next_cursor = ExpiryCursor::from(page.last().unwrap());
+            // 4c.3 (review `6bc4f569` gate 5): expiry rows carry no
+            // geometry, so freeze each victim's geometry with a bounded
+            // exact entry lookup BEFORE the propose — the applied
+            // tombstone zeroes `len`. A row that already belongs to a
+            // different object (or is missing) yields no geometry and the
+            // retire falls back to the commit-published one.
+            let frozen: HashMap<(String, i64), (i64, i64)> = {
+                let store = self.fs_dir.read();
+                let rocks = store.get_rocks_store();
+                let mut frozen = HashMap::new();
+                for v in &page {
+                    if let Some(cur) = rocks
+                        .cache_get_entry(v.incarnation, &v.key)
+                        .map_err(fs_err)?
+                    {
+                        if cur.object_id == v.object_id && cur.len > 0 {
+                            frozen.insert((v.key.clone(), v.object_id), (cur.len, cur.block_size));
+                        }
+                    }
+                }
+                frozen
+            };
             let op_id = self.fs_dir.read().next_op_id();
             let entry = JournalEntry::CacheTtlSweep(CacheTtlSweepEntry {
                 op_id,
@@ -1671,6 +2098,12 @@ impl CacheService {
             self.journal_writer
                 .sync_propose_cache(entry)
                 .map_err(fs_err)?;
+            // 4c.3 physical handoff (review `6bc4f569` gate 2).
+            let victim_ids: Vec<(u64, String, i64)> = page
+                .iter()
+                .map(|v| (v.incarnation, v.key.clone(), v.object_id))
+                .collect();
+            self.retire_dead_victims(&victim_ids, &frozen)?;
             processed += page.len();
             cursor = Some(next_cursor);
             if page.len() < MUTATION_PAGE_CAP {
@@ -1750,6 +2183,14 @@ impl CacheService {
                     processed,
                 });
             }
+            // 4c.3 (review `6bc4f569` gate 5): vacuum pages raw entry
+            // rows, so each victim's geometry freezes directly from the
+            // page (immutable per object).
+            let frozen: HashMap<(String, i64), (i64, i64)> = page
+                .iter()
+                .filter(|(_, e)| e.len > 0)
+                .map(|(k, e)| ((k.clone(), e.object_id), (e.len, e.block_size)))
+                .collect();
             let victims: Vec<VacuumVictim> = page
                 .iter()
                 .map(|(k, e)| VacuumVictim {
@@ -1771,6 +2212,15 @@ impl CacheService {
             self.journal_writer
                 .sync_propose_cache(entry)
                 .map_err(fs_err)?;
+            // 4c.3 physical handoff (review `6bc4f569` gate 2): the
+            // incarnation is revoked, so classify will prove every
+            // remaining row of it dead; geometry comes from the frozen
+            // page row.
+            let victim_ids: Vec<(u64, String, i64)> = page
+                .iter()
+                .map(|(k, e)| (incarnation, k.clone(), e.object_id))
+                .collect();
+            self.retire_dead_victims(&victim_ids, &frozen)?;
             processed += page.len();
             cursor = Some(last_key);
             if page.len() < MUTATION_PAGE_CAP {
@@ -1786,6 +2236,44 @@ impl CacheService {
             cursor,
             processed,
         })
+    }
+
+    /// One physical-GC handoff tick (4c.3, review `6bc4f569` gate 3 /
+    /// `327b30d2` item 1): extract a bounded round-robin batch of
+    /// `(worker_id, block_id)` pairs under the volatile lock, RELEASE
+    /// the lock, then enqueue each pair into the worker delete queue
+    /// (`WorkerManager::remove_block` — `BlockMap`'s HashSet makes
+    /// duplicate enqueues idempotent). The workers receive the deletes
+    /// on their next heartbeats and ack via block reports, exactly like
+    /// fs-mode deletes. Leader-gated: a follower's tick is a no-op (its
+    /// volatile queue is empty anyway — it is never fed off the raft
+    /// apply path). Physical-side failures are logged and never
+    /// propagated: a failed tick must not fail the worker heartbeat,
+    /// and committed metadata is never rolled back (the drain cursor
+    /// stays advanced; the 4d full report re-derives anything the queue
+    /// lost).
+    pub fn gc_handoff_tick(&self, workers: &ArcRwLock<WorkerManager>) {
+        if !self.monitor.is_active() {
+            return;
+        }
+        let batch = match self.state.lock() {
+            Ok(mut volatile) => volatile.gc_take_batch(),
+            Err(_) => return,
+        };
+        let batch = match batch {
+            Ok(batch) => batch,
+            Err(e) => {
+                log::warn!("cache gc handoff tick skipped a corrupt work item: {}", e);
+                return;
+            }
+        };
+        if batch.is_empty() {
+            return;
+        }
+        let mut wm = workers.write();
+        for (worker_id, block_id) in batch {
+            wm.remove_block(worker_id, block_id);
+        }
     }
 
     /// Bounded outcome-window GC (4c.2): page the outcome rows with the
@@ -2132,14 +2620,110 @@ impl CacheService {
         }
     }
 
-    /// Drop the volatile state (locations + every plan) of one object:
-    /// called when the object's row reaches a terminal state.
-    fn drop_object_state(&self, object_id: &i64) {
-        self.locations.lock().unwrap().remove(object_id);
+    /// Retire one object to physical GC (4c.3, review `6bc4f569`
+    /// gate 2/3): called only with a PROVEN-dead committed identity
+    /// (row missing / different object / same-object Tombstoned, or an
+    /// inactive incarnation). Plans for the object are dropped
+    /// immediately; the retained locations entry survives until the GC
+    /// drain completes (the drain's completion is the only thing that
+    /// removes it). A GC work item is enqueued when the frozen geometry
+    /// is known — from the retiring row (`geometry`, a full committed
+    /// row: tombstones zero `len`) or, failing that, from the geometry
+    /// the commit publish recorded next to the locations. With neither
+    /// source (e.g. the object never published locations — a Reserved
+    /// load fenced mid-write) no item is created: the unreported
+    /// physical blocks are the 4d full-report/orphan pass's problem.
+    ///
+    /// Lock order (4c.3 invariant): volatile only, then the plans leaf
+    /// lock separately — never nested, and never an fs_dir guard here.
+    fn retire_object_state(
+        &self,
+        incarnation: u64,
+        object_id: i64,
+        geometry: Option<(i64, i64)>,
+    ) -> CommonResult<()> {
+        {
+            let mut volatile = self.state.lock().unwrap();
+            let recorded = volatile
+                .locations
+                .get(&object_id)
+                .filter(|l| l.block_size > 0 && !l.blocks.is_empty())
+                .map(|l| (l.len, l.block_size));
+            let known = geometry.or(recorded);
+            if let Some((len, block_size)) = known {
+                // Idempotent for a response-loss retry: an existing item
+                // for this object_id keeps its drain cursor.
+                volatile.gc.enqueue(CacheGcWork {
+                    incarnation,
+                    object_id,
+                    len,
+                    block_size,
+                    next_seq: 1,
+                })?;
+            } else if !volatile.gc.items.contains_key(&object_id) {
+                // No geometry and no locations (and no earlier item):
+                // nothing drainable — drop any retained entry so it
+                // cannot leak. The 4d full report re-derives whatever
+                // unreported physical blocks exist.
+                volatile.gc.order.retain(|id| *id != object_id);
+                volatile.locations.remove(&object_id);
+            }
+        }
         self.plans
             .lock()
             .unwrap()
-            .retain(|_, plan| &plan.object_id != object_id);
+            .retain(|_, plan| plan.object_id != object_id);
+        Ok(())
+    }
+
+    /// Merge a dead commit's block evidence into the retained locations
+    /// and (re-)ensure a GC work item exists (review `6bc4f569` gate 4).
+    /// Called with the volatile lock held, only when the locked
+    /// re-check proved the committed row is no longer an exact-Valid
+    /// match for the commit: the client-reported workers DID receive
+    /// these blocks, so the GC drain must be able to target them. If
+    /// the object's drain already completed (item gone, locations
+    /// removed), the evidence re-seeds both — the fresh item restarts
+    /// at `next_seq = 1`; BlockMap's HashSet makes any re-derived
+    /// duplicate enqueue idempotent.
+    fn merge_dead_commit_evidence(
+        &self,
+        volatile: &mut CacheVolatile,
+        incarnation: u64,
+        object_id: i64,
+        len: i64,
+        block_size: i64,
+        blocks: &[CacheBlockLocation],
+    ) -> CommonResult<()> {
+        let (known_len, known_block_size) = {
+            let object_locations = volatile.locations.entry(object_id).or_default();
+            if object_locations.block_size == 0 {
+                object_locations.len = len;
+                object_locations.block_size = block_size;
+            }
+            for (index, block) in blocks.iter().enumerate() {
+                let entry = object_locations
+                    .blocks
+                    .entry((index + 1) as i64)
+                    .or_default();
+                for w in &block.workers {
+                    if !entry.iter().any(|x| x.worker_id == w.worker_id) {
+                        entry.push(w.clone());
+                    }
+                }
+            }
+            (object_locations.len, object_locations.block_size)
+        };
+        if !volatile.gc.items.contains_key(&object_id) {
+            volatile.gc.enqueue(CacheGcWork {
+                incarnation,
+                object_id,
+                len: known_len,
+                block_size: known_block_size,
+                next_seq: 1,
+            })?;
+        }
+        Ok(())
     }
 
     fn require_leader(&self) -> CommonResult<()> {
@@ -2306,14 +2890,19 @@ impl CacheService {
 
     /// Test/restore seam for volatile locations (a full block report will
     /// use the same table in 4d). Accepts only complete, validated sets.
+    /// The layout's geometry is recorded exactly like a real commit
+    /// publish would (4c.3), so later GC-retire fallbacks see it.
     #[cfg(test)]
     fn install_locations(
         &self,
         object_id: i64,
+        layout: &CacheBlockLayout,
         blocks: Vec<CacheBlockLocation>,
     ) -> CommonResult<()> {
-        let mut locations = self.locations.lock().unwrap();
+        let locations = &mut self.state.lock().unwrap().locations;
         let object_locations = locations.entry(object_id).or_default();
+        object_locations.len = layout.len;
+        object_locations.block_size = layout.block_size;
         object_locations.blocks.clear();
         for (index, block) in blocks.into_iter().enumerate() {
             object_locations
@@ -2321,6 +2910,24 @@ impl CacheService {
                 .insert((index + 1) as i64, block.workers);
         }
         Ok(())
+    }
+
+    /// Test seam: does the volatile GC queue hold a work item for this
+    /// object?
+    #[cfg(test)]
+    fn gc_has_work(&self, object_id: i64) -> bool {
+        self.state.lock().unwrap().gc.items.contains_key(&object_id)
+    }
+
+    /// Test seam: is this object's locations entry still retained (live
+    /// published, or retained until the GC drain completes)?
+    #[cfg(test)]
+    fn location_retained(&self, object_id: i64) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .locations
+            .contains_key(&object_id)
     }
 
     /// Test seam for volatile load plans (stand-in for a completed
@@ -2507,9 +3114,13 @@ mod tests {
     use crate::master::Master;
     use curvine_config::{ClusterConf, JournalConf, MasterConf};
     use curvine_core_error::ErrorExt;
-    use curvine_model::{AccessMode, MountOptions, WriteType};
+    use curvine_model::{
+        AccessMode, HeartbeatStatus, MountOptions, TransferWorkerCapabilities, WorkerCommand,
+        WriteType,
+    };
     use curvine_raft::raft::{RaftClient, RoleState};
     use curvine_runtime::sync::StateCtl;
+    use std::collections::BTreeSet;
 
     const OBJ: i64 = BlockIdCodec::CACHE_OBJECT_MIN;
 
@@ -2792,7 +3403,7 @@ mod tests {
 
         // Complete -> hit with exact derived ids/lengths.
         service
-            .install_locations(OBJ, full_locations(&lay))
+            .install_locations(OBJ, &lay, full_locations(&lay))
             .unwrap();
         let hit = service.get(1, "/k", true).unwrap().expect("hit");
         assert_eq!(hit.blocks.len(), 3);
@@ -2806,7 +3417,7 @@ mod tests {
         // Drop the last block -> whole-object miss.
         let mut partial = full_locations(&lay);
         partial.pop();
-        service.install_locations(OBJ, partial).unwrap();
+        service.install_locations(OBJ, &lay, partial).unwrap();
         assert!(
             service.get(1, "/k", true).unwrap().is_none(),
             "missing block location must be a whole-object miss"
@@ -2832,7 +3443,7 @@ mod tests {
         // Expire in the past (passive expiry; active scan lands in 4c).
         committed_entry(&service, token(2, 1), token(2, 2), "/k", OBJ, 64, 1);
         service
-            .install_locations(OBJ, full_locations(&layout(OBJ, 64)))
+            .install_locations(OBJ, &layout(OBJ, 64), full_locations(&layout(OBJ, 64)))
             .unwrap();
         assert!(service.get(1, "/k", true).unwrap().is_none());
         assert!(service.get(1, "/k", false).unwrap().is_none());
@@ -3541,13 +4152,16 @@ mod tests {
             store.cache.apply_remove(rocks, 1, "/k", 1, 2, OBJ).unwrap();
         }
         service
-            .install_locations(OBJ, full_locations(&layout(OBJ, 64)))
+            .install_locations(OBJ, &layout(OBJ, 64), full_locations(&layout(OBJ, 64)))
             .unwrap();
         assert_eq!(
             service.invalidate(7, 1, "/k", 1, OBJ).unwrap(),
             CacheOpStatus::AlreadyApplied
         );
-        assert!(!service.locations.lock().unwrap().contains_key(&OBJ));
+        assert!(
+            service.gc_has_work(OBJ),
+            "AlreadyApplied retire enqueues GC work"
+        );
 
         // Expected generation beyond the row: divergence error.
         assert!(service.invalidate(7, 1, "/k", 9, OBJ).is_err());
@@ -3600,7 +4214,7 @@ mod tests {
         let b = OBJ + 50;
         let b_lay = layout(b, 64);
         service
-            .install_locations(b, full_locations(&b_lay))
+            .install_locations(b, &b_lay, full_locations(&b_lay))
             .unwrap();
         service.install_plan(token(6, 1), plan_for(&b_lay));
 
@@ -3609,7 +4223,7 @@ mod tests {
         let err = service.invalidate(7, 1, "/k", 1, b).unwrap_err();
         assert!(format!("{}", err).contains("identity mismatch"), "{}", err);
         assert!(
-            service.locations.lock().unwrap().contains_key(&b),
+            service.location_retained(b),
             "forged invalidate must not clear another object's locations"
         );
         assert!(
@@ -3620,15 +4234,15 @@ mod tests {
         // Positive control: quoting the row's real object id resolves
         // AlreadyApplied and drops A's own state.
         service
-            .install_locations(OBJ, full_locations(&layout(OBJ, 64)))
+            .install_locations(OBJ, &layout(OBJ, 64), full_locations(&layout(OBJ, 64)))
             .unwrap();
         assert_eq!(
             service.invalidate(7, 1, "/k", 1, OBJ).unwrap(),
             CacheOpStatus::AlreadyApplied
         );
-        assert!(!service.locations.lock().unwrap().contains_key(&OBJ));
+        assert!(service.gc_has_work(OBJ), "A's retire enqueues GC work");
         // B is untouched by A's terminal resolution.
-        assert!(service.locations.lock().unwrap().contains_key(&b));
+        assert!(service.location_retained(b));
     }
 
     /// Invalidate Superseded branches clean volatile state ONLY when the
@@ -3647,7 +4261,7 @@ mod tests {
             store.cache.apply_remove(rocks, 1, "/k", 2, 3, OBJ).unwrap();
         }
         service
-            .install_locations(OBJ, full_locations(&layout(OBJ, 64)))
+            .install_locations(OBJ, &layout(OBJ, 64), full_locations(&layout(OBJ, 64)))
             .unwrap();
 
         // expected_generation 1 fences at 2; the row is already at 3:
@@ -3659,7 +4273,10 @@ mod tests {
                 current: 3
             }
         );
-        assert!(!service.locations.lock().unwrap().contains_key(&OBJ));
+        assert!(
+            service.gc_has_work(OBJ),
+            "verified-identity Superseded retire enqueues GC work"
+        );
 
         // Same fence quoting a different object id: still terminal
         // Superseded (the row advanced regardless), but the OTHER object's
@@ -3667,7 +4284,7 @@ mod tests {
         let b = OBJ + 51;
         let b_lay = layout(b, 64);
         service
-            .install_locations(b, full_locations(&b_lay))
+            .install_locations(b, &b_lay, full_locations(&b_lay))
             .unwrap();
         assert_eq!(
             service.invalidate(7, 1, "/k", 1, b).unwrap(),
@@ -3677,7 +4294,7 @@ mod tests {
             }
         );
         assert!(
-            service.locations.lock().unwrap().contains_key(&b),
+            service.location_retained(b),
             "unverified identity must not clear volatile state"
         );
     }
@@ -4514,6 +5131,713 @@ mod tests {
         assert_eq!(
             (frozen.state, frozen.generation),
             (CacheEntryState::Tombstoned, 2)
+        );
+    }
+
+    // ---- 4c.3 physical GC handoff (reviews `6bc4f569` / `327b30d2` /
+    // `4b2e2a72` / `618498f7`) ----
+
+    /// Install one GC job into a bare volatile state: full geometry, and
+    /// per-block worker sets only for the first `known` indexes (0/1/many
+    /// block objects; unknown indexes exercise the skip-replica rule).
+    fn gc_job(volatile: &mut CacheVolatile, object_id: i64, len: i64, known: usize) {
+        let mut locs = ObjectLocations {
+            len,
+            block_size: 64,
+            blocks: HashMap::new(),
+        };
+        for index in 1..=known {
+            locs.blocks.insert(index as i64, vec![worker(7)]);
+        }
+        volatile.locations.insert(object_id, locs);
+        volatile
+            .gc
+            .enqueue(CacheGcWork {
+                incarnation: 1,
+                object_id,
+                len,
+                block_size: 64,
+                next_seq: 1,
+            })
+            .unwrap();
+    }
+
+    /// Queue-level dedup and the loud geometry divergence (gate 1): a
+    /// response-loss retry with the same frozen geometry keeps the drain
+    /// cursor (never restarts a drain); the same object_id with different
+    /// geometry is impossible for an immutable object and fails loud.
+    #[test]
+    fn test_gc_queue_dedup_and_geometry_loud() {
+        let mut q = CacheGcQueue::default();
+        let work = CacheGcWork {
+            incarnation: 1,
+            object_id: OBJ,
+            len: 130,
+            block_size: 64,
+            next_seq: 1,
+        };
+        q.enqueue(work).unwrap();
+        // Partially drain (cursor deep into the object).
+        q.items.get_mut(&OBJ).unwrap().next_seq = 200;
+        // Response-loss retry: same geometry → idempotent, cursor kept.
+        q.enqueue(work).unwrap();
+        assert_eq!(q.order.len(), 1);
+        assert_eq!(q.items[&OBJ].next_seq, 200);
+        // Geometry divergence (same id, different immutable geometry):
+        // loud, never a silent overwrite.
+        let bad = CacheGcWork { len: 131, ..work };
+        let err = q.enqueue(bad).unwrap_err();
+        assert!(err.to_string().contains("geometry divergence"), "{}", err);
+        // A different incarnation for the same id is the same class of
+        // impossibility.
+        let bad = CacheGcWork {
+            incarnation: 2,
+            ..work
+        };
+        assert!(q.enqueue(bad).is_err());
+    }
+
+    /// Round-robin extraction (review `327b30d2` item 2): every
+    /// unfinished object gets at most one quantum per turn (a late small
+    /// job still progresses behind earlier big ones), the global per-tick
+    /// cap is honored exactly, unknown-location indexes are skipped while
+    /// the cursor advances, and completion removes the work item AND the
+    /// retained locations. A max-legal-layout object drains in bounded
+    /// ticks without monopolizing the budget.
+    #[test]
+    fn test_gc_take_batch_round_robin_cap_skip() {
+        let mut volatile = CacheVolatile::default();
+        // A: 3 blocks (done in one turn). B/C/D/E: 266 blocks each (C has
+        // locations for only the first 2 indexes). F: empty object.
+        gc_job(&mut volatile, OBJ, 130, 3);
+        gc_job(&mut volatile, OBJ + 1, 266 * 64, 266);
+        gc_job(&mut volatile, OBJ + 2, 266 * 64, 2);
+        gc_job(&mut volatile, OBJ + 3, 266 * 64, 266);
+        gc_job(&mut volatile, OBJ + 4, 266 * 64, 266);
+        gc_job(&mut volatile, OBJ + 5, 0, 0);
+
+        // Tick 1: budget 1024 is consumed exactly (3 + 256 + 256 + 256 +
+        // 253); E still got its turn despite being fifth — fairness.
+        let batch1 = volatile.gc_take_batch().unwrap();
+        // C's unknown indexes produce no (worker, block) pair but still
+        // consume budget; only indexes 1..=2 of C are known.
+        assert_eq!(batch1.len(), 3 + 256 + 2 + 256 + 253);
+        assert!(!volatile.gc.items.contains_key(&OBJ), "small job completes");
+        assert!(!volatile.locations.contains_key(&OBJ));
+        assert_eq!(volatile.gc.items[&(OBJ + 1)].next_seq, 257);
+        assert_eq!(volatile.gc.items[&(OBJ + 2)].next_seq, 257);
+        assert_eq!(volatile.gc.items[&(OBJ + 3)].next_seq, 257);
+        assert_eq!(
+            volatile.gc.items[&(OBJ + 4)].next_seq,
+            254,
+            "the fifth job still got its partial quantum"
+        );
+        assert!(
+            volatile.gc.items.contains_key(&(OBJ + 5)),
+            "empty job waits for the next tick"
+        );
+
+        // Drain to completion: total delivered pairs are exactly the
+        // known replicas (F delivers none), and everything is removed.
+        let mut total = batch1.len();
+        let mut ticks = 1;
+        while !volatile.gc.items.is_empty() {
+            let batch = volatile.gc_take_batch().unwrap();
+            assert!(
+                batch.len() <= GC_HANDOFF_BLOCKS_PER_TICK,
+                "per-tick hard cap"
+            );
+            total += batch.len();
+            ticks += 1;
+            assert!(ticks < 20, "266-block objects must drain in a few ticks");
+        }
+        assert_eq!(total, 3 + 266 + 2 + 266 + 266);
+        assert!(volatile.gc.order.is_empty());
+        assert!(
+            volatile.locations.is_empty(),
+            "completion is the only location removal"
+        );
+
+        // Max legal layout (BLOCK_SEQ_MAX blocks): bounded multi-tick
+        // progress, never more than one quantum per turn.
+        let mut volatile = CacheVolatile::default();
+        let max_len = BlockIdCodec::BLOCK_SEQ_MAX * 64;
+        gc_job(&mut volatile, OBJ, max_len, 2);
+        for _ in 0..3 {
+            let batch = volatile.gc_take_batch().unwrap();
+            assert!(batch.len() <= 2, "only the 2 known replicas emit pairs");
+        }
+        assert_eq!(
+            volatile.gc.items[&OBJ].next_seq,
+            1 + 3 * GC_HANDOFF_QUANTUM as u32,
+            "bounded per-turn quanta accumulate exactly"
+        );
+        assert!(
+            volatile.locations.contains_key(&OBJ),
+            "retained until drain completes"
+        );
+    }
+
+    /// The four metadata→GC handoff paths and the never-GC rules (gate 2):
+    /// point-invalidate, scope-remove, TTL-sweep all retire ONLY
+    /// proven-dead identities; a live same-object row is never handed to
+    /// physical GC; a stale/different object id never disturbs the
+    /// current object's volatile state. Manager applies stand in for the
+    /// committed proposes (the raft barrier fails closed in tests); the
+    /// retire loop is the drivers' shared production code.
+    #[test]
+    fn test_gc_handoff_paths_live_never() {
+        let service = build_service("gc-paths", chooser(vec![worker(1), worker(2)]));
+        mount_incarnation(&service, 1, 0);
+
+        // Point invalidate (verified post-propose arm): committed Valid
+        // row + published locations, the fence applies, then classify +
+        // retire exactly as the verified arm runs them.
+        committed_entry(&service, token(2, 1), token(2, 2), "/k", OBJ, 130, 0);
+        let lay = layout(OBJ, 130);
+        service
+            .install_locations(OBJ, &lay, full_locations(&lay))
+            .unwrap();
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            store.cache.apply_remove(rocks, 1, "/k", 1, 2, OBJ).unwrap();
+        }
+        let (dead, geometry) = service.classify_dead_victim(1, "/k", OBJ).unwrap();
+        assert!(dead);
+        assert_eq!(geometry, None, "a tombstone zeroes len");
+        service.retire_object_state(1, OBJ, geometry).unwrap();
+        assert!(service.gc_has_work(OBJ));
+        assert!(
+            service.location_retained(OBJ),
+            "retained until the drain completes"
+        );
+
+        // Scope remove: the driver's shared post-propose loop with the
+        // frozen-geometry fallback.
+        committed_entry(&service, token(3, 1), token(3, 2), "/a/x", OBJ + 10, 300, 0);
+        let lay = layout(OBJ + 10, 300);
+        service
+            .install_locations(OBJ + 10, &lay, full_locations(&lay))
+            .unwrap();
+        let frozen = {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let page = rocks
+                .cache_scan_entries_in_scope(1, "/a", None, 64)
+                .unwrap();
+            let victims = CacheService::scope_page_victims(&page).unwrap();
+            store
+                .cache
+                .apply_scope_remove(rocks, 1, "/a", &victims)
+                .unwrap();
+            page.iter()
+                .filter(|(_, e)| e.state != CacheEntryState::Tombstoned && e.len > 0)
+                .map(|(k, e)| ((k.clone(), e.object_id), (e.len, e.block_size)))
+                .collect::<HashMap<(String, i64), (i64, i64)>>()
+        };
+        service
+            .retire_dead_victims(&[(1, "/a/x".into(), OBJ + 10)], &frozen)
+            .unwrap();
+        assert!(service.gc_has_work(OBJ + 10));
+
+        // TTL sweep: the due expiry row applies, then the shared loop;
+        // the applied tombstone carries no geometry, so the retire falls
+        // back to the commit-published one.
+        committed_entry(
+            &service,
+            token(4, 1),
+            token(4, 2),
+            "/ttl",
+            OBJ + 20,
+            130,
+            1234,
+        );
+        let lay = layout(OBJ + 20, 130);
+        service
+            .install_locations(OBJ + 20, &lay, full_locations(&lay))
+            .unwrap();
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let row = ExpiryRow {
+                expire_at: 1234,
+                incarnation: 1,
+                object_id: OBJ + 20,
+                key: "/ttl".into(),
+                generation: 1,
+            };
+            store.cache.apply_ttl_sweep(rocks, 2000, &[row]).unwrap();
+        }
+        service
+            .retire_dead_victims(&[(1, "/ttl".into(), OBJ + 20)], &HashMap::new())
+            .unwrap();
+        assert!(service.gc_has_work(OBJ + 20));
+
+        // Live same-object row (the journaled fence did NOT apply): the
+        // classify refuses, nothing is enqueued, the object stays
+        // servable.
+        committed_entry(
+            &service,
+            token(5, 1),
+            token(5, 2),
+            "/live",
+            OBJ + 30,
+            130,
+            0,
+        );
+        let lay = layout(OBJ + 30, 130);
+        service
+            .install_locations(OBJ + 30, &lay, full_locations(&lay))
+            .unwrap();
+        let (dead, geometry) = service.classify_dead_victim(1, "/live", OBJ + 30).unwrap();
+        assert!(!dead, "a live same-object row is NEVER dead");
+        assert_eq!(geometry, None);
+        service
+            .retire_dead_victims(&[(1, "/live".into(), OBJ + 30)], &HashMap::new())
+            .unwrap();
+        assert!(!service.gc_has_work(OBJ + 30));
+        assert!(service.location_retained(OBJ + 30));
+        assert!(service.get(1, "/live", true).unwrap().is_some());
+
+        // Stale/different object id: the victim identity is dead (the key
+        // now belongs to another object), but retiring it must not touch
+        // the CURRENT object's volatile state.
+        let (dead, geometry) = service.classify_dead_victim(1, "/live", OBJ + 999).unwrap();
+        assert!(dead);
+        assert_eq!(geometry, None);
+        service.retire_object_state(1, OBJ + 999, geometry).unwrap();
+        assert!(!service.gc_has_work(OBJ + 999));
+        assert!(service.location_retained(OBJ + 30));
+        assert!(service.get(1, "/live", true).unwrap().is_some());
+    }
+
+    /// Vacuum handoff (gate 2): a revoked incarnation's rows are removed
+    /// by the vacuum apply; every page row is server-derived (proven
+    /// provenance), so all of them retire with the page-frozen geometry.
+    #[test]
+    fn test_gc_handoff_vacuum_path() {
+        let service = build_service("gc-vacuum", chooser(vec![worker(1)]));
+        mount_incarnation(&service, 1, 0);
+        committed_entry(&service, token(2, 1), token(2, 2), "/k", OBJ, 130, 0);
+        let lay = layout(OBJ, 130);
+        service
+            .install_locations(OBJ, &lay, full_locations(&lay))
+            .unwrap();
+        let frozen = {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            store.cache.apply_incarnation_revoke(rocks, 5, 1).unwrap();
+            let page = rocks.cache_scan_entries(1, None, 64).unwrap();
+            let victims: Vec<VacuumVictim> = page
+                .iter()
+                .map(|(k, e)| VacuumVictim {
+                    key: k.clone(),
+                    generation: e.generation,
+                    object_id: e.object_id,
+                    expire_at: e.expire_at,
+                })
+                .collect();
+            store.cache.apply_vacuum(rocks, 1, 5, &victims).unwrap();
+            page.iter()
+                .filter(|(_, e)| e.len > 0)
+                .map(|(k, e)| ((k.clone(), e.object_id), (e.len, e.block_size)))
+                .collect::<HashMap<(String, i64), (i64, i64)>>()
+        };
+        service
+            .retire_dead_victims(&[(1, "/k".into(), OBJ)], &frozen)
+            .unwrap();
+        assert!(service.gc_has_work(OBJ));
+        assert!(service.location_retained(OBJ));
+    }
+
+    /// Review `4b2e2a72` P0-1 regression: a missing row proves NOTHING
+    /// about which object the key owned — a point invalidate quoting a
+    /// forged (live) victim id must stay terminal-metadata-only and never
+    /// touch that object's volatile state.
+    #[test]
+    fn test_invalidate_missing_row_provenance() {
+        let service = build_service("invalidate-provenance", chooser(vec![worker(1), worker(2)]));
+        mount_incarnation(&service, 1, 0);
+        committed_entry(&service, token(2, 1), token(2, 2), "/k", OBJ, 130, 0);
+        let lay = layout(OBJ, 130);
+        service
+            .install_locations(OBJ, &lay, full_locations(&lay))
+            .unwrap();
+
+        assert_eq!(
+            service.invalidate(7, 1, "/missing", 1, OBJ).unwrap(),
+            CacheOpStatus::Superseded {
+                expected: 2,
+                current: 0
+            }
+        );
+        assert!(!service.gc_has_work(OBJ), "no provenance, no GC");
+        assert!(service.location_retained(OBJ), "live locations survive");
+        assert!(service.get(1, "/k", true).unwrap().is_some());
+    }
+
+    /// One worker heartbeat through the real WorkerManager chain
+    /// (`heartbeat(Running)` → `BlockMap::handle_heartbeat`), returning
+    /// the DeleteBlock ids carried for that worker.
+    fn heartbeat_deletes(
+        wm: &ArcRwLock<WorkerManager>,
+        cluster_id: &str,
+        worker_id: u32,
+    ) -> BTreeSet<i64> {
+        let cmds = {
+            let mut g = wm.write();
+            g.heartbeat(
+                cluster_id,
+                HeartbeatStatus::Running,
+                worker(worker_id),
+                1,
+                "session".into(),
+                TransferWorkerCapabilities::default(),
+                "test".into(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap()
+        };
+        let mut ids = BTreeSet::new();
+        for cmd in cmds {
+            let WorkerCommand::DeleteBlock(c) = cmd;
+            ids.extend(c.blocks);
+        }
+        ids
+    }
+
+    fn block_id_set(lay: &CacheBlockLayout, from: i64, to: i64) -> BTreeSet<i64> {
+        (from..=to).map(|i| lay.block_id(i).unwrap()).collect()
+    }
+
+    /// Review `4b2e2a72` P0-2 + `6bc4f569` gate 4: the commit settlement.
+    /// A load invalidated between propose and readback resolves terminal
+    /// Superseded, its validated block evidence goes to GC (never a late
+    /// publish), and the real heartbeat chain delivers the exact
+    /// DeleteBlock ids to every replica worker.
+    #[test]
+    fn test_commit_settle_dead_handoff_race() {
+        // (a) propose→readback race: the racing invalidate's tombstone is
+        // already committed when the settlement reads the row.
+        let service = build_service("settle-race", chooser(vec![worker(1), worker(2)]));
+        mount_incarnation(&service, 1, 0);
+        committed_entry(&service, token(2, 1), token(2, 2), "/k", OBJ, 130, 0);
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            store.cache.apply_remove(rocks, 1, "/k", 1, 2, OBJ).unwrap();
+        }
+        let lay = layout(OBJ, 130);
+        assert_eq!(
+            service
+                .commit_barrier_settle(
+                    &token(2, 1),
+                    1,
+                    "/k",
+                    1,
+                    OBJ,
+                    130,
+                    777,
+                    0,
+                    64,
+                    full_locations(&lay),
+                )
+                .unwrap(),
+            CacheOpStatus::Superseded {
+                expected: 1,
+                current: 2
+            }
+        );
+        assert!(!service.plans.lock().unwrap().contains_key(&token(2, 1)));
+        assert!(service.gc_has_work(OBJ));
+        assert!(service.location_retained(OBJ));
+
+        // Full drain through the production tick + the real heartbeat
+        // chain: each replica worker receives exactly the object's 3
+        // block ids, and the completion clears the retained locations.
+        let wm: ArcRwLock<WorkerManager> =
+            ArcRwLock::new(WorkerManager::new(&ClusterConf::default()).unwrap());
+        let cluster_id = wm.read().cluster_id.clone();
+        service.gc_handoff_tick(&wm);
+        let expected = block_id_set(&lay, 1, 3);
+        assert_eq!(heartbeat_deletes(&wm, &cluster_id, 1), expected);
+        assert_eq!(heartbeat_deletes(&wm, &cluster_id, 2), expected);
+        assert!(!service.gc_has_work(OBJ), "3 blocks drain in one tick");
+        assert!(!service.location_retained(OBJ));
+    }
+
+    /// Gate 4 determinism: the fenced-between-readback-and-publish race
+    /// lands on the `publish_hook` seam; the fenced branch (a revoked
+    /// namespace) wins even over an exact-Valid row (review `618498f7`);
+    /// the exact-Valid live path publishes; an exact-identity field
+    /// divergence stays loud.
+    #[test]
+    fn test_commit_settle_publish_hook_fence_and_divergence() {
+        // (b) readback→publish race via the publish hook: the settlement
+        // re-checks INSIDE the volatile lock and never publishes a row
+        // the hook just tombstoned.
+        let service = Arc::new(build_service(
+            "settle-publish-hook",
+            chooser(vec![worker(1), worker(2)]),
+        ));
+        mount_incarnation(&service, 1, 0);
+        committed_entry(&service, token(2, 1), token(2, 2), "/k", OBJ, 130, 0);
+        let hook_service = service.clone();
+        service.set_publish_hook(Box::new(move || {
+            let store = hook_service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            store.cache.apply_remove(rocks, 1, "/k", 1, 2, OBJ).unwrap();
+        }));
+        let lay = layout(OBJ, 130);
+        assert_eq!(
+            service
+                .commit_barrier_settle(
+                    &token(2, 1),
+                    1,
+                    "/k",
+                    1,
+                    OBJ,
+                    130,
+                    777,
+                    0,
+                    64,
+                    full_locations(&lay),
+                )
+                .unwrap(),
+            CacheOpStatus::Superseded {
+                expected: 1,
+                current: 2
+            }
+        );
+        assert!(service.gc_has_work(OBJ), "raced evidence goes to GC");
+        assert!(service.location_retained(OBJ));
+        // The merged evidence drains to exactly the commit's workers.
+        let batch = service.state.lock().unwrap().gc_take_batch().unwrap();
+        let expected = block_id_set(&lay, 1, 3);
+        assert_eq!(
+            batch.iter().map(|&(w, b)| (w, b)).collect::<BTreeSet<_>>(),
+            [(1u32, 0i64); 0]
+                .into_iter()
+                .chain(
+                    expected
+                        .iter()
+                        .flat_map(|&b| [(1, b), (2, b)])
+                        .collect::<Vec<_>>()
+                )
+                .collect::<BTreeSet<_>>()
+        );
+        assert!(!service.gc_has_work(OBJ));
+        assert!(!service.location_retained(OBJ));
+
+        // (c) fenced namespace beats an exact-Valid row: the evidence
+        // still goes to GC, the load answers the typed fence.
+        let service = build_service("settle-fenced", chooser(vec![worker(1)]));
+        mount_incarnation(&service, 1, 0);
+        committed_entry(&service, token(2, 1), token(2, 2), "/k", OBJ, 130, 0);
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            store.cache.apply_incarnation_revoke(rocks, 5, 1).unwrap();
+        }
+        let lay = layout(OBJ, 130);
+        let err = service
+            .commit_barrier_settle(
+                &token(2, 1),
+                1,
+                "/k",
+                1,
+                OBJ,
+                130,
+                777,
+                0,
+                64,
+                full_locations(&lay),
+            )
+            .unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("terminal") && msg.contains("incarnation 1"),
+            "{}",
+            msg
+        );
+        assert!(
+            service.gc_has_work(OBJ),
+            "fenced load's evidence still goes to GC"
+        );
+        assert!(service.location_retained(OBJ));
+
+        // (d) exact-Valid live row: publish, whole-object hit, no GC.
+        let service = build_service("settle-applied", chooser(vec![worker(1), worker(2)]));
+        mount_incarnation(&service, 1, 0);
+        committed_entry(&service, token(2, 1), token(2, 2), "/k", OBJ, 130, 0);
+        let lay = layout(OBJ, 130);
+        assert_eq!(
+            service
+                .commit_barrier_settle(
+                    &token(2, 1),
+                    1,
+                    "/k",
+                    1,
+                    OBJ,
+                    130,
+                    777,
+                    0,
+                    64,
+                    full_locations(&lay),
+                )
+                .unwrap(),
+            CacheOpStatus::Applied
+        );
+        assert!(!service.gc_has_work(OBJ));
+        assert!(service.location_retained(OBJ));
+        assert!(service.get(1, "/k", true).unwrap().is_some());
+
+        // (e) exact identity, divergent immutable field: loud divergence,
+        // never a silent classification.
+        let err = service
+            .commit_barrier_settle(
+                &token(2, 1),
+                1,
+                "/k",
+                1,
+                OBJ,
+                131,
+                777,
+                0,
+                64,
+                full_locations(&layout(OBJ, 131)),
+            )
+            .unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("divergence"), "{}", msg);
+    }
+
+    /// Production heartbeat progress (review `327b30d2` item 1 +
+    /// heartbeat-progress gate): two jobs of very different sizes drain
+    /// through consecutive real heartbeats — the small job completes in
+    /// the first tick alongside the large job's first quantum (fairness),
+    /// the second tick finishes the large job, and every replica worker's
+    /// DeleteBlock ids are exact.
+    #[test]
+    fn test_gc_handoff_tick_heartbeat_fairness() {
+        let service = build_service("gc-heartbeat", chooser(vec![worker(1), worker(2)]));
+        mount_incarnation(&service, 1, 0);
+        committed_entry(&service, token(2, 1), token(2, 2), "/small", OBJ, 130, 0);
+        committed_entry(
+            &service,
+            token(3, 1),
+            token(3, 2),
+            "/large",
+            OBJ + 1,
+            300 * 64,
+            0,
+        );
+        for (obj, len) in [(OBJ, 130i64), (OBJ + 1, 300 * 64)] {
+            let lay = layout(obj, len);
+            service
+                .install_locations(obj, &lay, full_locations(&lay))
+                .unwrap();
+            service
+                .retire_object_state(1, obj, Some((len, 64)))
+                .unwrap();
+        }
+
+        let wm: ArcRwLock<WorkerManager> =
+            ArcRwLock::new(WorkerManager::new(&ClusterConf::default()).unwrap());
+        let cluster_id = wm.read().cluster_id.clone();
+        let small = layout(OBJ, 130);
+        let large = layout(OBJ + 1, 300 * 64);
+
+        // Heartbeat 1: the small job's 3 blocks complete AND the large
+        // job gets its first 256 — no starvation behind the big object.
+        service.gc_handoff_tick(&wm);
+        let got = heartbeat_deletes(&wm, &cluster_id, 1);
+        assert_eq!(got.len(), 3 + 256);
+        for id in block_id_set(&small, 1, 3) {
+            assert!(got.contains(&id), "small job must progress in tick 1");
+        }
+        for id in block_id_set(&large, 1, 256) {
+            assert!(got.contains(&id));
+        }
+        assert!(!got.contains(&large.block_id(257).unwrap()));
+        // Ack worker 1's deletes like a block report would.
+        {
+            let mut g = wm.write();
+            for id in &got {
+                g.deleted_block(1, *id);
+            }
+        }
+        assert!(!service.gc_has_work(OBJ), "small job done after tick 1");
+        assert!(!service.location_retained(OBJ));
+
+        // Heartbeat 2: the large job's remaining 44 blocks finish it, on
+        // both replica workers.
+        service.gc_handoff_tick(&wm);
+        let tail = heartbeat_deletes(&wm, &cluster_id, 1);
+        assert_eq!(tail, block_id_set(&large, 257, 300));
+        let mut worker2_expected = block_id_set(&small, 1, 3);
+        worker2_expected.extend(block_id_set(&large, 1, 300));
+        let worker2_got = heartbeat_deletes(&wm, &cluster_id, 2);
+        assert_eq!(
+            worker2_got, worker2_expected,
+            "worker 2 receives both ticks' replica sets on its first beat"
+        );
+        assert!(!service.gc_has_work(OBJ + 1));
+        assert!(!service.location_retained(OBJ + 1));
+
+        // Nothing left: ack both workers like block reports, then a
+        // further tick + heartbeat carries no command.
+        {
+            let mut g = wm.write();
+            for id in &tail {
+                g.deleted_block(1, *id);
+            }
+            for id in &worker2_got {
+                g.deleted_block(2, *id);
+            }
+        }
+        service.gc_handoff_tick(&wm);
+        assert!(heartbeat_deletes(&wm, &cluster_id, 1).is_empty());
+    }
+
+    /// Follower tick no-op (review `327b30d2` item 1): a non-leader's
+    /// tick never enqueues deletes; the work survives for the leader.
+    #[test]
+    fn test_gc_tick_follower_noop() {
+        let service = build_service("gc-follower", chooser(vec![worker(1)]));
+        mount_incarnation(&service, 1, 0);
+        committed_entry(&service, token(2, 1), token(2, 2), "/k", OBJ, 130, 0);
+        let lay = layout(OBJ, 130);
+        service
+            .install_locations(OBJ, &lay, full_locations(&lay))
+            .unwrap();
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            store.cache.apply_remove(rocks, 1, "/k", 1, 2, OBJ).unwrap();
+        }
+        service.retire_object_state(1, OBJ, None).unwrap();
+        assert!(service.gc_has_work(OBJ));
+
+        let wm: ArcRwLock<WorkerManager> =
+            ArcRwLock::new(WorkerManager::new(&ClusterConf::default()).unwrap());
+        let cluster_id = wm.read().cluster_id.clone();
+        service.monitor.journal_ctl.set_state(RoleState::Follower);
+        service.gc_handoff_tick(&wm);
+        assert!(
+            heartbeat_deletes(&wm, &cluster_id, 1).is_empty(),
+            "follower tick must not enqueue deletes"
+        );
+        assert!(service.gc_has_work(OBJ), "work survives for the leader");
+
+        service.monitor.journal_ctl.set_state(RoleState::Leader);
+        service.gc_handoff_tick(&wm);
+        assert_eq!(
+            heartbeat_deletes(&wm, &cluster_id, 1),
+            block_id_set(&lay, 1, 3)
         );
     }
 }

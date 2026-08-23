@@ -741,6 +741,18 @@ impl MasterHandler {
             fs.reset_full_block_report(address.worker_id);
         }
 
+        // 4c.3 physical GC handoff (review `6bc4f569` gate 3 /
+        // `327b30d2` item 1): the leader drains a bounded batch of cache
+        // block deletes into the worker delete queue BEFORE this
+        // handler takes the WorkerManager write lock — the tick takes
+        // the same write lock only after releasing the volatile state,
+        // so the "volatile released, then wm write" order holds here
+        // too. The tick is leader-gated and a no-op for followers. The
+        // heartbeat below then carries this worker's pending
+        // DeleteBlockCmd; other workers receive theirs on their own
+        // heartbeats.
+        fs.cache_service.gc_handoff_tick(&fs.worker_manager);
+
         let mut wm = fs.worker_manager.write();
         let cmds = wm.heartbeat(
             &header.cluster_id,
