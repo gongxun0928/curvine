@@ -1643,8 +1643,9 @@ mod tests {
     /// 5. **Commit-vs-Invalidate interleave**: a one-shot seam injects a
     ///    full invalidate between the commit propose barrier's return and
     ///    the commit's terminal readback; the readback must re-classify to
-    ///    terminal `Superseded{1, 2}` (P1-3), and a same-token retry must
-    ///    resolve from the recorded Committed outcome as AlreadyApplied.
+    ///    terminal `Superseded{1, 2}` (P1-3), and a same-token retry stays
+    ///    terminal Superseded — the fenced row wins over the recorded
+    ///    Committed outcome (Superseded is terminal, §3).
     #[test]
     fn real_raft_allocate_commit_epoch_interleave() {
         let leader_mode_env = "CURVINE_TEST_CACHE_ALLOC_LEADER";
@@ -2062,7 +2063,9 @@ mod tests {
         );
 
         // 6. Same-token commit retry after the lost Superseded response:
-        //    the recorded Committed outcome resolves it as AlreadyApplied.
+        //    the exact Committed outcome does NOT resolve AlreadyApplied —
+        //    the row is Tombstoned@2 and Superseded is terminal, so the
+        //    durable row must still win.
         let retry_status = cache
             .commit(CacheCommitParams {
                 token: OpToken {
@@ -2084,7 +2087,14 @@ mod tests {
                 blocks: a_retry.blocks.clone(),
             })
             .unwrap();
-        assert_eq!(retry_status, CacheOpStatus::AlreadyApplied);
+        assert_eq!(
+            retry_status,
+            CacheOpStatus::Superseded {
+                expected: 1,
+                current: 2
+            },
+            "same-token retry after a fenced commit stays terminal Superseded"
+        );
 
         std::process::exit(0);
     }

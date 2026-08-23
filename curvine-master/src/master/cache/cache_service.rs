@@ -254,7 +254,8 @@ pub struct CacheService {
     /// barrier's return and the code's post-barrier verification (reserve
     /// epoch check / commit-invalidate readback). Tests use it to make
     /// "another mutation raced the barrier" deterministic. Never set in
-    /// production.
+    /// production; compiled out entirely outside `cfg(test)`.
+    #[cfg(test)]
     barrier_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
@@ -274,6 +275,7 @@ impl CacheService {
             segment: Mutex::new(None),
             plans: Mutex::new(HashMap::new()),
             locations: Mutex::new(HashMap::new()),
+            #[cfg(test)]
             barrier_hook: Mutex::new(None),
         }
     }
@@ -290,12 +292,19 @@ impl CacheService {
     /// before invoking the hook: a hook that re-enters the service (e.g. a
     /// nested invalidate proposing its own command) must not re-lock this
     /// mutex on the same thread.
+    #[cfg(test)]
     fn fire_barrier_hook(&self) {
         let hook = self.barrier_hook.lock().unwrap().take();
         if let Some(hook) = hook {
             hook();
         }
     }
+
+    /// Production no-op: the seam is compiled out outside tests, so a
+    /// cache barrier never pays an extra mutex lock.
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn fire_barrier_hook(&self) {}
 
     /// Whole-object lookup. `hit` requires a `Valid`, unexpired entry AND
     /// (when `need_locations`) a complete volatile location set for the
@@ -716,12 +725,17 @@ impl CacheService {
         let expire_at = 0i64;
 
         // Commit-token durable idempotency first: a retry after a lost
-        // response resolves to its recorded Committed outcome regardless
-        // of how far the entry row has advanced since. The outcome binds
-        // the FULL immutable request (load token + geometry + fence):
-        // AlreadyApplied requires an exact match of every field — a token
-        // replayed with any different parameter is divergence, never a
-        // silent AlreadyApplied.
+        // response resolves to its recorded Committed outcome. The outcome
+        // binds the FULL immutable request (load token + geometry + fence):
+        // only an exact match of every field is a replay — a token replayed
+        // with any different parameter is divergence, never a silent
+        // AlreadyApplied. An exact match does NOT short-circuit here,
+        // though: Superseded is terminal, so the retry is still classified
+        // from the committed row below. If a later generation fenced the
+        // entry after this commit recorded its outcome, the row (missing /
+        // Tombstoned / advanced) answers Superseded; only a same-generation
+        // exact Valid row answers AlreadyApplied.
+        let mut committed_outcome_exact = false;
         {
             let store = self.fs_dir.read();
             let rocks = store.get_rocks_store();
@@ -745,13 +759,9 @@ impl CacheService {
                         && out_mtime == ufs_mtime
                         && out_expire_at == expire_at
                     {
-                        // The load this token committed is terminal: its
-                        // volatile plan is spent.
-                        drop(store);
-                        self.plans.lock().unwrap().remove(&load_token);
-                        return Ok(CacheOpStatus::AlreadyApplied);
-                    }
-                    return err_box!(
+                        committed_outcome_exact = true;
+                    } else {
+                        return err_box!(
                         "cache commit token {:?} replayed with different parameters: committed ({}, {})@{} object {} load {:?} len {} mtime {} expire_at {}",
                         token,
                         out_inc,
@@ -763,6 +773,7 @@ impl CacheService {
                         out_mtime,
                         out_expire_at
                     );
+                    }
                 }
                 Some(other) => {
                     return err_box!(
@@ -904,6 +915,15 @@ impl CacheService {
                         len,
                         ufs_mtime
                     );
+                }
+                Some(_) if committed_outcome_exact => {
+                    // Unreachable in practice: the commit entry writes the
+                    // Committed outcome and the Valid row atomically. If a
+                    // Reserved row ever shows up here at the exact recorded
+                    // identity, resolve idempotently and spend the plan.
+                    drop(store);
+                    self.plans.lock().unwrap().remove(&load_token);
+                    return Ok(CacheOpStatus::AlreadyApplied);
                 }
                 Some(_) => (), // Reserved at the right identity: apply.
             }
@@ -2183,15 +2203,10 @@ mod tests {
     fn test_commit_outcome_retry_already_applied() {
         let service = build_service("commit-retry", chooser(vec![worker(1)]));
         committed_entry(&service, token(2, 1), token(2, 2), "/k", OBJ, 130, 0);
-        // Later mutations (removal) advanced the row far past the commit;
-        // the commit-token outcome must still win.
-        {
-            let store = service.fs_dir.read();
-            let rocks = store.get_rocks_store();
-            store.cache.apply_remove(rocks, 1, "/k", 1, 2, OBJ).unwrap();
-        }
-        // A live plan for the load exists: the AlreadyApplied resolution
-        // must spend it (terminal cleanup).
+
+        // Same-generation exact Valid row: the recorded-outcome retry is
+        // AlreadyApplied, and a live plan for the load is spent (terminal
+        // cleanup).
         let lay = layout(OBJ, 130);
         service.install_plan(token(2, 1), plan_for(&lay));
         let status = service
@@ -2201,6 +2216,29 @@ mod tests {
         assert!(
             !service.plans.lock().unwrap().contains_key(&token(2, 1)),
             "recorded-outcome AlreadyApplied must clear the load's plan"
+        );
+
+        // Later mutations (removal) fenced the row past the commit: the
+        // exact outcome match must NOT resolve AlreadyApplied — Superseded
+        // is terminal, so the fenced row wins even for the original token.
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            store.cache.apply_remove(rocks, 1, "/k", 1, 2, OBJ).unwrap();
+        }
+        service.install_plan(token(2, 1), plan_for(&lay));
+        assert_eq!(
+            service
+                .commit(commit_params(token(2, 1), token(2, 2), vec![]))
+                .unwrap(),
+            CacheOpStatus::Superseded {
+                expected: 1,
+                current: 2
+            }
+        );
+        assert!(
+            !service.plans.lock().unwrap().contains_key(&token(2, 1)),
+            "fenced-row Superseded must clear the load's plan"
         );
 
         // Same commit token with ANY different parameter is divergence,
