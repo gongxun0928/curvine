@@ -2266,9 +2266,10 @@ mod tests {
 
         // 4b. 4d R5: the epoch advance cold-cleared the volatile plans
         // together with the rest of the cache domain — the pending
-        // commit for load (9, 1) now fails closed as a retryable
-        // "no live plan" miss, and the exact allocate replay re-plans
-        // the same committed identity under the new epoch.
+        // commit for load (9, 1) resolves to the typed REPLAN_NEEDED
+        // status (task #5 RC `40e47dcb`: a re-planable state, not a
+        // string Err), and the exact allocate replay re-plans the
+        // same committed identity under the new epoch.
         let miss = cache
             .commit(CacheCommitParams {
                 token: OpToken {
@@ -2289,11 +2290,11 @@ mod tests {
                 ttl_ms: 0,
                 blocks: a_retry.blocks.clone(),
             })
-            .unwrap_err();
-        assert!(
-            format!("{}", miss).contains("no live plan"),
-            "post-epoch commit is a retryable plan miss, got: {}",
-            miss
+            .unwrap();
+        assert_eq!(
+            miss,
+            CacheOpStatus::ReplanNeeded,
+            "post-epoch commit is a typed re-planable miss"
         );
         let a_post = cache
             .allocate(

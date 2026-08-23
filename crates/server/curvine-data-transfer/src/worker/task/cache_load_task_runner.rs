@@ -31,6 +31,14 @@
 //!    by a same-token retry returns the same durable outcome.
 //! 4. crash/restart: the commit is self-contained (token + identity +
 //!    len + ufs_mtime + succeeded locations), no worker-resident state.
+//!    If the master lost the volatile plan (restart) or invalidated its
+//!    fences (worker session/epoch change), the commit comes back as a
+//!    typed REPLAN_NEEDED (RC `40e47dcb` + `3d91a095`) — the runner
+//!    replays the EXACT allocate (same load token, same identity, fresh
+//!    plan), rewrites every block per the NEW placements, rebuilds the
+//!    ACK evidence, and re-commits, all inside the task timeout budget.
+//!    An already-applied commit is never re-allocated: its recovery
+//!    path is commit-side only.
 //! 5. a superseded commit (fresher concurrent winner) is a terminal
 //!    success for this task: the loser's row is reclaimed by the master.
 
@@ -164,83 +172,85 @@ impl CacheLoadTaskRunner {
         let file_len = status.len;
         let ufs_mtime = status.mtime;
 
-        // CacheAllocate with the master-minted retry-stable load token.
-        // Zero-length files do NOT skip this: the service accepts len 0
-        // and returns an empty plan (hard gate 1).
+        // Two-state closed loop (hard gates 3+4, RC `40e47dcb` +
+        // `3d91a095`), driven end-to-end by `drive_cache_load`:
+        //
+        // - Allocate with the master-minted retry-stable load token
+        //   (zero-length files do NOT skip it: the service accepts len 0
+        //   and returns an empty plan, hard gate 1), write the planned
+        //   blocks recording the locations that ACTUALLY completed, then
+        //   commit self-contained evidence with a verbatim retry.
+        // - REPLAN_NEEDED (volatile plan lost to a master restart, or
+        //   plan fences invalidated by a worker session/epoch change
+        //   after the writes; the commit has NOT applied): replay the
+        //   EXACT allocate — same load token, same identity, fresh plan —
+        //   rewrite every block per the NEW placements, rebuild the ACK
+        //   evidence, and re-commit, bounded by the task timeout budget.
+        // - An applied commit (response loss) is NEVER re-allocated: the
+        //   master's per-client watermark (2) makes the load token (1)
+        //   evictable by the bounded outcome window, so recovery rides
+        //   the commit-side path alone.
         let client = self.fs.fs_client();
-        let alloc = client
-            .cache_allocate(
-                spec.load_token,
-                spec.incarnation,
-                &spec.key,
-                file_len,
-                self.task.info.job.block_size,
-            )
-            .await?;
 
-        let mut written: i64 = 0;
-        let mut committed_blocks = Vec::with_capacity(alloc.blocks.len());
-        if file_len > 0 {
-            let mut reader = ufs.open(&source_path).await?;
-            if reader.len() != file_len {
-                return err_box!(
-                    "cache load source {} changed length after status (expected {}, reader {})",
-                    source_path.full_path(),
-                    file_len,
-                    reader.len()
-                );
+        let allocate = {
+            let client = client.clone();
+            let spec = spec.clone();
+            move || {
+                let client = client.clone();
+                let spec = spec.clone();
+                async move {
+                    client
+                        .cache_allocate(
+                            spec.load_token,
+                            spec.incarnation,
+                            &spec.key,
+                            file_len,
+                            self.task.info.job.block_size,
+                        )
+                        .await
+                }
             }
-
-            for block in &alloc.blocks {
-                let (loaded, completed) = self
-                    .write_planned_block(&mut reader, block, written, file_len)
-                    .await?;
-                written = loaded;
-                committed_blocks.push(completed);
+        };
+        let write = |alloc: curvine_proto::CacheAllocateResponse| {
+            // `alloc` must be owned by the future (a replan round gets a
+            // fresh plan value); `self`/`ufs`/`source_path` are borrows
+            // of this fn's scope, which outlives every round, so the
+            // async block only moves Copy references.
+            let ufs = &ufs;
+            let source_path = &source_path;
+            async move { self.write_round(ufs, source_path, file_len, &alloc).await }
+        };
+        let commit = {
+            let client = client.clone();
+            let spec = spec.clone();
+            move |evidence: CommitEvidence| {
+                let client = client.clone();
+                let spec = spec.clone();
+                async move {
+                    client
+                        .cache_commit(
+                            spec.commit_token,
+                            spec.load_token,
+                            spec.incarnation,
+                            &spec.key,
+                            evidence.generation,
+                            evidence.object_id,
+                            file_len,
+                            ufs_mtime,
+                            evidence.blocks,
+                        )
+                        .await
+                }
             }
-            reader.complete().await?;
-        } else if !alloc.blocks.is_empty() {
-            return err_box!(
-                "cache allocate returned {} blocks for a zero-length object",
-                alloc.blocks.len()
-            );
-        }
+        };
 
-        if self.task.is_cancel() {
-            info!(
-                "cache load task canceled before committing: {}",
-                self.log_context()
-            );
-            return self.finish_canceled().await;
-        }
-
-        // Self-contained commit carrying the locations that ACTUALLY
-        // completed (worker ACKs), never the bare plan. Response loss
-        // (hard gate 3, RC `4ebcff5a`): the request is replayed VERBATIM
-        // under the task's timeout budget — an applied-but-lost commit
-        // converges to AlreadyApplied on the master, and a transient RPC
-        // error must not fail the task while the budget lasts. The retry
-        // never re-runs Allocate: once this commit applies, the master's
-        // per-client watermark (2) makes the load token (1) evictable by
-        // the bounded outcome window, so recovery rides the commit-side
-        // path alone.
-        let commit = commit_with_retry(
+        let (commit, evidence) = drive_cache_load(
             || self.task.is_cancel(),
             self.task_timeout_ms,
             COMMIT_RETRY_BACKOFF_MS,
-            || {
-                client.cache_commit(
-                    spec.commit_token,
-                    spec.load_token,
-                    spec.incarnation,
-                    &spec.key,
-                    alloc.generation,
-                    alloc.object_id,
-                    file_len,
-                    ufs_mtime,
-                    committed_blocks.clone(),
-                )
-            },
+            allocate,
+            write,
+            commit,
         )
         .await?;
         match cache_op_status(commit.status) {
@@ -252,6 +262,14 @@ impl CacheLoadTaskRunner {
                 info!(
                     "cache load commit superseded (current generation {:?}): {}",
                     commit.current_generation,
+                    self.log_context()
+                );
+            }
+            // drive_cache_load loops on ReplanNeeded and never surfaces
+            // it; treat a leak-through as uninterpretable, fail closed.
+            Some(CacheOpStatusProto::ReplanNeeded) => {
+                return err_box!(
+                    "cache commit returned REPLAN_NEEDED past the recovery loop: {}",
                     self.log_context()
                 );
             }
@@ -268,16 +286,74 @@ impl CacheLoadTaskRunner {
 
         self.update_progress(file_len, file_len, true).await;
         info!(
-            "cache load task completed: {} object_id={} generation={} file_len={} ufs_mtime={} blocks={}",
+            "cache load task completed: {} object_id={} generation={} file_len={} ufs_mtime={} committed_blocks={}",
             self.log_context(),
-            alloc.object_id,
-            alloc.generation,
+            evidence.object_id,
+            evidence.generation,
             file_len,
             ufs_mtime,
-            alloc.blocks.len()
+            evidence.blocks.len()
         );
 
         Ok(true)
+    }
+
+    /// One full write round against a plan: opens a FRESH reader (a
+    /// replan round rewrites from offset 0 per the NEW placements), walks
+    /// every planned block with the all-or-nothing `BlockWriter`, and
+    /// returns the commit evidence built from the writer's ACTUAL
+    /// `CommitBlock` ACKs (never the bare plan). Any failure aborts the
+    /// whole task — no Commit is issued for this round.
+    async fn write_round(
+        &self,
+        ufs: &UfsFileSystem,
+        source_path: &Path,
+        file_len: i64,
+        alloc: &curvine_proto::CacheAllocateResponse,
+    ) -> FsResult<CommitEvidence> {
+        // Plan shape must match the observed file length — both for the
+        // initial plan and for every replan round (hard gate 1 shape).
+        if file_len == 0 && !alloc.blocks.is_empty() {
+            return err_box!(
+                "cache allocate returned {} blocks for a zero-length object",
+                alloc.blocks.len()
+            );
+        }
+        if file_len > 0 && alloc.blocks.is_empty() {
+            return err_box!(
+                "cache allocate returned an empty plan for a {}-byte object",
+                file_len
+            );
+        }
+
+        let mut committed_blocks = Vec::with_capacity(alloc.blocks.len());
+        if file_len > 0 {
+            let mut reader = ufs.open(source_path).await?;
+            if reader.len() != file_len {
+                return err_box!(
+                    "cache load source {} changed length after status (expected {}, reader {})",
+                    source_path.full_path(),
+                    file_len,
+                    reader.len()
+                );
+            }
+
+            let mut written: i64 = 0;
+            for block in &alloc.blocks {
+                let (loaded, completed) = self
+                    .write_planned_block(&mut reader, block, written, file_len)
+                    .await?;
+                written = loaded;
+                committed_blocks.push(completed);
+            }
+            reader.complete().await?;
+        }
+
+        Ok(CommitEvidence {
+            generation: alloc.generation,
+            object_id: alloc.object_id,
+            blocks: committed_blocks,
+        })
     }
 
     /// Writes one master-planned block on its planned workers using the
@@ -442,6 +518,86 @@ impl CacheLoadTaskRunner {
     }
 }
 
+/// The self-contained commit evidence of ONE write round: the allocate
+/// identity plus the locations that ACTUALLY completed (worker ACKs).
+/// Replayed verbatim on commit retries; rebuilt from scratch after a
+/// REPLAN round (old placements only count as orphans).
+#[derive(Clone, Debug)]
+struct CommitEvidence {
+    generation: u64,
+    object_id: i64,
+    blocks: Vec<curvine_proto::CacheBlockLocationProto>,
+}
+
+/// Drives the two-state closed loop (hard gates 3+4, RC `40e47dcb` +
+/// `3d91a095`):
+///
+/// allocate → write round → commit (verbatim retry). A commit that
+/// returns REPLAN_NEEDED has NOT applied: its plan is unusable (volatile
+/// plan lost to a master restart, or fences invalidated by a worker
+/// session/epoch change), so the loop replays the EXACT allocate — the
+/// FSM replays the same identity and installs a fresh plan — rewrites
+/// every block per the NEW placements, rebuilds the evidence, and
+/// re-commits, bounded by the task timeout budget. Any other commit
+/// outcome is terminal (Applied/AlreadyApplied/Superseded) or fails
+/// closed (missing/unknown discriminator). Cancellation is loud at every
+/// state boundary.
+async fn drive_cache_load<C, A, AFut, W, WFut, K, KFut>(
+    mut is_cancel: C,
+    timeout_ms: u64,
+    backoff_ms: u64,
+    mut allocate: A,
+    mut write_round: W,
+    mut commit: K,
+) -> FsResult<(curvine_proto::CacheCommitResponse, CommitEvidence)>
+where
+    C: FnMut() -> bool,
+    A: FnMut() -> AFut,
+    AFut: std::future::Future<Output = FsResult<curvine_proto::CacheAllocateResponse>>,
+    W: FnMut(curvine_proto::CacheAllocateResponse) -> WFut,
+    WFut: std::future::Future<Output = FsResult<CommitEvidence>>,
+    K: FnMut(CommitEvidence) -> KFut,
+    KFut: std::future::Future<Output = FsResult<curvine_proto::CacheCommitResponse>>,
+{
+    let start = LocalTime::mills();
+    let mut evidence = write_round(allocate().await?).await?;
+    loop {
+        if is_cancel() {
+            return err_box!("cache load aborted by task cancellation before commit");
+        }
+        let commit_resp = {
+            let evidence = evidence.clone();
+            commit_with_retry(&mut is_cancel, timeout_ms, backoff_ms, || {
+                commit(evidence.clone())
+            })
+            .await?
+        };
+        match cache_op_status(commit_resp.status) {
+            Some(CacheOpStatusProto::Applied)
+            | Some(CacheOpStatusProto::AlreadyApplied)
+            | Some(CacheOpStatusProto::Superseded) => return Ok((commit_resp, evidence)),
+            Some(CacheOpStatusProto::ReplanNeeded) => {
+                // The commit did NOT apply and this round's writes only
+                // count as orphans: re-plan, rewrite, rebuild evidence.
+                if LocalTime::mills() - start > timeout_ms {
+                    return err_box!(
+                        "cache load replan budget exhausted (task timeout {} ms) after REPLAN_NEEDED",
+                        timeout_ms
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                evidence = write_round(allocate().await?).await?;
+            }
+            None => {
+                return err_box!(
+                    "cache commit returned unrecognized status {:?}",
+                    commit_resp.status
+                );
+            }
+        }
+    }
+}
+
 /// Assembles the commit evidence for one block from the writer's ACTUAL
 /// `CommitBlock` ACK: each ACKed `worker_id` is mapped back to its
 /// planned `WorkerAddressProto` (full five-field endpoint identity — the
@@ -526,6 +682,9 @@ fn cache_op_status(v: Option<i32>) -> Option<CacheOpStatusProto> {
         Some(s) if s == CacheOpStatusProto::Superseded as i32 => {
             Some(CacheOpStatusProto::Superseded)
         }
+        Some(s) if s == CacheOpStatusProto::ReplanNeeded as i32 => {
+            Some(CacheOpStatusProto::ReplanNeeded)
+        }
         _ => None,
     }
 }
@@ -561,13 +720,17 @@ mod tests {
             cache_op_status(Some(3)),
             Some(CacheOpStatusProto::Superseded)
         );
+        assert_eq!(
+            cache_op_status(Some(4)),
+            Some(CacheOpStatusProto::ReplanNeeded)
+        );
     }
 
     #[test]
     fn cache_op_status_fails_closed_on_missing_or_unknown() {
         assert_eq!(cache_op_status(None), None);
         assert_eq!(cache_op_status(Some(0)), None);
-        assert_eq!(cache_op_status(Some(4)), None);
+        assert_eq!(cache_op_status(Some(5)), None);
         assert_eq!(cache_op_status(Some(-1)), None);
     }
 
@@ -684,5 +847,177 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("cancellation"), "err: {}", err);
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    // ---- drive_cache_load two-state recovery seam (hard gate 4, RC ----
+    // `40e47dcb` + `3d91a095`): a REPLAN_NEEDED commit has NOT applied,
+    // so the loop must replay the exact allocate, rewrite per the NEW
+    // plan, and rebuild the evidence; an applied commit (response loss)
+    // must converge commit-side only and NEVER re-allocate.
+
+    use super::{drive_cache_load, CommitEvidence};
+    use curvine_proto::CacheAllocateResponse;
+
+    fn resp_with_status(s: i32) -> CacheCommitResponse {
+        CacheCommitResponse {
+            status: Some(s),
+            ..Default::default()
+        }
+    }
+
+    fn round_evidence(round: i64) -> CommitEvidence {
+        // The round number rides in block_id so a test can prove WHICH
+        // write round a commit actually carried.
+        CommitEvidence {
+            generation: 1,
+            object_id: 5,
+            blocks: vec![CacheBlockLocationProto {
+                block_id: round,
+                block_len: 64,
+                workers: vec![worker(1)],
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn drive_replans_rewrites_and_recommits_after_plan_loss() {
+        let allocs = AtomicU32::new(0);
+        let rounds = AtomicU32::new(0);
+        let commits = AtomicU32::new(0);
+        let committed_rounds = std::sync::Mutex::new(Vec::new());
+
+        let (resp, evidence) = drive_cache_load(
+            || false,
+            10_000,
+            1,
+            || {
+                allocs.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Ok(CacheAllocateResponse {
+                        object_id: 5,
+                        generation: 1,
+                        blocks: vec![CacheBlockLocationProto {
+                            block_id: 1,
+                            block_len: 64,
+                            workers: vec![worker(1)],
+                        }],
+                    })
+                }
+            },
+            |_alloc| {
+                let round = 1 + rounds.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(round_evidence(round as i64)) }
+            },
+            |ev| {
+                let n = 1 + commits.fetch_add(1, Ordering::SeqCst);
+                committed_rounds.lock().unwrap().push(ev.blocks[0].block_id);
+                async move {
+                    // First commit loses the volatile plan (master
+                    // restart / session-tag change); the second applies.
+                    if n == 1 {
+                        Ok(resp_with_status(4))
+                    } else {
+                        Ok(resp_with_status(1))
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            cache_op_status(resp.status),
+            Some(CacheOpStatusProto::Applied)
+        );
+        // The re-plan ran a FULL second round: allocate, rewrite, and a
+        // commit carrying the round-2 evidence (not the stale round-1
+        // placements).
+        assert_eq!(allocs.load(Ordering::SeqCst), 2);
+        assert_eq!(rounds.load(Ordering::SeqCst), 2);
+        assert_eq!(commits.load(Ordering::SeqCst), 2);
+        assert_eq!(evidence.blocks[0].block_id, 2);
+        assert_eq!(*committed_rounds.lock().unwrap(), vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn drive_applied_response_loss_never_reallocates() {
+        let allocs = AtomicU32::new(0);
+        let rounds = AtomicU32::new(0);
+        let attempts = AtomicU32::new(0);
+
+        let (resp, _evidence) = drive_cache_load(
+            || false,
+            10_000,
+            1,
+            || {
+                allocs.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Ok(CacheAllocateResponse {
+                        object_id: 5,
+                        generation: 1,
+                        blocks: Vec::new(),
+                    })
+                }
+            },
+            |_alloc| {
+                rounds.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(round_evidence(1)) }
+            },
+            |_ev| {
+                let n = attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    // Applied on the master, response lost twice: the
+                    // verbatim replay converges to AlreadyApplied.
+                    if n < 2 {
+                        Err(FsError::common("injected commit response loss"))
+                    } else {
+                        Ok(resp_with_status(2))
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            cache_op_status(resp.status),
+            Some(CacheOpStatusProto::AlreadyApplied)
+        );
+        assert_eq!(
+            allocs.load(Ordering::SeqCst),
+            1,
+            "an applied commit must recover commit-side only, never re-allocate"
+        );
+        assert_eq!(rounds.load(Ordering::SeqCst), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn drive_replan_budget_exhaustion_is_loud() {
+        let allocs = AtomicU32::new(0);
+        let err = drive_cache_load(
+            || false,
+            30,
+            1,
+            || {
+                allocs.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Ok(CacheAllocateResponse {
+                        object_id: 5,
+                        generation: 1,
+                        blocks: Vec::new(),
+                    })
+                }
+            },
+            |_alloc| async move { Ok(round_evidence(1)) },
+            |_ev| async move { Ok(resp_with_status(4)) },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("replan budget"), "err: {}", err);
+        assert!(
+            allocs.load(Ordering::SeqCst) >= 2,
+            "at least one full replan round before the budget error"
+        );
     }
 }

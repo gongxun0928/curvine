@@ -128,6 +128,16 @@ pub enum CacheOpStatus {
     /// committed row has advanced to, so the caller can terminate the old
     /// load and diagnostics can show the fence gap.
     Superseded { expected: u64, current: u64 },
+    /// Commit-only, RESERVED-row states that are re-planable (task #5 RC
+    /// gpt56 `3d91a095`): the load's volatile plan was lost (master
+    /// restart) or its fences were invalidated (worker session/epoch
+    /// changed after the writes) while the commit has NOT applied. The
+    /// caller must replay the EXACT allocate (same load token — it
+    /// re-plans the same identity against current sessions), rewrite the
+    /// blocks per the NEW placements, and re-commit. Terminal states
+    /// (revoked/fenced namespace, token divergence) stay Err — they are
+    /// never re-planable.
+    ReplanNeeded,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1808,17 +1818,23 @@ impl CacheService {
         // Exact recorded replay: resolve from history now that the
         // namespace is confirmed live.
         if let Some((object_id, generation)) = replay {
-            // Scoped lock: the guard must be released before the replan
-            // arm, which takes the volatile lock again.
+            // Scoped lock: the guard must be released before the fence
+            // re-check and the replan arm, which take the volatile lock
+            // again.
             let prior = {
                 let volatile = self.lock_volatile();
-                volatile.plans.get(&token).map(|plan| plan.blocks.clone())
+                volatile.plans.get(&token).cloned()
             };
             let blocks = match prior {
-                Some(blocks) => blocks,
-                None => {
-                    // Plan lost (master restart): regenerate a fresh
-                    // volatile plan for the same identity.
+                // A surviving plan is served verbatim ONLY while its
+                // fences still hold (gpt56 `1c436760`): a plan whose
+                // epoch/replica session fences were invalidated would
+                // hand the caller the SAME stale placements and loop
+                // REPLAN_NEEDED forever — it must re-plan fresh.
+                Some(plan) if self.validate_plan_fences(&plan).is_ok() => plan.blocks,
+                _ => {
+                    // Plan lost (master restart) or fenced out: regenerate
+                    // a fresh volatile plan for the same identity.
                     let layout = CacheBlockLayout::derive(object_id, file_len, block_size)?;
                     self.replan(token, generation, layout)?
                 }
@@ -2375,20 +2391,17 @@ impl CacheService {
         // The volatile plan is mandatory: without it the reported
         // locations cannot be validated against what the master planned
         // (master restart), and a silent re-plan would misattribute old
-        // writes. Fail closed as a retryable miss — the caller retries the
-        // exact allocate (which re-plans the same identity) and re-commits.
+        // writes. Typed REPLAN_NEEDED (task #5 RC `3d91a095`): this is a
+        // re-planable RESERVED-row state, not an error — the caller
+        // replays the exact allocate (which re-plans the same identity)
+        // and re-commits. Unreachable for an applied commit: an applied
+        // commit resolved earlier from its outcome/Valid row.
         let plan = {
             let volatile = self.lock_volatile();
-            volatile
-                .plans
-                .get(&load_token)
-                .cloned()
-                .ok_or_else(|| {
-                    cm_err(format!(
-                        "cache commit for load token {:?} has no live plan (master restart or unknown token): retryable miss, replay the exact allocate to re-plan, then re-commit",
-                        load_token
-                    ))
-                })?
+            match volatile.plans.get(&load_token).cloned() {
+                Some(plan) => plan,
+                None => return Ok(CacheOpStatus::ReplanNeeded),
+            }
         };
         if plan.object_id != object_id || plan.generation != generation {
             return err_box!(
@@ -2409,10 +2422,21 @@ impl CacheService {
 
         // 4d R8-3 pre-propose fence: the plan's epoch + replica
         // session tags are validated against the live registry BEFORE
-        // anything is proposed. A breach is retryable the same way a
-        // lost plan is: replay the exact allocate (which re-plans
-        // against the current sessions) and re-commit.
-        self.validate_plan_fences(&plan)?;
+        // anything is proposed. A breach is re-planable the same way a
+        // lost plan is (typed REPLAN_NEEDED, task #5 RC `3d91a095`):
+        // replay the exact allocate (which re-plans against the current
+        // sessions) and re-commit. Every check_plan_fences error is a
+        // fence breach (epoch change, unfenced replica, session tag
+        // change) — never a divergence, which was rejected above.
+        if self.validate_plan_fences(&plan).is_err() {
+            // gpt56 `1c436760`: the fenced-out plan must not stay
+            // replayable — the exact allocate retry would otherwise hand
+            // the SAME stale placements back and the runner would loop
+            // REPLAN_NEEDED until timeout. Drop it under the volatile
+            // lock so the retry re-plans against the CURRENT sessions.
+            self.lock_volatile().plans.remove(&load_token);
+            return Ok(CacheOpStatus::ReplanNeeded);
+        }
 
         // Evidence validation against the plan happens before the
         // barrier: every rejected set below never touches the journal.
@@ -6300,9 +6324,11 @@ mod tests {
         assert!(service.segment.lock().unwrap().is_none());
     }
 
-    /// The volatile plan is mandatory: a commit without it fails closed
-    /// as a retryable miss (master restart) — before any other judgment
-    /// about the entry row.
+    /// The volatile plan is mandatory: a commit without it (master
+    /// restart lost the plan) resolves to the typed re-planable status —
+    /// REPLAN_NEEDED, not a string Err the runner would retry-blind —
+    /// before any other judgment about the entry row (task #5 RC
+    /// `40e47dcb`).
     #[test]
     fn test_commit_requires_plan() {
         let service = build_service("commit-plan-mandatory", chooser(vec![worker(1)]));
@@ -6328,19 +6354,147 @@ mod tests {
                 .unwrap();
         }
         let lay = layout(OBJ, 130);
-        let err = service
+        let status = service
             .commit(commit_params(
                 token(9, 1),
                 token(9, 2),
                 full_locations(&lay),
             ))
+            .unwrap();
+        assert_eq!(status, CacheOpStatus::ReplanNeeded);
+    }
+
+    /// gpt56 `1c436760` seam: a fence-invalidated plan (worker session
+    /// advanced after the writes, before the commit) resolves commit to
+    /// typed REPLAN_NEEDED AND drops the stale plan; the exact allocate
+    /// replay re-plans the SAME identity with FRESH fences bound to the
+    /// CURRENT session tags (never the stale placements), and the
+    /// re-commit passes the plan/fence checks.
+    #[test]
+    fn test_commit_fence_breach_replan_replays_fresh_fences() {
+        let service = build_service("fence-breach-replan", chooser(vec![worker(1), worker(2)]));
+        mount_incarnation(&service, 1, 0);
+        // Reserved row + recorded load outcome (no durable commit yet).
+        {
+            let store = service.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let mgr = &store.cache;
+            mgr.apply_id_reserve(rocks, token(1, 1), OBJ, OBJ + 100)
+                .unwrap();
+            let alloc = CacheEntry {
+                generation: 1,
+                state: CacheEntryState::Reserved,
+                object_id: OBJ,
+                len: 0,
+                ufs_mtime: 0,
+                block_size: 64,
+                expire_at: 0,
+            };
+            mgr.apply_allocate(rocks, token(21, 1), 1, "/k", 130, &alloc)
+                .unwrap();
+        }
+        service.begin_cache_session(1, "w1-s1", &worker(1)).unwrap();
+        service.begin_cache_session(2, "w2-s1", &worker(2)).unwrap();
+        let (t1, t2) = {
+            let volatile = service.state.lock().unwrap();
+            (
+                volatile.worker_sessions.get(&1).unwrap().tag,
+                volatile.worker_sessions.get(&2).unwrap().tag,
+            )
+        };
+        let lay = layout(OBJ, 130);
+        let mut plan = plan_for(&lay);
+        plan.epoch = service.monitor.journal_epoch();
+        plan.fences = lay
+            .block_ids()
+            .map(|_| {
+                let mut m = HashMap::new();
+                m.insert(WorkerIdent::of(&worker(1)), t1);
+                m.insert(WorkerIdent::of(&worker(2)), t2);
+                m
+            })
+            .collect();
+        service.install_plan(token(21, 1), plan);
+
+        // Worker 2's session advances after the writes: the commit has
+        // NOT applied and must come back as typed REPLAN_NEEDED (never a
+        // string Err the runner would blind-retry), with the stale plan
+        // dropped so the allocate replay cannot hand it back.
+        service.begin_cache_session(2, "w2-s2", &worker(2)).unwrap();
+        assert_eq!(
+            service
+                .commit(commit_params(
+                    token(21, 1),
+                    token(21, 2),
+                    full_locations(&lay)
+                ))
+                .unwrap(),
+            CacheOpStatus::ReplanNeeded
+        );
+        assert!(
+            !service
+                .state
+                .lock()
+                .unwrap()
+                .plans
+                .contains_key(&token(21, 1)),
+            "a fenced-out plan must not stay replayable"
+        );
+
+        // Exact allocate replay: SAME identity (no second id minted) and
+        // a FRESH plan whose fences hold against the CURRENT sessions.
+        let replay = service.allocate(token(21, 1), 7, 1, "/k", 130, 64).unwrap();
+        assert_eq!(replay.object_id, OBJ);
+        assert_eq!(replay.generation, 1);
+        assert_eq!(replay.blocks.len() as i64, lay.block_count);
+        let new_plan = service
+            .state
+            .lock()
+            .unwrap()
+            .plans
+            .get(&token(21, 1))
+            .cloned()
+            .unwrap();
+        assert!(
+            service.validate_plan_fences(&new_plan).is_ok(),
+            "re-planned fences must hold against the current sessions"
+        );
+        // The fresh plan fences worker 2's NEW session tag, not the
+        // stale one the commit rejected.
+        let new_t2 = service
+            .state
+            .lock()
+            .unwrap()
+            .worker_sessions
+            .get(&2)
+            .unwrap()
+            .tag;
+        assert_ne!(t2, new_t2);
+        let fenced_t2 = new_plan
+            .fences
+            .first()
+            .and_then(|m| m.get(&WorkerIdent::of(&worker(2))))
+            .unwrap();
+        assert_eq!(
+            *fenced_t2, new_t2,
+            "the re-plan must fence the NEW session tag"
+        );
+
+        // The re-commit with the NEW placements passes the plan/fence
+        // checks and reaches the raft barrier (fail-closed in this
+        // harness — full applied-path coverage lives in real-raft tests).
+        let err = service
+            .commit(commit_params(
+                token(21, 1),
+                token(21, 2),
+                replay.blocks.clone(),
+            ))
             .unwrap_err();
         assert!(
-            format!("{}", err).contains("live plan"),
-            "commit without a plan must fail closed: {}",
+            format!("{}", err).contains("raft"),
+            "re-commit must reach the raft barrier: {}",
             err
         );
-        assert!(!format!("{}", err).contains("raft"), "{}", err);
     }
 
     /// A lost-response commit retry resolves to its recorded Committed

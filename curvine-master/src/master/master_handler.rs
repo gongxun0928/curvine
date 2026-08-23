@@ -949,6 +949,13 @@ impl MasterHandler {
             crate::master::cache::CacheOpStatus::Superseded { current, .. } => {
                 (CacheOpStatusProto::Superseded, Some(current))
             }
+            // Commit-only re-planable state (plan lost / fences
+            // invalidated, commit NOT applied): the caller replays the
+            // exact allocate, rewrites per the new placements, and
+            // re-commits (task #5 RC `3d91a095`).
+            crate::master::cache::CacheOpStatus::ReplanNeeded => {
+                (CacheOpStatusProto::ReplanNeeded, None)
+            }
         }
     }
 
