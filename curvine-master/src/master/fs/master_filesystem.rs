@@ -123,6 +123,13 @@ struct FullBlockReportState {
     /// (zero-create, zero-clear, zero-count, zero-trigger) BEFORE it
     /// reaches this struct — see `collect_full_block_report`.
     session: String,
+    /// RC2 P0-1 (gpt56 `53516250` window 2): the registry tag captured
+    /// at the FIRST authorized page — the Start identity this trigger
+    /// belongs to. The eventual cache snapshot checkout is exact on it:
+    /// a same-wire-session Start RETRY (fresh tag, fresh cache row)
+    /// makes the old trigger's take a None — the old snapshot can
+    /// never exact-strip the new Start's locations.
+    tag: u64,
     total_len: u64,
     update_time_ms: u64,
     reported_blocks: HashSet<i64>,
@@ -1268,7 +1275,7 @@ impl MasterFilesystem {
         fs_dir.block_inode_state(id)
     }
 
-    fn collect_full_block_report(&self, list: &BlockReportList) -> Option<HashSet<i64>> {
+    fn collect_full_block_report(&self, list: &BlockReportList) -> Option<(HashSet<i64>, u64)> {
         if !list.full_report {
             return None;
         }
@@ -1285,17 +1292,24 @@ impl MasterFilesystem {
         // exactly the pre-4d.3 behavior). A stale s1 page after
         // Start(s2) can therefore neither create the row before s2's
         // first page nor disturb s2's progress after it.
+        // RC2 P0-1 (gpt56 `53516250` window 2): on success the CURRENT
+        // registry TAG comes back with the authorization and is bound
+        // into the row — the eventual checkout is exact on this Start
+        // identity.
         let page_session = list.worker_session_id.clone().unwrap_or_default();
-        if !self
+        let page_tag = match self
             .cache_service
             .authorize_full_report_page(list.worker_id, &page_session)
         {
-            warn!(
-                "full block report page for worker {} skipped: session {:?} is not the current registry session",
-                list.worker_id, page_session
-            );
-            return None;
-        }
+            Some(tag) => tag,
+            None => {
+                warn!(
+                    "full block report page for worker {} skipped: session {:?} is not the current registry session",
+                    list.worker_id, page_session
+                );
+                return None;
+            }
+        };
 
         let now = LocalTime::mills();
         let mut reports = self.full_block_reports.lock();
@@ -1311,20 +1325,23 @@ impl MasterFilesystem {
         {
             reports.remove(&list.worker_id);
         }
-        // An existing row bound to a DIFFERENT session can only survive
-        // when the registry moved without the Start reset path removing
-        // it (defensive): restart the accumulation bound to THIS
-        // (authorized) page session — old-session state never carries
-        // over.
+        // An existing row bound to a DIFFERENT session (or a different
+        // Start identity — tag — under the same wire session, i.e. a
+        // Start retry the defensive path missed) can only survive when
+        // the registry moved without the Start reset path removing it:
+        // restart the accumulation bound to THIS (authorized) page
+        // session/tag — old-identity state never carries over.
         if reports
             .get(&list.worker_id)
-            .is_some_and(|row| row.session != page_session)
+            .is_some_and(|row| row.session != page_session || row.tag != page_tag)
         {
             warn!(
-                "full block report for worker {} restarted: row session {:?} superseded by {:?}",
+                "full block report for worker {} restarted: row identity (session {:?}, tag {}) superseded by (session {:?}, tag {})",
                 list.worker_id,
                 reports.get(&list.worker_id).map(|r| r.session.clone()),
-                page_session
+                reports.get(&list.worker_id).map(|r| r.tag).unwrap_or(0),
+                page_session,
+                page_tag
             );
             reports.remove(&list.worker_id);
         }
@@ -1333,6 +1350,7 @@ impl MasterFilesystem {
             .entry(list.worker_id)
             .or_insert_with(|| FullBlockReportState {
                 session: page_session.clone(),
+                tag: page_tag,
                 total_len: list.total_len,
                 update_time_ms: now,
                 reported_blocks: HashSet::with_capacity(list.total_len as usize),
@@ -1361,7 +1379,7 @@ impl MasterFilesystem {
         if report.reported_blocks.len() as u64 >= report.total_len {
             reports
                 .remove(&list.worker_id)
-                .map(|report| report.reported_blocks)
+                .map(|report| (report.reported_blocks, report.tag))
         } else {
             None
         }
@@ -1587,9 +1605,14 @@ impl MasterFilesystem {
         // the final reconcile set are domain-split.
         let mut cache_items: Vec<BlockReportInfo> = Vec::new();
         let mut fs_blocks: Vec<BlockReportInfo> = Vec::with_capacity(list.blocks.len());
-        // 4d.3: a cache-only worker's self-Complete snapshot, stashed
-        // until the FS accumulator's end-of-report trigger fires.
-        let mut cache_complete: Option<Vec<BlockReportInfo>> = None;
+        // 4d.3 / RC2 P0-1: a cache-only worker's self-Complete snapshot,
+        // stashed WITH its exact checkout ticket (carried out
+        // atomically at the in-place transition — never re-read) until
+        // the FS accumulator's end-of-report trigger fires.
+        let mut cache_complete: Option<(
+            Vec<BlockReportInfo>,
+            crate::cache::cache_service::FullSnapshotTicket,
+        )> = None;
         for item in list.blocks {
             match BlockIdCodec::is_cache_block_id(item.id) {
                 Ok(true) => cache_items.push(item),
@@ -1615,8 +1638,11 @@ impl MasterFilesystem {
                     list.total_len,
                     &cache_items,
                 ) {
-                    crate::cache::cache_service::CacheFullReportOutcome::Complete(entries) => {
-                        cache_complete = Some(entries);
+                    crate::cache::cache_service::CacheFullReportOutcome::Complete(
+                        entries,
+                        ticket,
+                    ) => {
+                        cache_complete = Some((entries, ticket));
                     }
                     crate::cache::cache_service::CacheFullReportOutcome::Partial
                     | crate::cache::cache_service::CacheFullReportOutcome::Skipped => {}
@@ -1716,47 +1742,59 @@ impl MasterFilesystem {
         }
         drop(wm);
 
-        if let Some(reported_blocks) = full_reported_blocks {
+        if let Some((reported_blocks, trigger_tag)) = full_reported_blocks {
             // 4d.3: end-of-report trigger for the CACHE domain — the
             // single authoritative signal (the FS accumulator counts
             // ALL ids, cache + FS). Snapshot = the self-Complete stash
-            // (cache-only worker) or the worker's still-Partial
-            // same-session accumulator consumed here (mixed worker); a
-            // terminal/absent row yields None and the reconcile is
-            // skipped (no authoritative snapshot, 复活禁止). The
-            // reconcile itself is fenced on the exact
-            // (epoch, session, tag, generation) triple; its WM side
-            // effects ride the same fenced transition as an
+            // with its atomic ticket (cache-only worker) or the worker's
+            // still-Partial same-session accumulator consumed here
+            // (mixed worker, checkout EXACT on the trigger's bound
+            // Start-identity tag — RC2 P0-1: a same-session Start retry
+            // installed a fresh row the old trigger can never consume);
+            // a terminal/absent/retried row yields None and the
+            // reconcile is skipped (no authoritative snapshot,
+            // 复活禁止). The reconcile itself is fenced on the exact
+            // (epoch, session, tag, attempt, generation) ticket; its WM
+            // side effects ride the same fenced transition as an
             // incremental's.
             let session = list.worker_session_id.clone().unwrap_or_default();
-            // RC1 P0-1: BOTH Complete paths share the ONE checkout state
-            // machine — the self-Complete stash (cache-only worker) reads
-            // back its in-place attempt ticket (stable while the row is
-            // Reconciling: a second checkout is blocked, only the exact
-            // CAS release returns the row), the mixed path consumes the
-            // still-Partial row via the same transition.
-            let snapshot = cache_complete
-                .take()
-                .map(|entries| {
-                    let attempt = self
-                        .cache_service
-                        .full_snapshot_attempt(list.worker_id, &session)
-                        .unwrap_or(0);
-                    (entries, attempt)
-                })
-                .or_else(|| {
-                    self.cache_service
-                        .take_cache_full_snapshot(list.worker_id, &session)
-                });
-            if let Some((entries, attempt)) = snapshot {
+            // #[cfg(test)] deterministic seam (RC2 P0-1, gpt56
+            // `53516250` window 2, mixed variant): the FS trigger has
+            // completed (reported set + bound tag in hand), the cache
+            // snapshot has NOT been taken yet. A hook may run a
+            // same-wire-session Start RETRY here — the take below must
+            // then return None (fresh row under a new tag) and the old
+            // trigger must have zero effect. Compiled out outside
+            // cfg(test); never set in production.
+            #[cfg(test)]
+            if let Some(hook) = crate::master::master_handler::FULL_TAKE_SEAM
+                .lock()
+                .unwrap()
+                .as_ref()
+            {
+                hook();
+            }
+            // RC1 P0-1 / RC2 P0-1: BOTH Complete paths share the ONE
+            // checkout state machine and hand out the exact
+            // (tag, attempt) ticket atomically — the self-Complete
+            // stash (cache-only worker) carries it from the in-place
+            // transition, the mixed path consumes the still-Partial row
+            // via the same transition, exact on the trigger's tag.
+            let snapshot = cache_complete.take().or_else(|| {
+                self.cache_service
+                    .take_cache_full_snapshot(list.worker_id, &session, trigger_tag)
+            });
+            if let Some((entries, ticket)) = snapshot {
                 // #[cfg(test)] deterministic seam (RC1 P0-1, gpt56
                 // `d2546338` item 1): the checkout window — the row is
-                // Reconciling (attempt checked out), the reconcile and
+                // Reconciling (ticket checked out), the reconcile and
                 // the exact-CAS release have not run. A hook may run an
                 // incremental report or an End/lost retire and WIN the
-                // row (terminalize it in place); the release CAS must
-                // then fail and the row must stay terminal. Compiled out
-                // outside cfg(test); never set in production.
+                // row (terminalize it in place), or a same-session
+                // Start retry (the ticket's exact match must then fail);
+                // the release CAS must fail and the row must stay
+                // terminal / belong to the retry. Compiled out outside
+                // cfg(test); never set in production.
                 #[cfg(test)]
                 if let Some(hook) = crate::master::master_handler::FULL_TRIGGER_SEAM
                     .lock()
@@ -1768,18 +1806,23 @@ impl MasterFilesystem {
                 let outcome = self.cache_service.reconcile_cache_full_report(
                     list.worker_id,
                     &session,
+                    ticket,
                     &entries,
                 )?;
                 self.apply_cache_incr_outcome(list.worker_id, outcome);
                 // RC1 P0-1 (gpt56 `d2546338` item 1): finish the checkout
                 // — the ONLY path back to Accumulating is an exact
-                // `(session, attempt)` CAS on the in-place row. A row
-                // TERMINALIZED mid-flight (incremental / End / lost raced
-                // the flight) stays terminal (`0b900a2f`); a row a newer
-                // Start installed stays untouched. No remove-then-blind-
-                // insert anywhere in the lifecycle.
-                self.cache_service
-                    .release_full_accumulator(list.worker_id, &session, attempt);
+                // `(session, tag, attempt)` CAS on the in-place row. A
+                // row TERMINALIZED mid-flight (incremental / End / lost
+                // raced the flight) stays terminal (`0b900a2f`); a row a
+                // newer Start installed stays untouched. No
+                // remove-then-blind-insert anywhere in the lifecycle.
+                self.cache_service.release_full_accumulator(
+                    list.worker_id,
+                    &session,
+                    ticket.tag,
+                    ticket.attempt,
+                );
             }
 
             // 4d.2: the FS reconcile set covers FS blocks only — cache
@@ -3288,6 +3331,269 @@ mod tests {
             .get(1, "/k", true)
             .unwrap()
             .expect("s2 report published");
+        assert_eq!(hit.blocks.len(), 3);
+        assert_eq!(hit.blocks[2].block_len, 22);
+    }
+
+    /// Shared scaffolding for the RC2 Start-retry races (gpt56
+    /// `53516250` window 2): one isolated leader filesystem with a
+    /// committed cache entry and worker 1 opened under wire session
+    /// "s1".
+    fn build_rc2_retry_fs(tag: &str) -> (MasterFilesystem, WorkerAddress, [i64; 3]) {
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.cache_metadata_enabled = true;
+        conf.master.meta_dir = Utils::test_sub_dir(format!(
+            "master-fs-4d3-rc2sr/meta-{}-{}",
+            tag,
+            Utils::rand_str(6)
+        ));
+        conf.journal.journal_dir = Utils::test_sub_dir(format!(
+            "master-fs-4d3-rc2sr/journal-{}-{}",
+            tag,
+            Utils::rand_str(6)
+        ));
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        fs.master_monitor
+            .journal_ctl
+            .set_state(curvine_raft::raft::RoleState::Leader);
+        let addr = WorkerAddress {
+            worker_id: 1,
+            hostname: format!("rc2sr-{}", tag),
+            ip_addr: "10.0.0.1".into(),
+            rpc_port: 8200,
+            web_port: 8300,
+        };
+        fs.begin_worker_session(&addr, "s1").unwrap();
+
+        let obj = BlockIdCodec::CACHE_OBJECT_MIN;
+        let lay = crate::master::meta::CacheBlockLayout::derive(obj, 150, 64).unwrap();
+        let blocks = [
+            lay.block_id(1).unwrap(),
+            lay.block_id(2).unwrap(),
+            lay.block_id(3).unwrap(),
+        ];
+        {
+            let store = fs.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let mgr = &store.cache;
+            mgr.apply_incarnation_allocate_v2(rocks, token(91, 1), 5, 1, 0)
+                .unwrap();
+            mgr.apply_id_reserve(rocks, token(1, 1), obj, obj + 100)
+                .unwrap();
+            let alloc = crate::master::meta::cache::entry::CacheEntry {
+                generation: 1,
+                state: crate::master::meta::cache::entry::CacheEntryState::Reserved,
+                object_id: obj,
+                len: 0,
+                ufs_mtime: 0,
+                block_size: 64,
+                expire_at: 0,
+            };
+            mgr.apply_allocate(rocks, token(2, 1), 1, "/k", 150, &alloc)
+                .unwrap();
+            mgr.apply_commit(
+                rocks,
+                token(2, 1),
+                token(2, 2),
+                1,
+                "/k",
+                1,
+                obj,
+                150,
+                777,
+                0,
+            )
+            .unwrap();
+        }
+        (fs, addr, blocks)
+    }
+
+    /// RC2 P0-1 (gpt56 `53516250` window 2, cache-only variant): the
+    /// worker's full report self-Completes (ticket handed out under the
+    /// OLD tag), then a same-WIRE-session Start RETRY lands inside the
+    /// checkout window (FULL_TRIGGER_SEAM) — fresh registry tag, fresh
+    /// accumulator row. The old snapshot's reconcile must fail the
+    /// exact-ticket fence (zero publish, zero strip), the old ticket's
+    /// release must not touch the retried row, and the retried Start's
+    /// own full report must then publish normally.
+    #[test]
+    fn test_4d3_rc2_cache_only_start_retry_race() {
+        let (fs, _addr, [b1, b2, b3]) = build_rc2_retry_fs("cacheonly");
+        let old_tag = fs.cache_service.cache_session_tag(1).unwrap();
+        let list = |session: &str, total: u64, blocks: Vec<BlockReportInfo>| BlockReportList {
+            cluster_id: fs.worker_manager.read().conf.cluster_id.to_string(),
+            worker_id: 1,
+            full_report: true,
+            total_len: total,
+            blocks,
+            worker_session_id: Some(session.into()),
+        };
+        let cfinal = |id: i64, len: i64| {
+            BlockReportInfo::new(id, BlockReportStatus::Finalized, StorageType::Disk, len)
+        };
+
+        {
+            let fs2 = fs.clone();
+            *crate::master::master_handler::FULL_TRIGGER_SEAM
+                .lock()
+                .unwrap() = Some(Box::new(move || {
+                // A same-wire-session Start RETRY inside the checkout
+                // window: fresh tag, fresh accumulator row.
+                fs2.begin_worker_session(&addr_retry(), "s1").unwrap();
+            }));
+        }
+        // A helper so the closure above can borrow nothing: re-create
+        // the address (identity fields are what matter to the session
+        // domain; worker_id is the key).
+        fn addr_retry() -> WorkerAddress {
+            WorkerAddress {
+                worker_id: 1,
+                ..Default::default()
+            }
+        }
+
+        // The cache-only worker's single completing page: cache
+        // self-Complete + FS trigger in one call, with the retry landing
+        // in between.
+        fs.block_report(
+            list(
+                "s1",
+                3,
+                vec![cfinal(b1, 64), cfinal(b2, 64), cfinal(b3, 22)],
+            ),
+            None,
+        )
+        .unwrap();
+        *crate::master::master_handler::FULL_TRIGGER_SEAM
+            .lock()
+            .unwrap() = None;
+
+        // The old snapshot never acted on the retried Start's tag.
+        assert!(
+            fs.cache_service.get(1, "/k", true).unwrap().is_none(),
+            "old ticket reconciled to a no-op"
+        );
+        let new_tag = fs.cache_service.cache_session_tag(1).unwrap();
+        assert_ne!(new_tag, old_tag, "the retry issued a fresh tag");
+        assert_eq!(
+            fs.cache_service.session_spine_snapshot(1).accumulator,
+            Some(("s1".to_string(), false)),
+            "retried row untouched: old ticket's release was a no-op"
+        );
+
+        // The retried Start's own full report publishes normally under
+        // the new tag.
+        fs.block_report(
+            list(
+                "s1",
+                3,
+                vec![cfinal(b1, 64), cfinal(b2, 64), cfinal(b3, 22)],
+            ),
+            None,
+        )
+        .unwrap();
+        let hit = fs
+            .cache_service
+            .get(1, "/k", true)
+            .unwrap()
+            .expect("retried Start's report published");
+        assert_eq!(hit.blocks.len(), 3);
+        assert_eq!(hit.blocks[2].block_len, 22);
+    }
+
+    /// RC2 P0-1 (gpt56 `53516250` window 2, mixed variant): the FS
+    /// trigger has completed (reported set + bound tag in hand) when a
+    /// same-wire-session Start RETRY lands BEFORE the cache snapshot
+    /// take (FULL_TAKE_SEAM). The take is exact on the trigger's OLD
+    /// tag, so the retried Start's fresh row is never consumable: take
+    /// → None, zero reconcile, zero strip, and the retried Start's own
+    /// report later publishes.
+    #[test]
+    fn test_4d3_rc2_mixed_start_retry_before_take_race() {
+        let (fs, addr, [b1, b2, b3]) = build_rc2_retry_fs("mixed");
+        let old_tag = fs.cache_service.cache_session_tag(1).unwrap();
+        let list = |session: &str, total: u64, blocks: Vec<BlockReportInfo>| BlockReportList {
+            cluster_id: fs.worker_manager.read().conf.cluster_id.to_string(),
+            worker_id: 1,
+            full_report: true,
+            total_len: total,
+            blocks,
+            worker_session_id: Some(session.into()),
+        };
+        let cfinal = |id: i64, len: i64| {
+            BlockReportInfo::new(id, BlockReportStatus::Finalized, StorageType::Disk, len)
+        };
+
+        {
+            let fs2 = fs.clone();
+            *crate::master::master_handler::FULL_TAKE_SEAM
+                .lock()
+                .unwrap() = Some(Box::new(move || {
+                fs2.begin_worker_session(&addr, "s1").unwrap();
+            }));
+        }
+
+        // MIXED report: 3 cache ids + 2 FS ids against a declared total
+        // of 5 — the cache side can never self-Complete; the FS
+        // accumulator's completion is the trigger, and the retry lands
+        // between the trigger and the take.
+        fs.block_report(
+            list(
+                "s1",
+                5,
+                vec![
+                    cfinal(b1, 64),
+                    cfinal(b2, 64),
+                    cfinal(b3, 22),
+                    cfinal(500001, 64),
+                    cfinal(500002, 64),
+                ],
+            ),
+            None,
+        )
+        .unwrap();
+        *crate::master::master_handler::FULL_TAKE_SEAM
+            .lock()
+            .unwrap() = None;
+
+        // The old trigger consumed nothing from the retried Start.
+        assert!(
+            fs.cache_service.get(1, "/k", true).unwrap().is_none(),
+            "old trigger's take returned None — zero reconcile"
+        );
+        let new_tag = fs.cache_service.cache_session_tag(1).unwrap();
+        assert_ne!(new_tag, old_tag, "the retry issued a fresh tag");
+        assert_eq!(
+            fs.cache_service.session_spine_snapshot(1).accumulator,
+            Some(("s1".to_string(), false)),
+            "retried row never checked out by the old trigger"
+        );
+
+        // The retried Start's own mixed report takes + reconciles
+        // under the NEW tag.
+        fs.block_report(
+            list(
+                "s1",
+                5,
+                vec![
+                    cfinal(b1, 64),
+                    cfinal(b2, 64),
+                    cfinal(b3, 22),
+                    cfinal(500003, 64),
+                    cfinal(500004, 64),
+                ],
+            ),
+            None,
+        )
+        .unwrap();
+        let hit = fs
+            .cache_service
+            .get(1, "/k", true)
+            .unwrap()
+            .expect("retried Start's mixed report published");
         assert_eq!(hit.blocks.len(), 3);
         assert_eq!(hit.blocks[2].block_len, 22);
     }

@@ -1466,6 +1466,19 @@ pub(crate) static INCR_OUTCOME_SEAM: std::sync::Mutex<Option<Box<dyn Fn() + Send
 pub(crate) static FULL_TRIGGER_SEAM: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
     std::sync::Mutex::new(None);
 
+/// #[cfg(test)] seam storage for the 4d.3 RC2 mixed-trigger Start-retry
+/// proof (gpt56 `53516250` window 2): the hook set here (if any) is fired
+/// by `MasterFilesystem::block_report` exactly between the FS trigger's
+/// completion (reported set + bound Start-identity tag in hand) and the
+/// cache snapshot take. A hook can run a same-WIRE-session Start RETRY
+/// (fresh registry tag, fresh cache accumulator row) inside the window;
+/// the take must then return None (checkout is exact on the trigger's
+/// old tag) and the old trigger must have zero effect. Never set in
+/// production; compiled out entirely outside cfg(test).
+#[cfg(test)]
+pub(crate) static FULL_TAKE_SEAM: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
+    std::sync::Mutex::new(None);
+
 #[cfg(test)]
 mod tests {
     use super::*;
