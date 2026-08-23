@@ -25,6 +25,7 @@ use crate::master::meta::cache::entry::{
 use crate::master::meta::cache::store::validate_scan_limit;
 use crate::master::meta::cache::store::CacheWrite;
 use crate::master::meta::cache::store::LocalCacheIndexStore;
+use crate::master::meta::cache::BlockIdCodec;
 use crate::master::meta::store::RocksInodeStore;
 use curvine_core_error::{err_msg, CommonError};
 use curvine_error::FsResult;
@@ -78,27 +79,28 @@ impl RocksInodeStore {
         buf
     }
 
-    /// Ordered expiry index position `(expire_at, incarnation, key)` —
-    /// the encoded key bytes are raw UTF-8 (order-preserving), so the
-    /// signed big-endian `expire_at` leads the order and same-timestamp
-    /// rows break ties deterministically by `(incarnation, key)`.
-    fn expiry_key(expire_at: i64, incarnation: u64, key: &str) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(16 + key.len());
-        buf.extend_from_slice(&expire_at.to_be_bytes());
-        buf.extend_from_slice(&incarnation.to_be_bytes());
-        buf.extend_from_slice(&encode_key(key));
-        buf
+    /// Ordered expiry index position — the layout frozen at 4a:
+    /// `(expire_at, incarnation, object_id)` as three big-endian fixed
+    /// fields. Deterministic order gives stable same-timestamp paging by
+    /// `(incarnation, object_id)`.
+    fn expiry_key(expire_at: i64, incarnation: u64, object_id: i64) -> [u8; 24] {
+        let mut key = [0u8; 24];
+        key[..8].copy_from_slice(&expire_at.to_be_bytes());
+        key[8..16].copy_from_slice(&incarnation.to_be_bytes());
+        key[16..24].copy_from_slice(&object_id.to_be_bytes());
+        key
     }
 
-    /// Point-read the committed expiry index row at
-    /// `(expire_at, incarnation, key)` as `(object_id, generation)`.
+    /// Point-read the committed expiry index row at the frozen
+    /// `(expire_at, incarnation, object_id)` position as
+    /// `(key, generation)`.
     fn expiry_row_at(
         &self,
         expire_at: i64,
         incarnation: u64,
-        key: &str,
-    ) -> FsResult<Option<(i64, u64)>> {
-        let ck = Self::expiry_key(expire_at, incarnation, key);
+        object_id: i64,
+    ) -> FsResult<Option<(String, u64)>> {
+        let ck = Self::expiry_key(expire_at, incarnation, object_id);
         match self.db.get_cf(Self::CF_CACHE_EXPIRY, ck)? {
             None => Ok(None),
             Some(bytes) => Ok(Some(Serde::deserialize(&bytes)?)),
@@ -212,43 +214,67 @@ impl CacheWrite for RocksCacheWrite<'_> {
     fn put_expiry(&mut self, row: &ExpiryRow) -> FsResult<()> {
         validate_expiry_row(row)?;
         validate_incarnation(row.incarnation).map_err(FsError::from)?;
-        // Stale-safe CAS upsert (4c.1): one current row per (incarnation,
-        // key) position; a committed row at this position with generation
-        // >= ours makes the write a deterministic no-op (an equal
-        // generation is an idempotent replay). The guard reads committed
-        // state only — the single-writer apply path never stages two
-        // writes to one position in a batch.
-        if let Some((_, g)) = self
-            .db
-            .expiry_row_at(row.expire_at, row.incarnation, &row.key)?
+        // Exact-identity CAS (4c.1): the frozen position is uniquely
+        // bound to one (key, generation) in legal history — an object id
+        // never advances generations. An existing committed row must be a
+        // bit-exact identity match (idempotent replay); any key or
+        // generation difference, in either direction, is divergence and
+        // fails loudly. The guard reads committed state only — the
+        // single-writer apply path never stages two writes to one
+        // position in a batch.
+        if let Some((key, gen)) =
+            self.db
+                .expiry_row_at(row.expire_at, row.incarnation, row.object_id)?
         {
-            if g >= row.generation {
+            if key == row.key && gen == row.generation {
                 return Ok(());
             }
+            return Err(FsError::from(CommonError::from(err_msg!(
+                "cache expiry identity divergence at ({}, {}, {}): committed ({}, {}) vs write ({}, {})",
+                row.expire_at,
+                row.incarnation,
+                row.object_id,
+                key,
+                gen,
+                row.key,
+                row.generation
+            ))));
         }
-        let key = RocksInodeStore::expiry_key(row.expire_at, row.incarnation, &row.key);
-        let value = Serde::serialize(&(row.object_id, row.generation))?;
-        self.put_cf(RocksInodeStore::CF_CACHE_EXPIRY, key, value)
+        let ck = RocksInodeStore::expiry_key(row.expire_at, row.incarnation, row.object_id);
+        let value = Serde::serialize(&(row.key.clone(), row.generation))?;
+        self.put_cf(RocksInodeStore::CF_CACHE_EXPIRY, ck, value)
     }
 
     fn delete_expiry(
         &mut self,
         expire_at: i64,
         incarnation: u64,
+        object_id: i64,
         key: &str,
-        max_generation: u64,
+        generation: u64,
     ) -> FsResult<()> {
-        // Stale-safe CAS delete (4c.1): a committed row at this position
-        // with a generation above `max_generation` is a newer overwrite
-        // and must survive; anything else (older, exact, or missing) is
-        // safe to remove.
-        if let Some((_, g)) = self.db.expiry_row_at(expire_at, incarnation, key)? {
-            if g > max_generation {
-                return Ok(());
+        // Exact-identity CAS delete (4c.1): only the expected
+        // (key, generation) at the frozen position may be removed; any
+        // mismatch is divergence; a missing row is an idempotent no-op.
+        match self.db.expiry_row_at(expire_at, incarnation, object_id)? {
+            None => Ok(()),
+            Some((committed_key, committed_gen)) => {
+                if committed_key != key || committed_gen != generation {
+                    return Err(FsError::from(CommonError::from(err_msg!(
+                        "cache expiry identity divergence at ({}, {}, {}): committed ({}, {}) vs delete ({}, {})",
+                        expire_at,
+                        incarnation,
+                        object_id,
+                        committed_key,
+                        committed_gen,
+                        key,
+                        generation
+                    ))));
+                }
+                let ck = RocksInodeStore::expiry_key(expire_at, incarnation, object_id);
+                self.delete_cf(RocksInodeStore::CF_CACHE_EXPIRY, ck)
             }
         }
-        let ck = RocksInodeStore::expiry_key(expire_at, incarnation, key);
-        self.delete_cf(RocksInodeStore::CF_CACHE_EXPIRY, ck)
     }
 
     fn put_incarnation(&mut self, incarnation: u64, row: IncarnationRow) -> FsResult<()> {
@@ -405,18 +431,45 @@ impl LocalCacheIndexStore for RocksInodeStore {
                 now
             ))));
         }
+        // Cursor validation at the boundary: a page cursor always comes
+        // from a row this index produced, so it must carry a positive
+        // deadline, an allocatable incarnation, and a cache-domain object.
+        if let Some(c) = after {
+            if c.expire_at <= 0 {
+                return Err(FsError::from(CommonError::from(err_msg!(
+                    "expiry scan cursor deadline must be positive: {}",
+                    c.expire_at
+                ))));
+            }
+            validate_incarnation(c.incarnation).map_err(FsError::from)?;
+            if !BlockIdCodec::is_cache_owner(c.object_id) {
+                return Err(FsError::from(CommonError::from(err_msg!(
+                    "expiry scan cursor object id outside cache domain: {}",
+                    c.object_id
+                ))));
+            }
+        }
         // Range: [cursor_or_min, upper) where `upper` is exactly the 8
         // big-endian bytes of `now + 1` — expire_at is the first field and
-        // every real row key is longer than 8 bytes, so the exclusive
-        // upper bound covers exactly the rows with expire_at <= now (a row
-        // at expire_at == now + 1 sorts strictly after `upper` and is NOT
-        // due yet). All deadlines are positive (`put_expiry` rejects
-        // <= 0), so signed big-endian byte order equals deadline order.
+        // every real row key is 24 bytes, so the exclusive upper bound
+        // covers exactly the rows with expire_at <= now (a row at
+        // expire_at == now + 1 sorts strictly after `upper` and is NOT due
+        // yet). `now == i64::MAX` cannot express +1: the sentinel
+        // MAX ++ 0xFF*16 is strictly after every real 24-byte key
+        // (incarnation <= u64::MAX-1 keeps the 9th byte below 0xFF), so
+        // the final deadline is still covered. All deadlines are positive
+        // (`put_expiry` rejects <= 0), so signed big-endian byte order
+        // equals deadline order.
         let start = after
-            .map(|c| Self::expiry_key(c.expire_at, c.incarnation, &c.key))
-            .unwrap_or_default();
-        let upper = now.saturating_add(1);
-        let end = upper.to_be_bytes().to_vec();
+            .map(|c| Self::expiry_key(c.expire_at, c.incarnation, c.object_id).to_vec())
+            .unwrap_or_else(|| [0u8; 24].to_vec());
+        let end = if now == i64::MAX {
+            let mut e = [0xFFu8; 24];
+            e[..8].copy_from_slice(&i64::MAX.to_be_bytes());
+            e.to_vec()
+        } else {
+            (now + 1).to_be_bytes().to_vec()
+        };
 
         let iter = self.db.range_scan(Self::CF_CACHE_EXPIRY, start, end)?;
         let mut rows = Vec::new();
@@ -426,7 +479,7 @@ impl LocalCacheIndexStore for RocksInodeStore {
                 break;
             }
             let (key, value) = item.map_err(rocks_err)?;
-            if key.len() < 16 {
+            if key.len() != 24 {
                 return Err(FsError::from(CommonError::from(err_msg!(
                     "corrupt expiry row key length: {}",
                     key.len()
@@ -434,15 +487,19 @@ impl LocalCacheIndexStore for RocksInodeStore {
             }
             let expire_at = RocksUtils::i64_from_bytes(&key[..8])?;
             let incarnation = RocksUtils::u64_from_bytes(&key[8..16])?;
-            let key_str = decode_key(&key[16..])?;
-            // Exclusive cursor: skip only the exact cursor row; later keys
-            // in the same (expire_at, incarnation) group still surface.
+            let object_id = RocksUtils::i64_from_bytes(&key[16..24])?;
+            // Exclusive cursor: skip only the exact cursor row; later
+            // object ids in the same (expire_at, incarnation) group still
+            // surface.
             if let Some(c) = skip_after.take() {
-                if expire_at == c.expire_at && incarnation == c.incarnation && key_str == c.key {
+                if expire_at == c.expire_at
+                    && incarnation == c.incarnation
+                    && object_id == c.object_id
+                {
                     continue;
                 }
             }
-            let (object_id, generation): (i64, u64) = Serde::deserialize(&value)?;
+            let (key_str, generation): (String, u64) = Serde::deserialize(&value)?;
             rows.push(ExpiryRow {
                 expire_at,
                 incarnation,
@@ -504,6 +561,21 @@ impl LocalCacheIndexStore for RocksInodeStore {
         // Membership is judged ONLY by key_in_scope on decoded keys: the
         // encoded key of "/a" is a byte-prefix of "/ab", so RocksDB range
         // bounds can narrow iteration but must never decide membership.
+        // A cursor outside the scope is rejected at the boundary: a page
+        // cursor always comes from an earlier page of this same scoped
+        // scan (membership is a property of the strings, so a cursor
+        // whose row was deleted stays valid); accepting a foreign one
+        // (e.g. `after` far below the scope) would let the loop skip an
+        // unbounded unrelated key region without filling any page.
+        if let Some(a) = after {
+            if !key_in_scope(a, scope) {
+                return Err(FsError::from(CommonError::from(err_msg!(
+                    "scoped entry scan cursor {:?} is outside scope {:?}",
+                    a,
+                    scope
+                ))));
+            }
+        }
         // The scope's smallest possible member is the exact scope key,
         // recovered by a point read (iteration yields strictly-after rows);
         // the family — every string with prefix "{scope}/" — is one
@@ -763,7 +835,7 @@ mod tests {
 
         // Deletion removes exactly one row.
         let mut w = store.cache_write();
-        w.delete_expiry(100, 1, "/a", 1)?;
+        w.delete_expiry(100, 1, OBJ + 1, "/a", 1)?;
         w.commit()?;
         assert_eq!(store.cache_scan_expiry(600, None, 10)?.len(), 2);
         Ok(())
@@ -772,8 +844,9 @@ mod tests {
     #[test]
     fn test_expiry_scan_cursor_same_timestamp_and_resume_after_delete() -> FsResult<()> {
         let store = new_store("expiry-cursor")?;
-        // Five rows sharing expire_at 100: same-timestamp groups must page
-        // deterministically by (incarnation, key), never by object id.
+        // Five rows, four sharing expire_at 100: same-timestamp groups
+        // must page deterministically by (incarnation, object_id) in the
+        // frozen key order.
         let rows = [
             (100i64, 2u64, OBJ + 4, "/y"),
             (100, 1, OBJ, "/b"),
@@ -795,7 +868,8 @@ mod tests {
 
         let expect = ["/b", "/c", "/x", "/y", "/z"];
 
-        // Full-order ground truth: deterministic (expire, inc, key) order.
+        // Full-order ground truth: deterministic
+        // (expire, incarnation, object_id) order.
         let all = store.cache_scan_expiry(300, None, 10)?;
         assert_eq!(
             all.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),
@@ -823,7 +897,7 @@ mod tests {
         let after_c = ExpiryCursor {
             expire_at: 100,
             incarnation: 1,
-            key: "/c".into(),
+            object_id: OBJ + 1,
         };
         let page = store.cache_scan_expiry(300, Some(&after_c), 10)?;
         assert_eq!(
@@ -834,7 +908,7 @@ mod tests {
         // Delete the cursor's own row, then resume from the same cursor:
         // no skips (its successors are untouched) and no duplicates.
         let mut w = store.cache_write();
-        w.delete_expiry(100, 1, "/c", 1)?;
+        w.delete_expiry(100, 1, OBJ + 1, "/c", 1)?;
         w.commit()?;
         let page = store.cache_scan_expiry(300, Some(&after_c), 10)?;
         assert_eq!(
@@ -845,69 +919,188 @@ mod tests {
     }
 
     #[test]
-    fn test_expiry_cas_put_and_delete_noop() -> FsResult<()> {
+    fn test_expiry_scan_max_deadline_and_cursor_validation() -> FsResult<()> {
+        let store = new_store("expiry-max")?;
+        let mut w = store.cache_write();
+        w.put_expiry(&ExpiryRow {
+            expire_at: i64::MAX,
+            incarnation: 1,
+            object_id: OBJ,
+            key: "/max".into(),
+            generation: 1,
+        })?;
+        w.put_expiry(&ExpiryRow {
+            expire_at: i64::MAX - 1,
+            incarnation: 1,
+            object_id: OBJ + 1,
+            key: "/prev".into(),
+            generation: 1,
+        })?;
+        w.commit()?;
+
+        // now == i64::MAX must still surface the MAX-deadline row (the
+        // successor sentinel covers every positive deadline).
+        let due = store.cache_scan_expiry(i64::MAX, None, 10)?;
+        assert_eq!(
+            due.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),
+            ["/prev", "/max"]
+        );
+        // MAX-1 excludes the MAX row.
+        let due = store.cache_scan_expiry(i64::MAX - 1, None, 10)?;
+        assert_eq!(
+            due.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),
+            ["/prev"]
+        );
+
+        // Cursor validation: a foreign cursor is rejected at the boundary
+        // before any iteration.
+        assert!(store
+            .cache_scan_expiry(
+                10,
+                Some(&ExpiryCursor {
+                    expire_at: 0,
+                    incarnation: 1,
+                    object_id: OBJ
+                }),
+                10
+            )
+            .is_err());
+        assert!(store
+            .cache_scan_expiry(
+                10,
+                Some(&ExpiryCursor {
+                    expire_at: 100,
+                    incarnation: 0,
+                    object_id: OBJ
+                }),
+                10
+            )
+            .is_err());
+        assert!(store
+            .cache_scan_expiry(
+                10,
+                Some(&ExpiryCursor {
+                    expire_at: 100,
+                    incarnation: 1,
+                    object_id: 42
+                }),
+                10
+            )
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_expiry_identity_cas_exact_or_loud() -> FsResult<()> {
         let store = new_store("expiry-cas")?;
-        let pos = |object_id: i64, generation: u64| ExpiryRow {
+        let pos = |key: &str, generation: u64| ExpiryRow {
             expire_at: 500,
             incarnation: 3,
-            object_id,
-            key: "/k".into(),
+            object_id: OBJ,
+            key: key.into(),
             generation,
         };
 
-        // Generation advance at the same (expire, inc, key) position
-        // overwrites in place: one row, newest version wins.
+        // Bit-exact replay of the same row is an idempotent no-op.
         let mut w = store.cache_write();
-        w.put_expiry(&pos(OBJ, 1))?;
+        w.put_expiry(&pos("/k", 1))?;
         w.commit()?;
         let mut w = store.cache_write();
-        w.put_expiry(&pos(OBJ + 1, 2))?;
-        w.commit()?;
-        let rows = store.cache_scan_expiry(600, None, 10)?;
-        assert_eq!(rows.len(), 1);
-        assert_eq!((rows[0].object_id, rows[0].generation), (OBJ + 1, 2));
-
-        // Stale replay of generation 1 at the same position: deterministic
-        // no-op, the generation-2 row survives.
-        let mut w = store.cache_write();
-        w.put_expiry(&pos(OBJ, 1))?;
+        w.put_expiry(&pos("/k", 1))?;
         w.commit()?;
         let rows = store.cache_scan_expiry(600, None, 10)?;
         assert_eq!(rows.len(), 1);
-        assert_eq!((rows[0].object_id, rows[0].generation), (OBJ + 1, 2));
+        assert_eq!((rows[0].object_id, rows[0].generation), (OBJ, 1));
 
-        // Stale delete (max_generation below the committed 2): no-op.
-        let mut w = store.cache_write();
-        w.delete_expiry(500, 3, "/k", 1)?;
-        w.commit()?;
-        assert_eq!(store.cache_scan_expiry(600, None, 10)?.len(), 1);
+        // Same frozen position, any identity difference — generation
+        // higher OR lower, or a different key — is loud divergence, not a
+        // silent no-op or overwrite.
+        {
+            let mut w = store.cache_write();
+            assert!(w.put_expiry(&pos("/k", 2)).is_err());
+        }
+        {
+            let mut w = store.cache_write();
+            assert!(w.put_expiry(&pos("/other", 1)).is_err());
+        }
+        let rows = store.cache_scan_expiry(600, None, 10)?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key, "/k");
 
-        // Delete at the current generation removes the row; deleting a
-        // missing row stays idempotent.
+        // Delete: exact identity removes the row; deleting the now-missing
+        // row is idempotent.
         let mut w = store.cache_write();
-        w.delete_expiry(500, 3, "/k", 2)?;
-        w.delete_expiry(500, 3, "/k", 2)?;
+        w.delete_expiry(500, 3, OBJ, "/k", 1)?;
+        w.delete_expiry(500, 3, OBJ, "/k", 1)?;
         w.commit()?;
         assert!(store.cache_scan_expiry(600, None, 10)?.is_empty());
 
-        // Rows at other positions are untouched by a same-key different
-        // deadline CAS (the position includes expire_at).
+        // Delete against a committed row with a different key or
+        // generation: loud divergence, row survives.
         let mut w = store.cache_write();
-        w.put_expiry(&pos(OBJ + 5, 7))?;
-        w.put_expiry(&ExpiryRow {
-            expire_at: 900,
-            incarnation: 3,
-            object_id: OBJ + 6,
-            key: "/k".into(),
-            generation: 9,
-        })?;
+        w.put_expiry(&pos("/k", 7))?;
         w.commit()?;
-        let mut w = store.cache_write();
-        w.delete_expiry(500, 3, "/k", 6)?; // generation 7 > 6: no-op
-        w.commit()?;
-        let rows = store.cache_scan_expiry(1000, None, 10)?;
-        assert_eq!(rows.len(), 2);
+        {
+            let mut w = store.cache_write();
+            assert!(w.delete_expiry(500, 3, OBJ, "/k", 6).is_err());
+            assert!(w.delete_expiry(500, 3, OBJ, "/other", 7).is_err());
+        }
+        assert_eq!(store.cache_scan_expiry(600, None, 10)?.len(), 1);
         Ok(())
+    }
+
+    #[test]
+    fn test_expiry_frozen_4b_layout_bytes() -> FsResult<()> {
+        let store = new_store("expiry-frozen")?;
+        // A row exactly as 4a/4b (7e3f8a02..919756de) would have written
+        // it: key = (expire_at, incarnation, object_id) big-endian 24
+        // bytes, value = bincode (key, generation). The value bytes are
+        // pinned by the frozen hex below: string "/a" = u64-LE len 2 ++
+        // "2f61", then generation 1 = u64-LE.
+        const VALUE_HEX: &str = "02000000000000002f610100000000000000";
+        let frozen_value: (String, u64) = Serde::deserialize(&hex_bytes(VALUE_HEX))?;
+        assert_eq!(frozen_value, ("/a".to_string(), 1));
+
+        let row = ExpiryRow {
+            expire_at: 100,
+            incarnation: 1,
+            object_id: OBJ,
+            key: "/a".into(),
+            generation: 1,
+        };
+        {
+            let mut w = store.cache_write();
+            w.put_expiry(&row)?;
+            w.commit()?;
+        }
+
+        // The committed bytes are exactly the frozen layout, read back raw
+        // through the index's own range scan.
+        let iter = store.db.range_scan(
+            RocksInodeStore::CF_CACHE_EXPIRY,
+            [0u8; 24].to_vec(),
+            [0xFF; 24].to_vec(),
+        )?;
+        let mut raw = Vec::new();
+        for item in iter {
+            let (k, v) = item.map_err(rocks_err)?;
+            raw.push((k, v));
+        }
+        assert_eq!(raw.len(), 1);
+        let expected_key: Vec<u8> = RocksInodeStore::expiry_key(100, 1, OBJ).to_vec();
+        assert_eq!(raw[0].0.to_vec(), expected_key);
+        assert_eq!(raw[0].1.to_vec(), hex_bytes(VALUE_HEX));
+
+        // And the row decodes to itself through the public scan.
+        assert_eq!(store.cache_scan_expiry(200, None, 10)?, vec![row]);
+        Ok(())
+    }
+
+    fn hex_bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
     }
 
     #[test]
@@ -956,6 +1149,21 @@ mod tests {
         assert!(store
             .cache_scan_entries_in_scope(1, "/a/b/c/d", None, 10)?
             .is_empty());
+
+        // A cursor outside the scope is rejected at the boundary — a
+        // foreign cursor can never turn the scan into an unbounded
+        // filtered walk over unrelated keys ("/ab" is a byte-prefix
+        // neighbor but not a component member; "/" sorts below "/z").
+        assert!(store
+            .cache_scan_entries_in_scope(1, "/a", Some("/ab"), 10)
+            .is_err());
+        assert!(store
+            .cache_scan_entries_in_scope(1, "/z", Some("/"), 10)
+            .is_err());
+        // An in-scope cursor stays valid even after its row is gone.
+        assert!(store
+            .cache_scan_entries_in_scope(1, "/a", Some("/a/b"), 10)
+            .is_ok());
 
         // limit=1 chained pages with the exclusive cursor: restart/resume
         // without skips or duplicates.

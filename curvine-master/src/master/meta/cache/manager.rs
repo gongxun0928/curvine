@@ -996,13 +996,19 @@ impl CacheManager {
         let mut w = store.cache_write();
         w.put_entry(incarnation, key, &new).map_err(cv)?;
         if cur.expire_at > 0 {
-            // Stale-safe CAS delete (4c.1): the position is
-            // (expire_at, incarnation, key) and the row at it can only be
-            // this version's (cur.generation == expected_generation);
-            // a hypothetical newer overwrite at the same position must
-            // survive.
-            w.delete_expiry(cur.expire_at, incarnation, key, cur.generation)
-                .map_err(cv)?;
+            // Exact-identity CAS delete (4c.1): the frozen position is
+            // (expire_at, incarnation, object_id) and the row at it was
+            // written by the commit that made this version Valid, so the
+            // committed (key, generation) must match exactly; any
+            // mismatch is divergence and fails the apply.
+            w.delete_expiry(
+                cur.expire_at,
+                incarnation,
+                cur.object_id,
+                key,
+                cur.generation,
+            )
+            .map_err(cv)?;
         }
         // The reverse row is only a GC hint for the superseded version.
         w.delete_object(cur.object_id).map_err(cv)?;

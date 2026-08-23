@@ -74,24 +74,29 @@ pub trait CacheWrite {
     /// superseded or reclaimed; stale rows are always safe to delete.
     fn delete_object(&mut self, object_id: i64) -> FsResult<()>;
 
-    /// Stale-safe CAS upsert into the ordered expiry index (4c.1): exactly
-    /// one current row exists per `(incarnation, key)` position. If the
-    /// committed row at this position already carries
-    /// `generation >= row.generation`, the write is a deterministic no-op —
-    /// a stale replay must never demote the index to an older version.
+    /// Exact-identity CAS upsert into the ordered expiry index (4c.1),
+    /// keyed by the frozen `(expire_at, incarnation, object_id)` position.
+    /// In legal history a position is uniquely bound to one
+    /// `(key, generation)` — an object id never advances generations — so
+    /// an existing committed row must be a bit-exact identity match
+    /// (idempotent replay); any difference in key OR generation (in
+    /// either direction) is replay divergence and fails loudly. Stale
+    /// TTL/remove no-op semantics live above this seam (4c.2 CAS against
+    /// the authoritative entry), never here.
     fn put_expiry(&mut self, row: &ExpiryRow) -> FsResult<()>;
 
-    /// Stale-safe CAS delete (4c.1): removes the expiry index row at
-    /// `(expire_at, incarnation, key)` only while its committed
-    /// generation is `<= max_generation`; a newer overwrite that reused
-    /// the position makes the delete a no-op. Deleting a missing row is
-    /// always allowed (idempotent).
+    /// Exact-identity CAS delete (4c.1): removes the expiry index row at
+    /// the frozen `(expire_at, incarnation, object_id)` position only when
+    /// the committed row's `(key, generation)` matches the expected pair
+    /// exactly; any mismatch is replay divergence and fails loudly; a
+    /// missing row is an idempotent no-op.
     fn delete_expiry(
         &mut self,
         expire_at: i64,
         incarnation: u64,
+        object_id: i64,
         key: &str,
-        max_generation: u64,
+        generation: u64,
     ) -> FsResult<()>;
 
     /// Create/update an incarnation row. Incarnation rows are durable forever.
@@ -146,10 +151,11 @@ pub trait LocalCacheIndexStore {
     fn cache_get_object(&self, object_id: i64) -> FsResult<Option<ObjectRow>>;
 
     /// Bounded, resumable scan of expiry rows with `expire_at <= now`, in
-    /// deterministic `(expire_at, incarnation, key)` index order, starting
-    /// strictly after `after` (None = from the beginning). Rows sharing an
-    /// `expire_at` page stably by `(incarnation, key)`. `limit` is
-    /// validated `1..=SCAN_HARD_CAP`.
+    /// frozen `(expire_at, incarnation, object_id)` index order, starting
+    /// strictly after `after` (None = from the beginning; the cursor is
+    /// validated: positive deadline, allocatable incarnation). Rows
+    /// sharing an `expire_at` page stably by `(incarnation, object_id)`.
+    /// `limit` is validated `1..=SCAN_HARD_CAP`.
     fn cache_scan_expiry(
         &self,
         now: i64,
@@ -174,9 +180,12 @@ pub trait LocalCacheIndexStore {
     /// decoded keys, never by RocksDB byte-prefix bounds (`encode_key` is
     /// deliberately not component-safe). The Key scope is the point read
     /// `cache_get_entry`; the Mount scope is `cache_scan_entries`. Starts
-    /// strictly after `after` (None = from the scope itself) and stops as
-    /// soon as iteration passes the scope's whole key family, so a page
-    /// never scans unrelated keys beyond the boundary.
+    /// strictly after `after` (None = from the scope itself); a cursor
+    /// outside the scope is rejected at the boundary (membership is a
+    /// property of the strings, so a cursor whose row was deleted stays
+    /// valid) — a foreign cursor can never turn the scan into an
+    /// unbounded filtered walk. Iteration stops as soon as it passes the
+    /// scope's whole key family.
     fn cache_scan_entries_in_scope(
         &self,
         incarnation: u64,
