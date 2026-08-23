@@ -16,7 +16,7 @@ use crate::master::fs::context::ValidateAddBlock;
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
 use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
-use crate::master::meta::{CacheInvalidationResult, FsDir};
+use crate::master::meta::{BlockIdCodec, CacheInvalidationResult, FsDir};
 
 use crate::master::fs::DeleteResult;
 use crate::master::meta::parse_glob_pattern;
@@ -1426,12 +1426,55 @@ impl MasterFilesystem {
             });
         }
 
+        // 4d.2 cache-before-FS diversion: cache-domain block ids NEVER
+        // enter the FS classify/apply/reconcile chain below (zero
+        // penetration, including Deleted — a cache Deleted is a BlockMap
+        // ack + volatile replica removal, never an inode-chain delete).
+        // The FS full-report accumulator above still counts ALL ids so
+        // its declared total stays correct; only the classification and
+        // the final reconcile set are domain-split.
+        let mut cache_items: Vec<BlockReportInfo> = Vec::new();
+        let mut fs_blocks: Vec<BlockReportInfo> = Vec::with_capacity(list.blocks.len());
+        for item in list.blocks {
+            match BlockIdCodec::is_cache_block_id(item.id) {
+                Ok(true) => cache_items.push(item),
+                // A decode failure is not provably a cache id: keep it
+                // on the FS path, whose classify logs and skips it.
+                _ => fs_blocks.push(item),
+            }
+        }
+        if !cache_items.is_empty() {
+            if list.full_report {
+                // Full-report cache pages are accumulated/reconciled by
+                // 4d.3 — 4d.2 only guarantees they leave the FS chain.
+                log::debug!(
+                    "block_report: {} cache blocks in worker {} full report deferred to 4d.3",
+                    cache_items.len(),
+                    list.worker_id
+                );
+            } else {
+                let session = list.worker_session_id.as_deref().unwrap_or("");
+                let outcome =
+                    self.cache_service
+                        .incr_block_report(list.worker_id, session, &cache_items)?;
+                if !outcome.remove_blocks.is_empty() || !outcome.deleted_acks.is_empty() {
+                    let mut wm = self.worker_manager.write();
+                    for id in outcome.remove_blocks {
+                        wm.remove_block(list.worker_id, id);
+                    }
+                    for id in outcome.deleted_acks {
+                        wm.deleted_block(list.worker_id, id);
+                    }
+                }
+            }
+        }
+
         //(Whether to increase, block id, block location)
-        let mut checked = Vec::with_capacity(list.blocks.len());
+        let mut checked = Vec::with_capacity(fs_blocks.len());
         let mut delete_blocks = Vec::new();
         let mut missing_blocks = 0usize;
         let mut not_file_blocks = 0usize;
-        for item in list.blocks {
+        for item in fs_blocks {
             match item.status {
                 BlockReportStatus::Finalized | BlockReportStatus::Writing => {
                     let defer_writing_delete =
@@ -1513,7 +1556,14 @@ impl MasterFilesystem {
         drop(wm);
 
         if let Some(reported_blocks) = full_reported_blocks {
-            self.submit_full_block_reconcile(list.worker_id, reported_blocks, replication_handler)?;
+            // 4d.2: the FS reconcile set covers FS blocks only — cache
+            // ids in the accumulated total are excluded here (the 4d.3
+            // full-report reconcile owns the cache-domain exact set).
+            let fs_reported: HashSet<i64> = reported_blocks
+                .into_iter()
+                .filter(|id| !BlockIdCodec::is_cache_block_id(*id).unwrap_or(false))
+                .collect();
+            self.submit_full_block_reconcile(list.worker_id, fs_reported, replication_handler)?;
         }
 
         self.apply_block_report_batch(batch)?;
@@ -2116,5 +2166,147 @@ mod tests {
             "lost worker capacity must not leak into allocatable"
         );
         assert_eq!(info.allocatable_available, 800);
+    }
+
+    fn token(client: u64, seq: u64) -> crate::master::meta::cache::entry::OpToken {
+        crate::master::meta::cache::entry::OpToken {
+            client_id: client,
+            op_seq: seq,
+        }
+    }
+
+    /// 4d.2 cache-before-FS diversion at the block_report boundary: a
+    /// mixed page (fs ids + cache ids) routes cache items into the cache
+    /// domain only — they never reach the FS classify loop (no
+    /// missing-inode deletion for cache ids, `delete_blocks` carries FS
+    /// ids only) — while a complete Valid×Finalized cache publish makes
+    /// the whole-object read path serve the worker, and a cache Deleted
+    /// removes the replica with zero FS effect.
+    #[test]
+    fn test_4d2_block_report_mixed_page_zero_penetration() {
+        use curvine_raft::raft::RoleState;
+
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.cache_metadata_enabled = true;
+        conf.master.meta_dir =
+            Utils::test_sub_dir(format!("master-fs-4d2-mixed/meta-{}", Utils::rand_str(6)));
+        conf.journal.journal_dir = Utils::test_sub_dir(format!(
+            "master-fs-4d2-mixed/journal-{}",
+            Utils::rand_str(6)
+        ));
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
+
+        let addr = WorkerAddress {
+            worker_id: 1,
+            hostname: "mixed-1".into(),
+            ip_addr: "10.0.0.1".into(),
+            rpc_port: 8200,
+            web_port: 8300,
+        };
+        fs.begin_worker_session(&addr, "s1").unwrap();
+
+        // Committed Valid cache entry: OBJ, len 150 -> 64/64/22.
+        let obj = BlockIdCodec::CACHE_OBJECT_MIN;
+        let lay = crate::master::meta::CacheBlockLayout::derive(obj, 150, 64).unwrap();
+        {
+            let store = fs.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let mgr = &store.cache;
+            mgr.apply_incarnation_allocate_v2(rocks, token(91, 1), 5, 1, 0)
+                .unwrap();
+            mgr.apply_id_reserve(rocks, token(1, 1), obj, obj + 100)
+                .unwrap();
+            let alloc = crate::master::meta::cache::entry::CacheEntry {
+                generation: 1,
+                state: crate::master::meta::cache::entry::CacheEntryState::Reserved,
+                object_id: obj,
+                len: 0,
+                ufs_mtime: 0,
+                block_size: 64,
+                expire_at: 0,
+            };
+            mgr.apply_allocate(rocks, token(2, 1), 1, "/k", 150, &alloc)
+                .unwrap();
+            mgr.apply_commit(
+                rocks,
+                token(2, 1),
+                token(2, 2),
+                1,
+                "/k",
+                1,
+                obj,
+                150,
+                777,
+                0,
+            )
+            .unwrap();
+        }
+
+        // One mixed INCREMENTAL page: an fs id whose inode is missing
+        // (existing FS behavior: scheduled deletion) plus the three
+        // cache block ids with exact lengths.
+        let list = BlockReportList {
+            cluster_id: conf.cluster_id.clone(),
+            worker_id: 1,
+            full_report: false,
+            total_len: 0,
+            blocks: vec![
+                BlockReportInfo::new(500, BlockReportStatus::Finalized, StorageType::Disk, 64),
+                BlockReportInfo::new(
+                    lay.block_id(1).unwrap(),
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    64,
+                ),
+                BlockReportInfo::new(
+                    lay.block_id(2).unwrap(),
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    64,
+                ),
+                BlockReportInfo::new(
+                    lay.block_id(3).unwrap(),
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    22,
+                ),
+            ],
+            worker_session_id: Some("s1".into()),
+        };
+        let res = fs.block_report(list, None).unwrap();
+        assert_eq!(
+            res.delete_blocks,
+            vec![500],
+            "cache ids never leak into the FS delete set"
+        );
+
+        // The cache publish completed the whole-object location set.
+        let hit = fs
+            .cache_service
+            .get(1, "/k", true)
+            .unwrap()
+            .expect("cache blocks published through the routed incremental");
+        assert_eq!(hit.blocks.len(), 3);
+        assert_eq!(hit.blocks[2].block_len, 22);
+
+        // A cache Deleted page: replica removed, zero FS effect.
+        let list = BlockReportList {
+            cluster_id: conf.cluster_id.clone(),
+            worker_id: 1,
+            full_report: false,
+            total_len: 0,
+            blocks: vec![BlockReportInfo::with_deleted(lay.block_id(2).unwrap(), 64)],
+            worker_session_id: Some("s1".into()),
+        };
+        let res = fs.block_report(list, None).unwrap();
+        assert!(res.delete_blocks.is_empty());
+        assert!(
+            fs.cache_service.get(1, "/k", true).unwrap().is_none(),
+            "losing one block's only replica is a whole-object miss"
+        );
     }
 }
