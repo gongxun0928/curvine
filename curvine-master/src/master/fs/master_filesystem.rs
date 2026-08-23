@@ -1540,6 +1540,9 @@ impl MasterFilesystem {
         // the final reconcile set are domain-split.
         let mut cache_items: Vec<BlockReportInfo> = Vec::new();
         let mut fs_blocks: Vec<BlockReportInfo> = Vec::with_capacity(list.blocks.len());
+        // 4d.3: a cache-only worker's self-Complete snapshot, stashed
+        // until the FS accumulator's end-of-report trigger fires.
+        let mut cache_complete: Option<Vec<BlockReportInfo>> = None;
         for item in list.blocks {
             match BlockIdCodec::is_cache_block_id(item.id) {
                 Ok(true) => cache_items.push(item),
@@ -1550,13 +1553,27 @@ impl MasterFilesystem {
         }
         if !cache_items.is_empty() {
             if list.full_report {
-                // Full-report cache pages are accumulated/reconciled by
-                // 4d.3 — 4d.2 only guarantees they leave the FS chain.
-                log::debug!(
-                    "block_report: {} cache blocks in worker {} full report deferred to 4d.3",
-                    cache_items.len(),
-                    list.worker_id
-                );
+                // 4d.3: full-report cache pages feed the cache
+                // accumulator (cache-before-FS: they never reach the FS
+                // chain below). The declared total passed here is the
+                // report's FULL total (cache + FS ids), so a MIXED
+                // worker's cache side can never self-Complete — only a
+                // cache-only worker's can; the FS accumulator reaching
+                // its total below is the single authoritative
+                // end-of-report trigger for everyone.
+                let session = list.worker_session_id.clone().unwrap_or_default();
+                match self.cache_service.cache_full_report_page(
+                    list.worker_id,
+                    &session,
+                    list.total_len,
+                    &cache_items,
+                ) {
+                    crate::cache::cache_service::CacheFullReportOutcome::Complete(entries) => {
+                        cache_complete = Some(entries);
+                    }
+                    crate::cache::cache_service::CacheFullReportOutcome::Partial
+                    | crate::cache::cache_service::CacheFullReportOutcome::Skipped => {}
+                }
             } else {
                 let session = list.worker_session_id.as_deref().unwrap_or("");
                 let outcome =
@@ -1653,6 +1670,37 @@ impl MasterFilesystem {
         drop(wm);
 
         if let Some(reported_blocks) = full_reported_blocks {
+            // 4d.3: end-of-report trigger for the CACHE domain — the
+            // single authoritative signal (the FS accumulator counts
+            // ALL ids, cache + FS). Snapshot = the self-Complete stash
+            // (cache-only worker) or the worker's still-Partial
+            // same-session accumulator consumed here (mixed worker); a
+            // terminal/absent row yields None and the reconcile is
+            // skipped (no authoritative snapshot, 复活禁止). The
+            // reconcile itself is fenced on the exact
+            // (epoch, session, tag, generation) triple; its WM side
+            // effects ride the same fenced transition as an
+            // incremental's.
+            let session = list.worker_session_id.clone().unwrap_or_default();
+            let snapshot = cache_complete.take().or_else(|| {
+                self.cache_service
+                    .take_cache_full_snapshot(list.worker_id, &session)
+            });
+            if let Some(entries) = snapshot {
+                let outcome = self.cache_service.reconcile_cache_full_report(
+                    list.worker_id,
+                    &session,
+                    &entries,
+                )?;
+                self.apply_cache_incr_outcome(list.worker_id, outcome);
+                // Reopen a FRESH accumulator for the next periodic full
+                // report — insert-only-when-absent, so a terminal row
+                // (incremental raced in) or a newer Start's row is
+                // never overwritten/resurrected.
+                self.cache_service
+                    .reopen_full_accumulator(list.worker_id, &session);
+            }
+
             // 4d.2: the FS reconcile set covers FS blocks only — cache
             // ids in the accumulated total are excluded here (the 4d.3
             // full-report reconcile owns the cache-domain exact set).
@@ -2404,6 +2452,169 @@ mod tests {
         assert!(
             fs.cache_service.get(1, "/k", true).unwrap().is_none(),
             "losing one block's only replica is a whole-object miss"
+        );
+    }
+
+    /// 4d.3 full-report reconcile end-to-end at the block_report
+    /// boundary: the FS accumulator (counting ALL ids, cache + FS) is
+    /// the single end-of-report trigger; cache pages accumulate
+    /// cache-side only (zero FS penetration — `delete_blocks` never
+    /// carries a cache id); a MIXED report reconciles its cache
+    /// snapshot at the final page (the accumulator reopen lets the
+    /// NEXT periodic full report accumulate again, including the
+    /// self-Complete path), and a Deleted-only cache full report is an
+    /// exact replace: the missing identities strip, the Deleted acks,
+    /// and the FS delete set stays empty.
+    #[test]
+    fn test_4d3_block_report_full_reconcile_end_to_end() {
+        use curvine_raft::raft::RoleState;
+
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.cache_metadata_enabled = true;
+        conf.master.meta_dir =
+            Utils::test_sub_dir(format!("master-fs-4d3-full/meta-{}", Utils::rand_str(6)));
+        conf.journal.journal_dir =
+            Utils::test_sub_dir(format!("master-fs-4d3-full/journal-{}", Utils::rand_str(6)));
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
+
+        let addr = WorkerAddress {
+            worker_id: 1,
+            hostname: "full-1".into(),
+            ip_addr: "10.0.0.1".into(),
+            rpc_port: 8200,
+            web_port: 8300,
+        };
+        fs.begin_worker_session(&addr, "s1").unwrap();
+
+        // Committed Valid cache entry: OBJ, len 150 -> 64/64/22.
+        let obj = BlockIdCodec::CACHE_OBJECT_MIN;
+        let lay = crate::master::meta::CacheBlockLayout::derive(obj, 150, 64).unwrap();
+        let b1 = lay.block_id(1).unwrap();
+        let b2 = lay.block_id(2).unwrap();
+        let b3 = lay.block_id(3).unwrap();
+        {
+            let store = fs.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let mgr = &store.cache;
+            mgr.apply_incarnation_allocate_v2(rocks, token(91, 1), 5, 1, 0)
+                .unwrap();
+            mgr.apply_id_reserve(rocks, token(1, 1), obj, obj + 100)
+                .unwrap();
+            let alloc = crate::master::meta::cache::entry::CacheEntry {
+                generation: 1,
+                state: crate::master::meta::cache::entry::CacheEntryState::Reserved,
+                object_id: obj,
+                len: 0,
+                ufs_mtime: 0,
+                block_size: 64,
+                expire_at: 0,
+            };
+            mgr.apply_allocate(rocks, token(2, 1), 1, "/k", 150, &alloc)
+                .unwrap();
+            mgr.apply_commit(
+                rocks,
+                token(2, 1),
+                token(2, 2),
+                1,
+                "/k",
+                1,
+                obj,
+                150,
+                777,
+                0,
+            )
+            .unwrap();
+        }
+
+        let list = |full: bool, total: u64, blocks: Vec<BlockReportInfo>| BlockReportList {
+            cluster_id: conf.cluster_id.clone(),
+            worker_id: 1,
+            full_report: full,
+            total_len: total,
+            blocks,
+            worker_session_id: Some("s1".into()),
+        };
+        let cfinal = |id: i64, len: i64| {
+            BlockReportInfo::new(id, BlockReportStatus::Finalized, StorageType::Disk, len)
+        };
+
+        // Page 1 of a 5-id MIXED full report: 2 FS ids (missing inodes
+        // — the FS domain schedules their deletion immediately) + 2
+        // cache ids (accumulated cache-side only).
+        let res = fs
+            .block_report(
+                list(
+                    true,
+                    5,
+                    vec![
+                        cfinal(500, 64),
+                        cfinal(501, 64),
+                        cfinal(b1, 64),
+                        cfinal(b2, 64),
+                    ],
+                ),
+                None,
+            )
+            .unwrap();
+        assert_eq!(res.delete_blocks, vec![500, 501]);
+        assert!(
+            fs.cache_service.get(1, "/k", true).unwrap().is_none(),
+            "cache side still accumulating"
+        );
+
+        // Final page: the FS accumulator completes (5/5 ids counted,
+        // cache + FS) — the end-of-report trigger fires the 4d.3 cache
+        // reconcile. Cache ids never leak into the FS delete set.
+        let res = fs
+            .block_report(list(true, 5, vec![cfinal(b3, 22)]), None)
+            .unwrap();
+        assert!(res.delete_blocks.is_empty());
+        let hit = fs
+            .cache_service
+            .get(1, "/k", true)
+            .unwrap()
+            .expect("cache snapshot reconciled at end-of-report");
+        assert_eq!(hit.blocks.len(), 3);
+        assert_eq!(hit.blocks[2].block_len, 22);
+
+        // The accumulator was reopened: the NEXT periodic full report
+        // (this time cache-only) accumulates again and self-Completes;
+        // its reconcile is idempotent (still served, no dup rows).
+        let res = fs
+            .block_report(
+                list(
+                    true,
+                    3,
+                    vec![cfinal(b1, 64), cfinal(b2, 64), cfinal(b3, 22)],
+                ),
+                None,
+            )
+            .unwrap();
+        assert!(res.delete_blocks.is_empty());
+        let hit = fs.cache_service.get(1, "/k", true).unwrap().unwrap();
+        assert_eq!(hit.blocks.len(), 3);
+
+        // A Deleted-only cache full report is an EXACT replace: the
+        // two missing identities strip, the Deleted acks through the
+        // fenced transition, and the FS delete set stays empty
+        // (Deleted zero-penetration).
+        let res = fs
+            .block_report(
+                list(true, 1, vec![BlockReportInfo::with_deleted(b2, 64)]),
+                None,
+            )
+            .unwrap();
+        assert!(
+            res.delete_blocks.is_empty(),
+            "cache Deleted never penetrates the FS delete set"
+        );
+        assert!(
+            fs.cache_service.get(1, "/k", true).unwrap().is_none(),
+            "exact replace: missing + deleted identities removed the object"
         );
     }
 
