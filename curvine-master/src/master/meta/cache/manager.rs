@@ -730,14 +730,45 @@ impl CacheManager {
         validate_incarnation(incarnation)?;
         Self::check_token(token)?;
 
-        // Abort first-winner (task #5 gate 2, gpt56 `21bb7129`): this
-        // load's commit token was consumed by a durable abort — the
-        // commit lost the race and is a terminal no-op (the row is
-        // Tombstoned by the abort; nothing may publish). Checked BEFORE
-        // the load binding so the abort outcome is authoritative history
-        // for this token, never divergence.
-        if let Some(OpOutcome::Aborted { .. }) = store.cache_get_outcome(token).map_err(cv)? {
-            return Ok(());
+        // Abort first-winner (task #5 gate 2, gpt56 `21bb7129` +
+        // `52db24f3`): this load's commit token was consumed by a
+        // durable abort of THE SAME load — the commit lost the race and
+        // is a terminal no-op (the row is Tombstoned by the abort;
+        // nothing may publish). Field-exact: an Aborted record of a
+        // DIFFERENT request under this token is divergence, not a
+        // silent pass (gpt56 `52db24f3`). Checked BEFORE the load
+        // binding so the abort outcome is authoritative history for
+        // this token.
+        if let Some(OpOutcome::Aborted {
+            incarnation: a_inc,
+            key: a_key,
+            generation: a_gen,
+            object_id: a_obj,
+            load_token: a_load,
+        }) = store.cache_get_outcome(token).map_err(cv)?
+        {
+            if a_inc == incarnation
+                && a_key == key
+                && a_gen == generation
+                && a_obj == expected_object_id
+                && a_load == load_token
+            {
+                return Ok(());
+            }
+            return err_box!(
+                "cache commit token {:?} recorded an Aborted outcome of a different load: divergence (recorded ({}, {})@{} object {} load {:?}, commit says ({}, {})@{} object {} load {:?})",
+                token,
+                a_inc,
+                a_key,
+                a_gen,
+                a_obj,
+                a_load,
+                incarnation,
+                key,
+                generation,
+                expected_object_id,
+                load_token
+            );
         }
 
         // Load binding first: this commit may only land on the object its
@@ -1072,20 +1103,18 @@ impl CacheManager {
             load_token,
         };
         match store.cache_get_outcome(commit_token).map_err(cv)? {
-            Some(recorded) => {
-                if recorded == aborted {
-                    return Ok(()); // exact abort replay: strict no-op
-                }
-                // A Committed outcome (or anything else) under this token
-                // means the commit side won the race: fail closed, the
-                // row is not ours to release.
-                return err_box!(
-                    "cache abort first-winner refusal for commit token {:?}: recorded {:?}, abort would record {:?}",
-                    commit_token,
-                    recorded,
-                    aborted
-                );
+            Some(recorded) if recorded == aborted => {
+                return Ok(()); // exact abort replay: strict no-op
             }
+            // Any OTHER recorded outcome (a Committed, or an Aborted of a
+            // different request) means this abort LOST the first-winner
+            // race for the shared commit token. A deterministic no-op,
+            // never an Err: the journal loader treats any cache apply
+            // error as FATAL (gpt56 `52db24f3` blocker 1), and a
+            // prechecked race loser must not poison the state machine.
+            // Loud classification is the handler's post-barrier
+            // readback's job.
+            Some(_recorded) => return Ok(()),
             None => {
                 match store
                     .cache_client_watermark(commit_token.client_id)

@@ -3224,6 +3224,25 @@ impl CacheService {
                     current,
                 })
             }
+            Some(cur)
+                if cur.generation == expected_generation
+                    && cur.state == CacheEntryState::Valid
+                    && cur.object_id == expected_object_id =>
+            {
+                // The commit won the shared-token race between this
+                // handler's prechecks and the barrier: the abort applied
+                // as its deterministic first-winner-loser no-op and the
+                // row is published. Loud at the readback (gpt56
+                // `52db24f3` blocker 1) — the FSM was never poisoned.
+                drop(store);
+                err_box!(
+                    "cache abort for load {:?} lost the first-winner race: its commit applied concurrently and the entry ({}, {})@{} is Valid",
+                    load_token,
+                    incarnation,
+                    key,
+                    expected_generation
+                )
+            }
             other => err_box!(
                 "cache abort barrier readback failed for ({}, {}): {:?}",
                 incarnation,
@@ -6909,11 +6928,14 @@ mod tests {
         assert!(service.get(1, "/k", false).unwrap().is_some());
     }
 
-    /// Apply-order race, commit-first (gpt56 `21bb7129`): both Commit and
-    /// Abort passed the service precheck, the Commit journal entry lands
-    /// first — the Abort apply MUST fail closed on the first-winner
-    /// classification and the Valid row is preserved (the generic-remove
-    /// TOCTOU is closed by the dedicated entry + shared commit token).
+    /// Apply-order race, commit-first (gpt56 `21bb7129` + `52db24f3`
+    /// blocker 1): both Commit and Abort passed the service precheck, the
+    /// Commit journal entry lands first — the Abort apply is the
+    /// DETERMINISTIC first-winner-loser no-op (never an Err: the journal
+    /// loader treats cache apply errors as fatal), the Valid row is
+    /// preserved, and the loud refusal lives at the handler. Both entries
+    /// are applied through the production journal dispatch
+    /// (`apply_cache_journal_entry`), not direct manager calls.
     #[test]
     fn test_apply_race_commit_first_keeps_valid_row() {
         let service = build_service("race-commit-first", chooser(vec![worker(1)]));
@@ -6936,42 +6958,43 @@ mod tests {
             mgr.apply_allocate(rocks, token(51, 1), 1, "/k", 130, &alloc)
                 .unwrap();
         }
-        // Commit lands first: Reserved@1 → Valid@1 with a Committed
-        // outcome under the shared commit token.
-        {
-            let store = service.fs_dir.read();
-            let rocks = store.get_rocks_store();
-            store
-                .cache
-                .apply_commit(
-                    rocks,
-                    token(51, 1),
-                    token(51, 2),
-                    1,
-                    "/k",
-                    1,
-                    OBJ,
-                    130,
-                    777,
-                    0,
-                )
-                .unwrap();
-        }
-        // The racing abort apply loses: fail-closed refusal, not a
-        // silent generic removal of the just-committed row.
-        let err = {
-            let store = service.fs_dir.read();
-            let rocks = store.get_rocks_store();
-            store
-                .cache
-                .apply_abort(rocks, token(51, 1), token(51, 2), 1, "/k", 1, 2, OBJ)
-        }
-        .unwrap_err();
-        assert!(
-            format!("{}", err).contains("first-winner"),
-            "abort apply must refuse under a recorded commit outcome: {}",
-            err
-        );
+        // Commit lands first through the production dispatch: Reserved@1
+        // → Valid@1 with a Committed outcome under the shared commit
+        // token.
+        service
+            .fs_dir
+            .read()
+            .apply_cache_journal_entry(&JournalEntry::CacheCommit(CacheCommitEntry {
+                op_id: 1,
+                rpc_id: 7,
+                token: token(51, 2),
+                load_token: token(51, 1),
+                incarnation: 1,
+                key: "/k".to_string(),
+                generation: 1,
+                expected_object_id: OBJ,
+                len: 130,
+                ufs_mtime: 777,
+                expire_at: 0,
+            }))
+            .unwrap();
+        // The racing abort entry applies as a no-op loser — an Err here
+        // would be FATAL for the journal loader (gpt56 `52db24f3`).
+        service
+            .fs_dir
+            .read()
+            .apply_cache_journal_entry(&JournalEntry::CacheAbort(CacheAbortEntry {
+                op_id: 2,
+                rpc_id: 7,
+                load_token: token(51, 1),
+                commit_token: token(51, 2),
+                incarnation: 1,
+                key: "/k".to_string(),
+                expected_generation: 1,
+                new_generation: 2,
+                expected_object_id: OBJ,
+            }))
+            .unwrap();
         // The Valid row survives: published data is never deleted.
         assert!(service.get(1, "/k", false).unwrap().is_some());
         {
@@ -6981,12 +7004,32 @@ mod tests {
             assert_eq!(row.state, CacheEntryState::Valid);
             assert_eq!(row.generation, 1);
         }
+        // The loud refusal lives at the handler: a later abort RPC for
+        // the same load is refused by the commit-outcome guard before
+        // the barrier.
+        let err = service
+            .abort(7, token(51, 1), token(51, 2), 1, "/k")
+            .unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("refused"),
+            "abort handler must refuse loudly under a recorded commit outcome: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("raft"),
+            "refusal is at the guard, before the barrier: {}",
+            msg
+        );
     }
 
     /// Apply-order race, abort-first (gpt56 `21bb7129`): the Abort entry
     /// lands first — the row is Tombstoned@2 with an Aborted outcome
     /// under the shared commit token, and the racing Commit apply is a
-    /// terminal no-op that must NOT publish over the tombstone.
+    /// terminal no-op that must NOT publish over the tombstone. Also
+    /// driven through the production journal dispatch, and a commit
+    /// reusing the token with DIFFERENT parameters is loud divergence,
+    /// never a silent no-op (gpt56 `52db24f3`).
     #[test]
     fn test_apply_race_abort_first_never_publishes() {
         let service = build_service("race-abort-first", chooser(vec![worker(1)]));
@@ -7009,37 +7052,68 @@ mod tests {
             mgr.apply_allocate(rocks, token(61, 1), 1, "/k", 130, &alloc)
                 .unwrap();
         }
-        // Abort lands first: Reserved@1 → Tombstoned@2, Aborted outcome
-        // under the shared commit token.
-        {
-            let store = service.fs_dir.read();
-            let rocks = store.get_rocks_store();
-            store
-                .cache
-                .apply_abort(rocks, token(61, 1), token(61, 2), 1, "/k", 1, 2, OBJ)
-                .unwrap();
-        }
-        // The racing commit apply is a terminal no-op (checked before
-        // the load binding), never a publish.
-        {
-            let store = service.fs_dir.read();
-            let rocks = store.get_rocks_store();
-            store
-                .cache
-                .apply_commit(
-                    rocks,
-                    token(61, 1),
-                    token(61, 2),
-                    1,
-                    "/k",
-                    1,
-                    OBJ,
-                    130,
-                    777,
-                    0,
-                )
-                .unwrap();
-        }
+        // Abort lands first through the production dispatch: Reserved@1
+        // → Tombstoned@2, Aborted outcome under the shared commit token.
+        service
+            .fs_dir
+            .read()
+            .apply_cache_journal_entry(&JournalEntry::CacheAbort(CacheAbortEntry {
+                op_id: 1,
+                rpc_id: 7,
+                load_token: token(61, 1),
+                commit_token: token(61, 2),
+                incarnation: 1,
+                key: "/k".to_string(),
+                expected_generation: 1,
+                new_generation: 2,
+                expected_object_id: OBJ,
+            }))
+            .unwrap();
+        // The racing commit apply is a terminal no-op (field-exact
+        // Aborted match, checked before the load binding), never a
+        // publish.
+        service
+            .fs_dir
+            .read()
+            .apply_cache_journal_entry(&JournalEntry::CacheCommit(CacheCommitEntry {
+                op_id: 2,
+                rpc_id: 7,
+                token: token(61, 2),
+                load_token: token(61, 1),
+                incarnation: 1,
+                key: "/k".to_string(),
+                generation: 1,
+                expected_object_id: OBJ,
+                len: 130,
+                ufs_mtime: 777,
+                expire_at: 0,
+            }))
+            .unwrap();
+        // The SAME commit token re-used with a different object identity
+        // is loud divergence under the tightened fast-path, never a
+        // silent terminal no-op.
+        let err = service
+            .fs_dir
+            .read()
+            .apply_cache_journal_entry(&JournalEntry::CacheCommit(CacheCommitEntry {
+                op_id: 3,
+                rpc_id: 7,
+                token: token(61, 2),
+                load_token: token(61, 1),
+                incarnation: 1,
+                key: "/k".to_string(),
+                generation: 1,
+                expected_object_id: OBJ + 5,
+                len: 130,
+                ufs_mtime: 777,
+                expire_at: 0,
+            }))
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("different load"),
+            "divergent commit under a consumed token must be loud: {}",
+            err
+        );
         {
             let store = service.fs_dir.read();
             let rocks = store.get_rocks_store();
