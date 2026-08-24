@@ -217,16 +217,22 @@ impl FsClient {
     }
 
     pub async fn free(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
-        let header = FreeRequest {
-            path: path.encode(),
-            recursive,
-            // Free bridge (task #6): the plain client free never paginates;
-            // the cache-mode continuation binding lands with P4-1.
-            cache_cursor: None,
-        };
-
-        let rep: FreeResponse = self.rpc(RpcCode::Free, header).await?;
-        Ok(ProtoUtils::free_res_from_pb(rep.res))
+        let encoded = path.encode();
+        // Free bridge (task #6, RC `83a05ee8` P0-1 + `6106ab2e`): one
+        // public free call drives the cache-mode bounded walk to
+        // done=true via the shared driver below.
+        drive_free(|cursor| {
+            let path = encoded.clone();
+            async move {
+                let header = FreeRequest {
+                    path,
+                    recursive,
+                    cache_cursor: cursor,
+                };
+                self.rpc(RpcCode::Free, header).await
+            }
+        })
+        .await
     }
 
     pub async fn rename(&self, src: &Path, dst: &Path, flags: RenameFlags) -> FsResult<bool> {
@@ -1021,10 +1027,54 @@ impl FsClient {
     }
 }
 
+/// Free bridge driver loop (task #6, RC `83a05ee8` P0-1 + `6106ab2e`):
+/// one public free call drives the cache-mode bounded walk to done=true.
+/// `send` issues one Free request with the given continuation and returns
+/// the response; the driver echoes the master-minted OPAQUE continuation
+/// verbatim (it never interprets it) and accumulates the per-call removed
+/// counts into `FreeResult::inodes`. A legacy response (no cache_done
+/// field) answers once and exits immediately, byte-for-byte the old
+/// single-shot behavior.
+pub(crate) async fn drive_free<S, Fut>(mut send: S) -> FsResult<FreeResult>
+where
+    S: FnMut(Option<Vec<u8>>) -> Fut,
+    Fut: std::future::Future<Output = FsResult<FreeResponse>>,
+{
+    let mut cursor: Option<Vec<u8>> = None;
+    let mut removed: i64 = 0;
+    let out = loop {
+        let rep = send(cursor.clone()).await?;
+        let out = ProtoUtils::free_res_from_pb(rep.res);
+        match rep.cache_done {
+            Some(false) => {
+                removed += rep.cache_removed.unwrap_or(0);
+                let next = match rep.cache_next_cursor {
+                    Some(c) => c,
+                    None => {
+                        return err_box!(
+                            "free: cache_done=false but the master sent no cache_next_cursor"
+                        )
+                    }
+                };
+                cursor = Some(next);
+            }
+            Some(true) => {
+                removed += rep.cache_removed.unwrap_or(0);
+                break out;
+            }
+            None => break out,
+        }
+    };
+    let mut out = out;
+    out.inodes += removed;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use curvine_proto::GetFilesystemInfoRequest;
+    use std::collections::HashMap;
 
     #[test]
     fn handshake_request_carries_client_component_info() {
@@ -1058,5 +1108,108 @@ mod tests {
 
         let legacy = LegacyGetFilesystemInfoRequest::decode(encoded.as_slice()).unwrap();
         assert_eq!(legacy, LegacyGetFilesystemInfoRequest {});
+    }
+
+    fn free_rep(done: Option<bool>, next: Option<Vec<u8>>, removed: Option<i64>) -> FreeResponse {
+        FreeResponse {
+            res: FreeResultProto::default(),
+            cache_done: done,
+            cache_next_cursor: next,
+            cache_removed: removed,
+        }
+    }
+
+    fn block_on_drive<F>(f: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        // Unit tests run outside any ambient runtime, so a private
+        // current-thread runtime is safe here (the daemon nesting trap
+        // only bites under an ambient tokio main).
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    /// RC `83a05ee8` seam S1: >16384 rows (256 pages x 64) fully consumed
+    /// within ONE public free call — the driver echoes every continuation
+    /// and accumulates every removed count.
+    #[test]
+    fn free_drive_consumes_16k_plus_rows_to_done() {
+        block_on_drive(async {
+            let mut sends = 0usize;
+            let mut seen_cursors: Vec<Option<Vec<u8>>> = Vec::new();
+            let res = drive_free(|cursor| {
+                sends += 1;
+                seen_cursors.push(cursor.clone());
+                async move {
+                    if sends <= 256 {
+                        Ok(free_rep(
+                            Some(false),
+                            Some(format!("cont-{}", sends).into_bytes()),
+                            Some(64),
+                        ))
+                    } else {
+                        assert_eq!(sends, 257);
+                        Ok(free_rep(Some(true), None, Some(1)))
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            // 256 full pages (16384 rows) + the final 1-row page.
+            assert_eq!(res.inodes, 256 * 64 + 1);
+            assert_eq!(sends, 257);
+            // First call is a fresh start; each later call echoes the
+            // previous response's continuation verbatim.
+            assert_eq!(seen_cursors[0], None);
+            for (i, cur) in seen_cursors.iter().enumerate().skip(1) {
+                assert_eq!(cur.as_deref(), Some(format!("cont-{}", i).as_bytes()));
+            }
+        });
+    }
+
+    /// done=false without a continuation is a protocol violation, loud.
+    #[test]
+    fn free_drive_rejects_done_false_without_continuation() {
+        block_on_drive(async {
+            let err = drive_free(|_cursor| async move { Ok(free_rep(Some(false), None, Some(3))) })
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("no cache_next_cursor"),
+                "got: {}",
+                err
+            );
+        });
+    }
+
+    /// A legacy response (every optional field absent) is single-shot and
+    /// the real FreeResult passes through untouched.
+    #[test]
+    fn free_drive_legacy_response_is_single_shot() {
+        block_on_drive(async {
+            let mut sends = 0usize;
+            let res = drive_free(|_cursor| {
+                sends += 1;
+                async move {
+                    Ok(FreeResponse {
+                        res: ProtoUtils::free_res_to_pb(FreeResult {
+                            inodes: 7,
+                            bytes: 42,
+                            blocks: HashMap::new(),
+                        }),
+                        ..Default::default()
+                    })
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(sends, 1);
+            assert_eq!(res.inodes, 7);
+            assert_eq!(res.bytes, 42);
+        });
     }
 }

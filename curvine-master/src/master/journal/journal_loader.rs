@@ -2136,11 +2136,14 @@ mod tests {
                 })
                 .count()
         };
-        for phase in ["1", "2", "3"] {
-            // Phase 3 is a fresh-format free-bridge run: its own meta and
-            // journal dirs so the phase-1/2 lifecycle state never bleeds in.
+        for phase in ["1", "2", "3", "4"] {
+            // Phases 3/4 are fresh-format free-bridge runs: their own meta
+            // and journal dirs so the phase-1/2 lifecycle state never
+            // bleeds in.
             let (phase_meta, phase_journal) = if phase == "3" {
                 (format!("{}/meta-3", base), format!("{}/journal-3", base))
+            } else if phase == "4" {
+                (format!("{}/meta-4", base), format!("{}/journal-4", base))
             } else {
                 (meta_dir.clone(), journal_dir.clone())
             };
@@ -2176,6 +2179,13 @@ mod tests {
                 assert_eq!(
                     count, 7,
                     "phase 3 must propose exactly the seven free-bridge entries (found {})",
+                    count
+                );
+            } else if phase == "4" {
+                let count = count_data_entries(&phase_journal);
+                assert_eq!(
+                    count, 5,
+                    "phase 4 must propose exactly the five RC-seam entries (found {})",
                     count
                 );
             } else {
@@ -2230,6 +2240,10 @@ mod tests {
 
         let rt = conf.journal.create_runtime();
         let log_store = RocksLogStorage::from_conf(&conf.journal, true);
+        // Read-side twin for in-process journal counting (phase 4's S4
+        // asserts zero growth BETWEEN calls, which the parent cannot
+        // observe); raft takes the original below.
+        let count_store = log_store.clone();
         let role_monitor = RoleMonitor::new();
         let master_monitor = MasterMonitor::with_epoch(
             role_monitor.read_ctl(),
@@ -2433,10 +2447,13 @@ mod tests {
             assert_eq!(entry_state("m061"), (CacheEntryState::Tombstoned, 2));
             assert_eq!(entry_state("m062"), (CacheEntryState::Valid, 1));
 
-            // The CALLER's next free re-resolves (cross-call, `fdbe3786`):
-            // restore the pointer and complete the incarnation free — two
-            // more pages journal (page 1 of this call is all-tombstone and
-            // proposes nothing).
+            // The CALLER's next free re-resolves (cross-call, `fdbe3786`;
+            // note the asymmetry — a FRESH call re-resolves, but replaying
+            // the fenced call's continuation token against incarnation 2
+            // would be the typed FENCED terminal instead): restore the
+            // pointer and complete the incarnation free — two more pages
+            // journal (page 1 of this call is all-tombstone and proposes
+            // nothing).
             {
                 let store = fs_dir.read();
                 let rocks = store.get_rocks_store();
@@ -2456,13 +2473,268 @@ mod tests {
                 );
             }
 
-            // Same-cursor retry (response loss): every row the retry pages
+            // Same-token retry (response loss): every row the retry pages
             // is tombstoned — it journals NOTHING and never inflates a
-            // generation (the parent re-asserts the entry count).
+            // generation (the parent re-asserts the entry count). The
+            // continuation is the master-minted opaque token, echoed
+            // verbatim.
+            let token = crate::master::cache::FreeContinuation {
+                mount_id: mid,
+                incarnation: 1,
+                scope: CacheFreeScope::Mount,
+                resume_key: "m062".into(),
+            }
+            .encode();
             let p = cache
-                .remove_free_scope(76, mid, &CacheFreeScope::Mount, Some("m062"), 16)
+                .remove_free_scope(76, mid, &CacheFreeScope::Mount, Some(token.as_slice()), 16)
                 .unwrap();
             assert!(p.done && p.processed == 0, "{:?}", p);
+
+            std::process::exit(0);
+        }
+
+        if phase == "4" {
+            // Free bridge RC seams (gpt56 `83a05ee8` + `6106ab2e`): S2
+            // cross-call stale-token FENCED with the NEW namespace
+            // untouched; S4 TRUE response-loss replay timing (replay of
+            // the SAME token with no other advancement → journal ZERO
+            // growth and a byte-identical next token); S3 service seam
+            // (pointer cleared, unmount-like, + token → FENCED); and the
+            // last-page fence on a <64 single page whose window contains
+            // the lifecycle switch. Fresh format with dedicated dirs; the
+            // parent asserts EXACTLY five data entries (auto-Mkdir,
+            // composite Add, the S2 page, the S4 page, the fenced
+            // short-page).
+            use crate::master::cache::CacheFreeScope;
+            use crate::master::meta::cache::{CacheEntry, CacheEntryState, IncarnationRow};
+            use curvine_error::ErrorKind;
+
+            let cv4 = "/p4mlcG";
+            mount_manager
+                .mount_with_token(
+                    None,
+                    cv4,
+                    "file:///tmp/p4-mlc-g",
+                    &add_opts(),
+                    Some(OpToken {
+                        client_id: 201,
+                        op_seq: 1,
+                    }),
+                    81,
+                )
+                .unwrap();
+            let mid = mount_manager
+                .get_mount_info(&Path::from_str(cv4).unwrap())
+                .unwrap()
+                .unwrap()
+                .mount_id;
+            {
+                let store = fs_dir.read();
+                let rocks = store.get_rocks_store();
+                assert_eq!(rocks.cache_current_incarnation(mid).unwrap(), Some(1));
+            }
+
+            // Incarnation 1: 130 keys "s000".."s129" (S2/S4 walk surface).
+            // Incarnation 2: a live row + 80 keys "n000".."n079" (the NEW
+            // namespace the stale token must never touch), pointer stays 1.
+            let seed = |inc: u64, prefix: &str, n: usize| {
+                let store = fs_dir.read();
+                let rocks = store.get_rocks_store();
+                let mut w = rocks.cache_write();
+                for i in 0..n {
+                    w.put_entry(
+                        inc,
+                        &format!("{}{:03}", prefix, i),
+                        &CacheEntry {
+                            generation: 1,
+                            state: CacheEntryState::Valid,
+                            object_id: BlockIdCodec::CACHE_OBJECT_MIN + i as i64,
+                            len: 128,
+                            ufs_mtime: 1,
+                            block_size: 64,
+                            expire_at: 0,
+                        },
+                    )
+                    .unwrap();
+                }
+                w.commit().unwrap();
+            };
+            seed(1, "s", 130);
+            {
+                let store = fs_dir.read();
+                let rocks = store.get_rocks_store();
+                let mut w = rocks.cache_write();
+                w.put_incarnation(
+                    2,
+                    IncarnationRow {
+                        mount_id: mid,
+                        revoked: false,
+                    },
+                )
+                .unwrap();
+                w.commit().unwrap();
+            }
+            seed(2, "n", 80);
+            let entry_state_at = |inc: u64, key: &str| {
+                let store = fs_dir.read();
+                let rocks = store.get_rocks_store();
+                let e = rocks.cache_get_entry(inc, key).unwrap().unwrap();
+                (e.state, e.generation)
+            };
+            // Live in-process journal count through the SAME log store
+            // raft is running on (S4 asserts zero growth BETWEEN calls,
+            // which the parent cannot observe).
+            let count_now = || -> usize {
+                let last = count_store.read().last_index();
+                if last < 1 {
+                    return 0;
+                }
+                let entries = count_store.scan_entries(1, last + 1).unwrap();
+                entries
+                    .into_iter()
+                    .filter(|e| e.get_entry_type() == EntryType::EntryNormal && !e.data.is_empty())
+                    .filter(|e| match JournalBatch::deserialize_compat(&e.data) {
+                        Ok(batch) => batch
+                            .batch
+                            .iter()
+                            .any(|op| !matches!(op, JournalEntry::UfsApplied(_))),
+                        Err(_) => true,
+                    })
+                    .count()
+            };
+
+            // S2: a fresh Mount free walks page 1 (64 victims, journal +1)
+            // and mints the continuation T.
+            let p = cache
+                .remove_free_scope(82, mid, &CacheFreeScope::Mount, None, 1)
+                .unwrap();
+            assert!(!p.done && p.processed == 64, "{:?}", p);
+            let t = p.next.expect("done=false mints a continuation");
+            let base_count = count_now();
+            assert!(base_count >= 3, "Mkdir+Add+page1 journaled: {}", base_count);
+
+            // Switch the namespace (incarnation 2) BETWEEN calls: the old
+            // token is the typed FENCED terminal, verified BEFORE any
+            // paging, and the new namespace is untouched.
+            {
+                let store = fs_dir.read();
+                let rocks = store.get_rocks_store();
+                let mut w = rocks.cache_write();
+                w.set_current_incarnation(mid, 2).unwrap();
+                w.commit().unwrap();
+            }
+            let err = cache
+                .remove_free_scope(83, mid, &CacheFreeScope::Mount, Some(t.as_slice()), 1)
+                .unwrap_err();
+            assert!(
+                matches!(
+                    curvine_error::FsError::from(err).kind(),
+                    ErrorKind::CacheIncarnationFenced
+                ),
+                "stale token must be the typed FENCED terminal"
+            );
+            for i in [0usize, 39, 79] {
+                assert_eq!(
+                    entry_state_at(2, &format!("n{:03}", i)),
+                    (CacheEntryState::Valid, 1),
+                    "new namespace must be zero-touch"
+                );
+            }
+            assert_eq!(count_now(), base_count, "FENCED terminal proposes nothing");
+            // Restore the walk to incarnation 1.
+            {
+                let store = fs_dir.read();
+                let rocks = store.get_rocks_store();
+                let mut w = rocks.cache_write();
+                w.set_current_incarnation(mid, 1).unwrap();
+                w.commit().unwrap();
+            }
+
+            // S4 TRUE response-loss timing: replay T proposes page
+            // s064..s127 (journal +1) and mints T'; the response is LOST;
+            // an immediate replay of T — with no other advancement — must
+            // journal NOTHING and mint a byte-identical T'.
+            let p = cache
+                .remove_free_scope(84, mid, &CacheFreeScope::Mount, Some(t.as_slice()), 1)
+                .unwrap();
+            assert!(!p.done && p.processed == 64, "{:?}", p);
+            let t2 = p.next.clone().expect("first T replay mints T'");
+            let after_first = count_now();
+            assert_eq!(after_first, base_count + 1, "the S4 page journaled once");
+            let p = cache
+                .remove_free_scope(85, mid, &CacheFreeScope::Mount, Some(t.as_slice()), 1)
+                .unwrap();
+            assert!(
+                !p.done && p.processed == 0,
+                "replay pages tombstones: {:?}",
+                p
+            );
+            assert_eq!(
+                p.next.as_ref().expect("replay still mints a continuation"),
+                t2.as_slice(),
+                "replayed token output must be byte-identical"
+            );
+            assert_eq!(count_now(), after_first, "replay journals NOTHING");
+
+            // S3 service seam: the pointer is GONE (unmount-like) — the
+            // continuation is the typed FENCED terminal, never the legacy
+            // inode free, never a fresh re-resolve.
+            {
+                let store = fs_dir.read();
+                let rocks = store.get_rocks_store();
+                let mut w = rocks.cache_write();
+                w.clear_current_incarnation(mid).unwrap();
+                w.commit().unwrap();
+            }
+            let err = cache
+                .remove_free_scope(86, mid, &CacheFreeScope::Mount, Some(t2.as_slice()), 1)
+                .unwrap_err();
+            assert!(
+                matches!(
+                    curvine_error::FsError::from(err).kind(),
+                    ErrorKind::CacheIncarnationFenced
+                ),
+                "cleared pointer + token must be the typed FENCED terminal"
+            );
+            assert_eq!(count_now(), after_first);
+
+            // Last-page fence (`6106ab2e` tightening 1): a <64 single
+            // page whose window contains the lifecycle switch — the
+            // short-page done path re-verifies the binding and returns
+            // the typed FENCED terminal, NOT done=true. The remaining
+            // valid rows s128/s129 form one 2-row page; the one-shot
+            // barrier hook moves the pointer to incarnation 2 immediately
+            // after that page's propose.
+            {
+                let store = fs_dir.read();
+                let rocks = store.get_rocks_store();
+                let mut w = rocks.cache_write();
+                w.set_current_incarnation(mid, 1).unwrap();
+                w.commit().unwrap();
+            }
+            let hook_fs_dir = fs_dir.clone();
+            cache.set_barrier_hook(Box::new(move || {
+                let store = hook_fs_dir.read();
+                let rocks = store.get_rocks_store();
+                let mut w = rocks.cache_write();
+                w.set_current_incarnation(mid, 2).unwrap();
+                w.commit().unwrap();
+            }));
+            let err = cache
+                .remove_free_scope(87, mid, &CacheFreeScope::Mount, None, 4)
+                .unwrap_err();
+            assert!(
+                matches!(
+                    curvine_error::FsError::from(err).kind(),
+                    ErrorKind::CacheIncarnationFenced
+                ),
+                "short-page switch must be the typed FENCED terminal"
+            );
+            // The one page DID apply (journal +1) before the fence: s128
+            // is tombstoned by the committed apply.
+            assert_eq!(entry_state_at(1, "s128"), (CacheEntryState::Tombstoned, 2));
+            assert_eq!(count_now(), after_first + 1);
+            assert_eq!(count_now(), base_count + 2);
 
             std::process::exit(0);
         }

@@ -68,6 +68,24 @@ pub struct MasterHandler {
     compat_warned: DashMap<String, CompatibilityVerdict>,
 }
 
+/// Free bridge routing (task #6, RC `6106ab2e`): the pure routing
+/// function `MasterHandler::free_route` IS the production routing and
+/// `free0` matches its result exhaustively — the legacy inode free is
+/// reachable ONLY through `LegacyInode`.
+#[derive(Debug)]
+enum FreeRoute<'a> {
+    /// Cache-mode mount path: typed Key/Prefix/Mount scope free bound to
+    /// the mount's current incarnation.
+    CacheBridge,
+    /// A continuation token on a route that no longer resolves cache-mode
+    /// (cache->fs switch, unmount, lost mount): the typed FENCED
+    /// terminal — never the legacy inode free.
+    ContinuationFenced(&'a [u8]),
+    /// Every other path (no mount, fs-mode mount): the legacy inode free,
+    /// byte-for-byte unchanged.
+    LegacyInode,
+}
+
 impl MasterHandler {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -275,7 +293,7 @@ impl MasterHandler {
         // every optional field absent.
         if let Some(p) = cache {
             rep.cache_done = Some(p.done);
-            rep.cache_next_cursor = if p.done { None } else { p.cursor };
+            rep.cache_next_cursor = if p.done { None } else { p.next };
             rep.cache_removed = Some(p.processed as i64);
         }
         ctx.response(rep)
@@ -298,34 +316,69 @@ impl MasterHandler {
         &self,
         req_id: i64,
         header: FreeRequest,
-    ) -> FsResult<(
-        FreeResult,
-        Option<crate::master::cache::ScopeRemoveProgress>,
-    )> {
+    ) -> FsResult<(FreeResult, Option<crate::master::cache::FreeScopeProgress>)> {
+        // Resolve the route FIRST (pure function below), then dispatch via
+        // an exhaustive match: the inode free is only reachable through
+        // `FreeRoute::LegacyInode` and NOTHING else.
+        let mut cache_mount: Option<curvine_model::MountInfo> = None;
         if let Ok(path) = Path::from_str(&header.path) {
             if path.is_cv() {
                 if let Some(info) = self.mount_manager.get_mount_info(&path)? {
                     if info.is_cache_mode() {
-                        let scope = Self::cache_free_scope(&info, &path, header.recursive)?;
-                        let progress = self.fs.cache_service.remove_free_scope(
-                            req_id,
-                            info.mount_id,
-                            &scope,
-                            header.cache_cursor.as_deref(),
-                            crate::master::cache::MUTATION_MAX_PAGES_PER_CALL,
-                        )?;
-                        return Ok((FreeResult::default(), Some(progress)));
+                        cache_mount = Some(info);
                     }
                 }
             }
         }
-
-        if self.check_is_retry(req_id)? {
-            return Ok((FreeResult::default(), None));
+        match Self::free_route(cache_mount.is_some(), header.cache_cursor.as_deref()) {
+            FreeRoute::CacheBridge => {
+                let info = cache_mount.unwrap();
+                let path = Path::from_str(&header.path).unwrap();
+                let scope = Self::cache_free_scope(&info, &path, header.recursive)?;
+                let progress = self.fs.cache_service.remove_free_scope(
+                    req_id,
+                    info.mount_id,
+                    &scope,
+                    header.cache_cursor.as_deref(),
+                    crate::master::cache::MUTATION_MAX_PAGES_PER_CALL,
+                )?;
+                Ok((FreeResult::default(), Some(progress)))
+            }
+            // A continuation on a route that no longer resolves cache-mode
+            // (cache->fs switch, unmount, mount lost) is the typed FENCED
+            // terminal — it NEVER falls through to the legacy inode free.
+            // The token is parsed only to report the fenced incarnation; a
+            // malformed token stays loud.
+            FreeRoute::ContinuationFenced(raw) => {
+                Err(match crate::master::cache::FreeContinuation::decode(raw) {
+                    Ok(cont) => curvine_error::FsError::cache_incarnation_fenced(cont.incarnation),
+                    Err(e) => return Err(e.into()),
+                })
+            }
+            FreeRoute::LegacyInode => {
+                if self.check_is_retry(req_id)? {
+                    return Ok((FreeResult::default(), None));
+                }
+                let res = self.fs.free(&header.path, header.recursive);
+                let res = self.set_req_cache(req_id, res)?;
+                Ok((res, None))
+            }
         }
-        let res = self.fs.free(&header.path, header.recursive);
-        let res = self.set_req_cache(req_id, res)?;
-        Ok((res, None))
+    }
+
+    /// Free bridge routing (gpt56 `6106ab2e` tightening: this pure
+    /// function IS the production routing and `free0` above matches its
+    /// result exhaustively). `cache_mount` = the request path resolves to
+    /// a live cache-mode mount; `continuation` = a master-minted free
+    /// continuation token echoed by the client.
+    fn free_route(cache_mount: bool, continuation: Option<&[u8]>) -> FreeRoute<'_> {
+        if cache_mount {
+            FreeRoute::CacheBridge
+        } else if let Some(raw) = continuation {
+            FreeRoute::ContinuationFenced(raw)
+        } else {
+            FreeRoute::LegacyInode
+        }
     }
 
     /// Derive the typed cache free scope from the request (gpt56
@@ -349,7 +402,9 @@ impl MasterHandler {
         // would derive a bogus key under this mount), so the prefix
         // contract is asserted here. The mount table already resolves
         // only covered paths; this makes the derivation self-contained.
-        if !path.path().starts_with(&info.cv_path) {
+        // Component-boundary check (RC `6106ab2e` P1-b): a string
+        // `starts_with` would let `/mnt2/...` pass a `/mnt` root.
+        if !Path::has_prefix(path.path(), &info.cv_path) {
             return err_box!(
                 "cache free path {} is not under mount {} root {}",
                 path.full_path(),
@@ -1746,6 +1801,59 @@ mod tests {
         // get_ufs_path rejects a path that is not under the cv root.
         let outside = Path::from_str("/other/x").unwrap();
         assert!(MasterHandler::cache_free_scope(&info, &outside, true).is_err());
+
+        // RC `6106ab2e` P1-b: the prefix guard is COMPONENT-BOUNDARY — a
+        // sibling root ("/mnt2") shares no component with "/mnt" and must
+        // fail closed even though it passes a naive string starts_with.
+        let sibling = Path::from_str("/mnt2/x").unwrap();
+        let err = MasterHandler::cache_free_scope(&info, &sibling, true).unwrap_err();
+        assert!(
+            err.to_string().contains("not under mount"),
+            "expected sibling-root rejection, got: {}",
+            err
+        );
+    }
+
+    /// Free bridge routing matrix (RC `6106ab2e`): `free_route` is the
+    /// production routing — a cache-mode mount is always the typed bridge;
+    /// a continuation token on ANY non-cache route (cache->fs switch,
+    /// unmount, plain fs path) is ContinuationFenced and can never fall
+    /// through to the legacy inode free; only a plain request on a plain
+    /// route is LegacyInode.
+    #[test]
+    fn free_route_matrix() {
+        use crate::master::cache::CacheFreeScope;
+        use crate::master::cache::FreeContinuation;
+
+        let token = FreeContinuation {
+            mount_id: 7,
+            incarnation: 3,
+            scope: CacheFreeScope::Mount,
+            resume_key: "a".into(),
+        }
+        .encode();
+
+        // Cache-mode mount: the bridge wins even when a continuation is
+        // present (the driver re-verifies the binding inside).
+        assert!(matches!(
+            MasterHandler::free_route(true, None),
+            FreeRoute::CacheBridge
+        ));
+        assert!(matches!(
+            MasterHandler::free_route(true, Some(token.as_slice())),
+            FreeRoute::CacheBridge
+        ));
+        // Non-cache route + continuation: FENCED terminal, never the
+        // legacy inode free.
+        assert!(matches!(
+            MasterHandler::free_route(false, Some(token.as_slice())),
+            FreeRoute::ContinuationFenced(t) if t == token.as_slice()
+        ));
+        // Plain request on a plain route: legacy inode free.
+        assert!(matches!(
+            MasterHandler::free_route(false, None),
+            FreeRoute::LegacyInode
+        ));
     }
 
     #[test]

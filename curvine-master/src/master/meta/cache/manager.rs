@@ -2091,25 +2091,31 @@ impl CacheManager {
         validate_incarnation(incarnation)?;
         Self::validate_scope_victims(None, victims)?;
 
-        if !Self::incarnation_active(store, incarnation)? {
-            return Ok(());
-        }
-        match store.cache_get_incarnation(incarnation).map_err(cv)? {
-            Some(row) if row.mount_id == mount_id => {}
-            Some(row) => {
-                return err_box!(
-                "mount scope remove incarnation {} belongs to mount {}, not the claimed mount {}",
-                incarnation,
-                row.mount_id,
-                mount_id
-            )
-            }
+        // RC `6106ab2e` P1-a: the row/ownership check runs BEFORE the
+        // fenced no-op — a missing row or a wrong-owner row is LOUD
+        // corruption whatever the pointer state; only a correct-owner
+        // inactive incarnation is the deterministic no-op.
+        let row = match store.cache_get_incarnation(incarnation).map_err(cv)? {
+            Some(row) => row,
             None => {
                 return err_box!(
                     "mount scope remove incarnation {} has no incarnation row",
                     incarnation
                 )
             }
+        };
+        if row.mount_id != mount_id {
+            return err_box!(
+                "mount scope remove incarnation {} belongs to mount {}, not the claimed mount {}",
+                incarnation,
+                row.mount_id,
+                mount_id
+            );
+        }
+        if row.revoked
+            || store.cache_current_incarnation(row.mount_id).map_err(cv)? != Some(incarnation)
+        {
+            return Ok(());
         }
 
         self.apply_scope_victims_cas(store, incarnation, victims)
@@ -3964,6 +3970,31 @@ mod tests {
         assert_eq!(
             store.cache_get_entry(3, "a").unwrap().unwrap().state,
             CacheEntryState::Valid
+        );
+
+        // RC `6106ab2e` P1-a: the row/ownership check runs BEFORE the
+        // fenced no-op — a fenced-but-wrong-owner claim is LOUD, not the
+        // silent whole-batch no-op (a wrong-owner batch is never this
+        // mount's namespace to free, whatever the pointer says).
+        let err = mgr
+            .apply_mount_scope_remove(&store, 3, 9, &[scope_victim("a", 1, OBJ, 5000)])
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("belongs to mount 7, not the claimed mount 9"),
+            "expected fenced+wrong-owner to be loud, got: {}",
+            err
+        );
+        // ...and a missing incarnation row is loud even though a fenced
+        // namespace would otherwise be a no-op.
+        let err = mgr
+            .apply_mount_scope_remove(&store, 999, 7, &[scope_victim("a", 1, OBJ, 5000)])
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("incarnation 999 has no incarnation row"),
+            "expected missing-row to be loud, got: {}",
+            err
         );
 
         // Live incarnation but the entry claims ANOTHER mount: loud, zero

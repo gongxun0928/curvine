@@ -96,11 +96,16 @@ message DeleteResponse {
 message FreeRequest {
     required string path = 1;
     required bool recursive = 2;
-    // Free bridge (task #6, gpt56 92883fff/9f83a317): continuation cursor
-    // for a cache-mode mount free. Absent = start a fresh bounded page
-    // walk; present = resume the caller's earlier walk at the returned
-    // cache_next_cursor. Ignored by the legacy inode free path.
-    optional string cache_cursor = 3;
+    // Free bridge (task #6, gpt56 92883fff/9f83a317/RC 6106ab2e):
+    // OPAQUE continuation token for a cache-mode mount free, minted by
+    // the master (explicit version, strict decode, binds
+    // mount/incarnation/scope/resume_key). Absent = start a fresh
+    // bounded page walk; present = resume the caller's earlier walk.
+    // The client echoes it verbatim and never interprets it. A present
+    // token whose mount no longer routes cache-mode (cache->fs switch,
+    // unmount) is a typed FENCED terminal — it never falls through to
+    // the legacy inode free.
+    optional bytes cache_cursor = 3;
 }
 
 message FreeResponse {
@@ -108,10 +113,10 @@ message FreeResponse {
     // Free bridge: present only when the request routed to the cache
     // domain (cache-mode mount path). cache_done=false with a
     // cache_next_cursor means the caller must re-issue Free with that
-    // cursor (same path/recursive) until cache_done=true. The legacy
+    // token (same path/recursive) until cache_done=true. The legacy
     // inode path never sets these fields.
     optional bool cache_done = 2;
-    optional string cache_next_cursor = 3;
+    optional bytes cache_next_cursor = 3;
     optional int64 cache_removed = 4;
 }
 

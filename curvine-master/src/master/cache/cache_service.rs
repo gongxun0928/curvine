@@ -1478,6 +1478,140 @@ pub enum CacheFreeScope {
     Prefix(String),
 }
 
+/// Progress of one bounded Free-bridge call. The continuation is an
+/// OPAQUE master-minted token (never a raw key): it binds the call's
+/// fixed `(mount_id, incarnation, scope)` plus the resume key, so a
+/// resumed page walk can never cross into another incarnation or scope
+/// (RC `6106ab2e` P0-2). `next` is `Some` only when `done=false`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreeScopeProgress {
+    pub done: bool,
+    /// Opaque continuation token for the next call; `None` when done.
+    pub next: Option<Vec<u8>>,
+    /// Victims journaled this call.
+    pub processed: usize,
+}
+
+/// The decoded payload of a Free-bridge continuation token (RC
+/// `6106ab2e` tightening 2: explicit stable version + strict decode —
+/// never a bare serializable internal enum, so later enum growth can
+/// never reinterpret an old token or vice versa).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreeContinuation {
+    pub mount_id: u32,
+    pub incarnation: u64,
+    pub scope: CacheFreeScope,
+    pub resume_key: String,
+}
+
+impl FreeContinuation {
+    /// Wire format v1 (all integers little-endian, explicit lengths,
+    /// NO trailing bytes accepted on decode):
+    /// `[u8 version][u32 mount_id][u64 incarnation][u8 scope_kind]
+    ///  [u32 scope_len][scope bytes][u32 resume_len][resume bytes]`
+    /// scope_kind: 0 = Mount (scope must be EMPTY), 1 = Key, 2 = Prefix
+    /// (both require a NON-EMPTY scope <= MAX_KEY_BYTES).
+    pub fn encode(&self) -> Vec<u8> {
+        let (kind, scope_bytes): (u8, &[u8]) = match &self.scope {
+            CacheFreeScope::Mount => (0, b""),
+            CacheFreeScope::Key(s) => (1, s.as_bytes()),
+            CacheFreeScope::Prefix(s) => (2, s.as_bytes()),
+        };
+        let mut out =
+            Vec::with_capacity(1 + 4 + 8 + 1 + 4 + scope_bytes.len() + 4 + self.resume_key.len());
+        out.push(FREE_CONTINUATION_VERSION);
+        out.extend_from_slice(&self.mount_id.to_le_bytes());
+        out.extend_from_slice(&self.incarnation.to_le_bytes());
+        out.push(kind);
+        out.extend_from_slice(&(scope_bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(scope_bytes);
+        out.extend_from_slice(&(self.resume_key.len() as u32).to_le_bytes());
+        out.extend_from_slice(self.resume_key.as_bytes());
+        out
+    }
+
+    /// Strict decode: unknown version, trailing bytes, truncated
+    /// lengths, over-long or shape-illegal scope/resume are all loud —
+    /// a malformed token is a wire-protocol violation, never a silent
+    /// miss.
+    pub fn decode(raw: &[u8]) -> CommonResult<Self> {
+        let bad = |why: &str| {
+            cm_err(format!(
+                "cache free continuation token is malformed: {}",
+                why
+            ))
+        };
+        let mut p = 0usize;
+        let mut take = |n: usize| -> CommonResult<&[u8]> {
+            let end = p.checked_add(n).ok_or_else(|| bad("length overflow"))?;
+            if end > raw.len() {
+                return Err(bad("truncated"));
+            }
+            let s = &raw[p..end];
+            p = end;
+            Ok(s)
+        };
+        let version = take(1)?[0];
+        if version != FREE_CONTINUATION_VERSION {
+            return Err(bad(&format!(
+                "unknown version {} (supported {})",
+                version, FREE_CONTINUATION_VERSION
+            )));
+        }
+        let mount_id = {
+            let b = take(4)?;
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+        };
+        let incarnation = {
+            let b = take(8)?;
+            u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+        };
+        let kind = take(1)?[0];
+        let scope_len = {
+            let b = take(4)?;
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize
+        };
+        if scope_len > MAX_KEY_BYTES {
+            return Err(bad("scope exceeds the key cap"));
+        }
+        let scope_bytes = take(scope_len)?;
+        let resume_len = {
+            let b = take(4)?;
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize
+        };
+        if resume_len == 0 || resume_len > MAX_KEY_BYTES {
+            return Err(bad("resume key must be non-empty and within the key cap"));
+        }
+        let resume_bytes = take(resume_len)?;
+        if p != raw.len() {
+            return Err(bad("trailing bytes"));
+        }
+        let scope = match (kind, scope_bytes) {
+            (0, b"") => CacheFreeScope::Mount,
+            (0, _) => return Err(bad("Mount scope must carry no scope bytes")),
+            (1, b"") => return Err(bad("Key scope must be non-empty")),
+            (1, s) => CacheFreeScope::Key(
+                String::from_utf8(s.to_vec()).map_err(|_| bad("scope is not utf-8"))?,
+            ),
+            (2, b"") => return Err(bad("Prefix scope must be non-empty")),
+            (2, s) => CacheFreeScope::Prefix(
+                String::from_utf8(s.to_vec()).map_err(|_| bad("scope is not utf-8"))?,
+            ),
+            (k, _) => return Err(bad(&format!("unknown scope kind {}", k))),
+        };
+        Ok(FreeContinuation {
+            mount_id,
+            incarnation,
+            scope,
+            resume_key: String::from_utf8(resume_bytes.to_vec())
+                .map_err(|_| bad("resume key is not utf-8"))?,
+        })
+    }
+}
+
+/// The only continuation token wire version (see [`FreeContinuation`]).
+pub const FREE_CONTINUATION_VERSION: u8 = 1;
+
 /// Resumable progress of one TTL-sweep driver call (4c.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TtlSweepProgress {
@@ -3603,13 +3737,20 @@ impl CacheService {
         rpc_id: i64,
         mount_id: u32,
         scope: &CacheFreeScope,
-        after: Option<&str>,
+        continuation: Option<&[u8]>,
         max_pages: usize,
-    ) -> CommonResult<ScopeRemoveProgress> {
+    ) -> CommonResult<FreeScopeProgress> {
         self.require_enabled()?;
         self.require_leader()?;
         let max_pages = max_pages.clamp(1, MUTATION_MAX_PAGES_PER_CALL);
-        Self::validate_key_cursor(after)?;
+        // Strict decode first (RC `6106ab2e` tightening 2): a malformed
+        // continuation is a wire-protocol violation and is loud whatever
+        // the live state says.
+        let cont = match continuation {
+            Some(raw) => Some(FreeContinuation::decode(raw)?),
+            None => None,
+        };
+        Self::validate_key_cursor(cont.as_ref().map(|c| c.resume_key.as_str()))?;
         let scope_str: Option<&str> = match scope {
             CacheFreeScope::Mount => None,
             CacheFreeScope::Key(s) | CacheFreeScope::Prefix(s) => {
@@ -3628,10 +3769,22 @@ impl CacheService {
                 Some(s)
             }
         };
-        if let (Some(a), Some(s)) = (after, scope_str) {
+        if let Some(c) = &cont {
+            // The continuation must describe the SAME typed scope the
+            // caller's (path, recursive) still derives — changing the
+            // request shape mid-walk is loud, not a rebind.
+            if &c.scope != scope {
+                return err_box!(
+                    "cache free continuation scope {:?} does not match the derived scope {:?}",
+                    c.scope,
+                    scope
+                );
+            }
+        }
+        if let (Some(a), Some(s)) = (cont.as_ref().map(|c| c.resume_key.as_str()), scope_str) {
             match scope {
-                // Exact key: the only legal continuation cursor is the key
-                // itself (and only while the point read still yields a page).
+                // Exact key: the only legal resume key is the key itself
+                // (and only while the point read still yields a page).
                 CacheFreeScope::Key(k) => {
                     if a != k {
                         return err_box!(
@@ -3651,42 +3804,62 @@ impl CacheService {
         }
 
         // Resolve and FIX the call's binding: (mount_id, incarnation,
-        // scope). A visible cache-mode mount without a current pointer is
-        // fail-closed corruption, never an empty no-op free.
+        // scope). With a continuation the binding is VERIFIED against the
+        // token before any paging (RC `6106ab2e` P0-2): a moved pointer,
+        // a revoked/owner-mismatched row, or a remounted mount id is the
+        // typed FENCED terminal — the walk may never cross into another
+        // incarnation. A FRESH call keeps the loud fail-closed resolution
+        // (a visible cache-mode mount without a live pointer is
+        // corruption, never an empty no-op free).
         let incarnation = {
             let store = self.fs_dir.read();
             let rocks = store.get_rocks_store();
-            let inc = rocks
-                .cache_current_incarnation(mount_id)
-                .map_err(fs_err)?
-                .ok_or_else(|| {
-                    cm_err(format!(
+            match rocks.cache_current_incarnation(mount_id).map_err(fs_err)? {
+                Some(inc) => match rocks.cache_get_incarnation(inc).map_err(fs_err)? {
+                    Some(row) if !row.revoked && row.mount_id == mount_id => {
+                        if let Some(c) = &cont {
+                            if c.mount_id != mount_id || c.incarnation != inc {
+                                return Err(Self::fenced(c.incarnation));
+                            }
+                        }
+                        inc
+                    }
+                    Some(row) => {
+                        if let Some(c) = &cont {
+                            return Err(Self::fenced(c.incarnation));
+                        }
+                        return err_box!(
+                            "cache free: incarnation {} of mount {} is not live (revoked {}, owner {})",
+                            inc,
+                            mount_id,
+                            row.revoked,
+                            row.mount_id
+                        );
+                    }
+                    None => {
+                        if let Some(c) = &cont {
+                            return Err(Self::fenced(c.incarnation));
+                        }
+                        return err_box!(
+                            "cache free: incarnation {} of mount {} has no incarnation row",
+                            inc,
+                            mount_id
+                        );
+                    }
+                },
+                None => {
+                    if let Some(c) = &cont {
+                        return Err(Self::fenced(c.incarnation));
+                    }
+                    return Err(cm_err(format!(
                         "cache free: mount {} has no current incarnation (fail-closed)",
                         mount_id
-                    ))
-                })?;
-            match rocks.cache_get_incarnation(inc).map_err(fs_err)? {
-                Some(row) if !row.revoked && row.mount_id == mount_id => inc,
-                Some(row) => {
-                    return err_box!(
-                        "cache free: incarnation {} of mount {} is not live (revoked {}, owner {})",
-                        inc,
-                        mount_id,
-                        row.revoked,
-                        row.mount_id
-                    )
-                }
-                None => {
-                    return err_box!(
-                        "cache free: incarnation {} of mount {} has no incarnation row",
-                        inc,
-                        mount_id
-                    )
+                    )));
                 }
             }
         };
 
-        let mut cursor = after.map(|a| a.to_string());
+        let mut cursor = cont.map(|c| c.resume_key.clone());
         let mut processed = 0usize;
         for _ in 0..max_pages {
             // Per-page fence: the binding must still be the call's fixed
@@ -3720,9 +3893,16 @@ impl CacheService {
                 }
             };
             if page.is_empty() {
-                return Ok(ScopeRemoveProgress {
+                // RC `6106ab2e` tightening 1: the binding is re-verified
+                // before EVERY return, including the empty-page terminal —
+                // a lifecycle switch inside the final (short/empty) window
+                // is FENCED, not done=true.
+                if !self.incarnation_active(incarnation)? {
+                    return Err(Self::fenced(incarnation));
+                }
+                return Ok(FreeScopeProgress {
                     done: true,
-                    cursor,
+                    next: None,
                     processed,
                 });
             }
@@ -3778,16 +3958,36 @@ impl CacheService {
             processed += journaled;
             cursor = Some(last_key);
             if page.len() < MUTATION_PAGE_CAP {
-                return Ok(ScopeRemoveProgress {
+                // RC `6106ab2e` tightening 1: a short page IS the last
+                // page — re-verify the binding before reporting done, or a
+                // switch inside this window would silently complete a walk
+                // against a moved namespace.
+                if !self.incarnation_active(incarnation)? {
+                    return Err(Self::fenced(incarnation));
+                }
+                return Ok(FreeScopeProgress {
                     done: true,
-                    cursor,
+                    next: None,
                     processed,
                 });
             }
         }
-        Ok(ScopeRemoveProgress {
+        // Page budget exhausted: continuation is the master-minted opaque
+        // token re-binding (mount, incarnation, scope, resume key) — the
+        // client echoes it verbatim and never interprets it.
+        if !self.incarnation_active(incarnation)? {
+            return Err(Self::fenced(incarnation));
+        }
+        let next = FreeContinuation {
+            mount_id,
+            incarnation,
+            scope: scope.clone(),
+            resume_key: cursor.clone().unwrap_or_default(),
+        }
+        .encode();
+        Ok(FreeScopeProgress {
             done: false,
-            cursor,
+            next: Some(next),
             processed,
         })
     }
@@ -9507,22 +9707,60 @@ mod tests {
 
         // Shape gates fire BEFORE any binding resolution: an empty
         // Key/Prefix would smuggle the Mount branch and is rejected; a
-        // Key cursor must be the exact key; a Prefix cursor must be
-        // inside the family.
+        // well-formed token whose resume key is not the exact Key (or is
+        // outside the Prefix family) is rejected at membership.
         assert!(service
             .remove_free_scope(7, 5, &CacheFreeScope::Key(String::new()), None, 4)
             .is_err());
         assert!(service
             .remove_free_scope(7, 5, &CacheFreeScope::Prefix(String::new()), None, 4)
             .is_err());
+        let wrong_key = FreeContinuation {
+            mount_id: 5,
+            incarnation: 1,
+            scope: CacheFreeScope::Key("a".into()),
+            resume_key: "b".into(),
+        }
+        .encode();
         let err = service
-            .remove_free_scope(7, 5, &CacheFreeScope::Key("a".into()), Some("b"), 4)
+            .remove_free_scope(
+                7,
+                5,
+                &CacheFreeScope::Key("a".into()),
+                Some(wrong_key.as_slice()),
+                4,
+            )
             .unwrap_err();
         assert!(err.to_string().contains("not the exact key"), "{}", err);
+        let outside = FreeContinuation {
+            mount_id: 5,
+            incarnation: 1,
+            scope: CacheFreeScope::Prefix("a".into()),
+            resume_key: "zz".into(),
+        }
+        .encode();
         let err = service
-            .remove_free_scope(7, 5, &CacheFreeScope::Prefix("a".into()), Some("zz"), 4)
+            .remove_free_scope(
+                7,
+                5,
+                &CacheFreeScope::Prefix("a".into()),
+                Some(outside.as_slice()),
+                4,
+            )
             .unwrap_err();
         assert!(err.to_string().contains("outside scope"), "{}", err);
+
+        // Strict token decode fires BEFORE any binding resolution: a
+        // truncated/garbage continuation is a wire-protocol violation
+        // whatever the live state says.
+        let err = service
+            .remove_free_scope(7, 5, &CacheFreeScope::Mount, Some(b"garbage"), 4)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("continuation token is malformed"),
+            "{}",
+            err
+        );
 
         // Binding resolution is fail-closed: no pointer at all is loud,
         // never an empty no-op free.
@@ -9553,9 +9791,9 @@ mod tests {
             let p = service.remove_free_scope(7, 5, &scope, None, 4).unwrap();
             assert_eq!(
                 p,
-                ScopeRemoveProgress {
+                FreeScopeProgress {
                     done: true,
-                    cursor: None,
+                    next: None,
                     processed: 0
                 },
                 "{:?}",
@@ -9563,25 +9801,155 @@ mod tests {
             );
         }
 
-        // Cross-call re-resolve (gpt56 `fdbe3786`): a binding that moved
-        // BETWEEN calls is not an error at all — the new call resolves and
-        // fixes the NEW incarnation. The unit-test raft barrier fails
-        // closed, so any page proposal would surface as an error here;
-        // empty namespaces keep this at pure resolution semantics.
-        install(&service, 5, 3, false);
-        for scope in [
-            CacheFreeScope::Mount,
-            CacheFreeScope::Key("a".into()),
-            CacheFreeScope::Prefix("a".into()),
-        ] {
-            let p = service.remove_free_scope(7, 5, &scope, None, 4).unwrap();
-            assert!(p.done && p.processed == 0, "{:?} -> {:?}", scope, p);
+        // Continuation binding verification (RC `6106ab2e` P0-2): a token
+        // minted against incarnation 2 is the typed FENCED terminal once
+        // the pointer names incarnation 3 — verified BEFORE any paging,
+        // never auto re-resolved, never a legacy fallback. Empty
+        // namespaces keep this at pure resolution semantics (the
+        // unit-test raft barrier fails closed, so no page is proposed).
+        let stale = FreeContinuation {
+            mount_id: 5,
+            incarnation: 2,
+            scope: CacheFreeScope::Mount,
+            resume_key: "a".into(),
         }
+        .encode();
+        install(&service, 5, 3, false);
+        let err = service
+            .remove_free_scope(7, 5, &CacheFreeScope::Mount, Some(stale.as_slice()), 4)
+            .unwrap_err();
+        assert!(
+            matches!(
+                curvine_error::FsError::from(err).kind(),
+                curvine_error::ErrorKind::CacheIncarnationFenced
+            ),
+            "expected typed CacheIncarnationFenced"
+        );
+        // A fresh call after the switch resolves and fixes the NEW
+        // incarnation (gpt56 `fdbe3786` cross-call re-resolve).
+        let p = service
+            .remove_free_scope(7, 5, &CacheFreeScope::Mount, None, 4)
+            .unwrap();
+        assert!(p.done && p.processed == 0, "{:?}", p);
+        // A continuation whose scope no longer matches the derived scope
+        // is loud (never a rebind), even on a matching incarnation.
+        let other_scope = FreeContinuation {
+            mount_id: 5,
+            incarnation: 3,
+            scope: CacheFreeScope::Key("a".into()),
+            resume_key: "a".into(),
+        }
+        .encode();
+        let err = service
+            .remove_free_scope(
+                7,
+                5,
+                &CacheFreeScope::Prefix("a".into()),
+                Some(other_scope.as_slice()),
+                4,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not match the derived scope"),
+            "{}",
+            err
+        );
         // The MID-PAGE fence (binding moves DURING pagination → terminal
         // typed `CacheIncarnationFenced`, never auto re-resolve + continue)
         // needs a real page proposal and is therefore proven only in the
-        // real-raft phase-3 harness (`real_raft_mount_lifecycle`) via the
-        // post-barrier hook.
+        // real-raft free-bridge phases (`real_raft_mount_lifecycle`) via
+        // the post-barrier hook.
+    }
+
+    /// Free-bridge continuation token codec (RC `6106ab2e` tightening 2):
+    /// explicit version, stable layout, strict decode — round-trips every
+    /// scope shape and rejects every mutation of the layout.
+    #[test]
+    fn test_free_continuation_codec() {
+        let cases = vec![
+            FreeContinuation {
+                mount_id: u32::MAX,
+                incarnation: 42,
+                scope: CacheFreeScope::Mount,
+                resume_key: "/a".into(),
+            },
+            FreeContinuation {
+                mount_id: 5,
+                incarnation: u64::MAX,
+                scope: CacheFreeScope::Key("/x/y".into()),
+                resume_key: "/x/y".into(),
+            },
+            FreeContinuation {
+                mount_id: 5,
+                incarnation: 7,
+                scope: CacheFreeScope::Prefix(format!("/p/{}", "k".repeat(MAX_KEY_BYTES - 4))),
+                resume_key: "/p/k".into(),
+            },
+        ];
+        for c in cases {
+            let raw = c.encode();
+            assert_eq!(FreeContinuation::decode(&raw).unwrap(), c, "{:?}", c);
+        }
+
+        let base = FreeContinuation {
+            mount_id: 5,
+            incarnation: 7,
+            scope: CacheFreeScope::Prefix("a".into()),
+            resume_key: "a/b".into(),
+        }
+        .encode();
+        let malformed = |why: &str, raw: &[u8]| {
+            let err = FreeContinuation::decode(raw).unwrap_err();
+            assert!(
+                err.to_string().contains(why),
+                "expected '{}' in: {}",
+                why,
+                err
+            );
+        };
+        // Unknown version.
+        let mut v = base.clone();
+        v[0] = FREE_CONTINUATION_VERSION + 1;
+        malformed("unknown version", &v);
+        // Truncated at every prefix boundary.
+        for cut in 1..base.len() {
+            malformed("truncated", &base[..cut]);
+        }
+        // Trailing bytes.
+        let mut t = base.clone();
+        t.push(0);
+        malformed("trailing", &t);
+        // Over-long scope length against the key cap.
+        let mut over = base.clone();
+        let cap = (MAX_KEY_BYTES as u32 + 1).to_le_bytes();
+        over[14..18].copy_from_slice(&cap);
+        malformed("scope exceeds", &over);
+        // Empty resume key.
+        let mut no_resume = base.clone();
+        no_resume[19..23].copy_from_slice(&0u32.to_le_bytes());
+        no_resume.truncate(23);
+        malformed("resume key must be non-empty", &no_resume);
+        // Shape-illegal kind bytes.
+        let mut k3 = base.clone();
+        k3[13] = 3;
+        malformed("unknown scope kind", &k3);
+        // Mount with a non-empty scope, and Key with an empty scope.
+        let build = |kind: u8, scope: &[u8], resume: &[u8]| -> Vec<u8> {
+            let mut v = vec![FREE_CONTINUATION_VERSION];
+            v.extend_from_slice(&5u32.to_le_bytes());
+            v.extend_from_slice(&7u64.to_le_bytes());
+            v.push(kind);
+            v.extend_from_slice(&(scope.len() as u32).to_le_bytes());
+            v.extend_from_slice(scope);
+            v.extend_from_slice(&(resume.len() as u32).to_le_bytes());
+            v.extend_from_slice(resume);
+            v
+        };
+        malformed(
+            "Mount scope must carry no scope bytes",
+            &build(0, b"a", b"a/b"),
+        );
+        malformed("Key scope must be non-empty", &build(1, b"", b"a/b"));
     }
 
     /// Review `cbd434bd`: the vacuum driver's external String cursor is
