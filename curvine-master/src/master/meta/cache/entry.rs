@@ -318,13 +318,18 @@ pub enum OpOutcome {
     /// outcome + client watermark, ZERO business state), so a
     /// response-loss retry of the SAME token reproduces the Superseded /
     /// path-conflict failure instead of re-proposing forever. The payload
-    /// binds the full immutable request exactly like `MountLifecycle`.
+    /// binds the FULL entry exactly like `MountLifecycle` (gpt56 4068670f
+    /// P0-1): old/new incarnations and ttl included, so the apply-side
+    /// replay compares every field and a divergence in any of them is loud.
     /// Appended at the enum tail so earlier outcome bytes keep decoding.
     MountLifecycleRejected {
         kind: MountLifecycleKind,
         mount_id: u32,
         expected_mount: Option<MountInfo>,
         expected_incarnation: Option<u64>,
+        old_incarnation: Option<u64>,
+        new_incarnation: Option<u64>,
+        ttl_ms: i64,
         next_mount: Option<MountInfo>,
         reason: MountLifecycleRejectReason,
     },

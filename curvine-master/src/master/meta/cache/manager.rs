@@ -574,6 +574,27 @@ impl CacheManager {
                 new_incarnation
             );
         }
+        // gpt56 4068670f P0-2: the entry's ttl is the ONLY ttl — with a new
+        // incarnation it must equal the next row's ttl (one frozen policy),
+        // and without one there is no policy to freeze, so it must be 0.
+        // Anything else can mint a MountInfo/policy TTL split that violates
+        // the restore invariant the moment it commits.
+        if new_incarnation.is_some() {
+            let next_ttl = next_mount.map(|m| m.ttl_ms);
+            if next_ttl != Some(ttl_ms) {
+                return err_box!(
+                    "lifecycle entry shape: ttl_ms {} must equal the next row's ttl {:?} when minting incarnation {:?}",
+                    ttl_ms,
+                    next_ttl,
+                    new_incarnation
+                );
+            }
+        } else if ttl_ms != 0 {
+            return err_box!(
+                "lifecycle entry shape: ttl_ms must be 0 when no incarnation is minted (found {})",
+                ttl_ms
+            );
+        }
         match kind {
             MountLifecycleKind::Add => {
                 let Some(next) = next_mount else {
@@ -695,6 +716,9 @@ impl CacheManager {
             mount_id: r_mount,
             expected_mount: r_expected,
             expected_incarnation: r_inc,
+            old_incarnation: r_old,
+            new_incarnation: r_new,
+            ttl_ms: r_ttl,
             next_mount: r_next,
             ..
         }) = store.cache_get_outcome(token).map_err(cv)?
@@ -703,6 +727,9 @@ impl CacheManager {
                 && r_mount == mount_id
                 && r_expected.as_ref() == expected_mount
                 && r_inc == expected_incarnation
+                && r_old == old_incarnation
+                && r_new == new_incarnation
+                && r_ttl == ttl_ms
                 && r_next.as_ref() == next_mount
             {
                 return Ok(MountLifecycleStatus::Superseded);
@@ -759,6 +786,9 @@ impl CacheManager {
                 mount_id,
                 expected_mount,
                 expected_incarnation,
+                old_incarnation,
+                new_incarnation,
+                ttl_ms,
                 next_mount,
                 MountLifecycleRejectReason::CasRowLost,
             )?;
@@ -780,6 +810,9 @@ impl CacheManager {
                 mount_id,
                 expected_mount,
                 expected_incarnation,
+                old_incarnation,
+                new_incarnation,
+                ttl_ms,
                 next_mount,
                 MountLifecycleRejectReason::CasPointerLost,
             )?;
@@ -817,6 +850,9 @@ impl CacheManager {
                             mount_id,
                             expected_mount,
                             expected_incarnation,
+                            old_incarnation,
+                            new_incarnation,
+                            ttl_ms,
                             next_mount,
                             MountLifecycleRejectReason::PathConflict,
                         )?;
@@ -937,6 +973,9 @@ impl CacheManager {
         mount_id: u32,
         expected_mount: Option<&MountInfo>,
         expected_incarnation: Option<u64>,
+        old_incarnation: Option<u64>,
+        new_incarnation: Option<u64>,
+        ttl_ms: i64,
         next_mount: Option<&MountInfo>,
         reason: MountLifecycleRejectReason,
     ) -> CommonResult<()> {
@@ -948,6 +987,9 @@ impl CacheManager {
                 mount_id,
                 expected_mount: expected_mount.cloned(),
                 expected_incarnation,
+                old_incarnation,
+                new_incarnation,
+                ttl_ms,
                 next_mount: next_mount.cloned(),
                 reason,
             },
@@ -1024,12 +1066,13 @@ impl CacheManager {
         }
 
         // Direct evidence 1: this entry's own minted incarnation was
-        // revoked by a later lifecycle on THIS mount.
+        // revoked by a later lifecycle on THIS mount (a revoked row
+        // belonging to a DIFFERENT mount is corruption, not proof).
         let minted_revoked = match new_incarnation {
             Some(inc) => {
                 matches!(
                     store.cache_get_incarnation(inc).map_err(cv)?,
-                    Some(r) if r.revoked
+                    Some(r) if r.revoked && r.mount_id == mount_id
                 )
             }
             None => false,
@@ -4874,5 +4917,110 @@ mod tests {
             "divergent rejected replay: {}",
             err
         );
+
+        // gpt56 4068670f P0-1: divergence on the new-incarnation axis ALONE
+        // (identical expected/next/old/ttl) must also be loud — the rejected
+        // outcome binds the FULL entry.
+        let err = mgr
+            .apply_mount_lifecycle(
+                &store,
+                token(4, 2),
+                MountLifecycleKind::Update,
+                9,
+                Some(&stale),
+                Some(1),
+                Some(&raced),
+                Some(1),
+                Some(3),
+                9_000,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("replay divergence"),
+            "new-incarnation-only divergence: {}",
+            err
+        );
+    }
+
+    /// gpt56 4068670f P0-2: the entry ttl is the ONLY ttl. A forged entry
+    /// minting a MountInfo TTL different from the incarnation-policy TTL
+    /// (or a non-zero ttl with no new incarnation) is FSM-fatal with ZERO
+    /// state and ZERO outcome.
+    #[test]
+    fn lifecycle_ttl_shape_gate() {
+        let store = new_store("mlc-ttl-shape");
+        let mgr = CacheManager::new();
+
+        // Forged Add: next row ttl 1_000, entry ttl 999.
+        let next = cache_row(5, "/t-add", 1_000);
+        let err = mgr
+            .apply_mount_lifecycle(
+                &store,
+                token(6, 1),
+                MountLifecycleKind::Add,
+                5,
+                None,
+                None,
+                Some(&next),
+                None,
+                Some(1),
+                999,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("must equal the next row's ttl"),
+            "forged add ttl: {}",
+            err
+        );
+        assert!(store.cache_get_outcome(token(6, 1)).unwrap().is_none());
+        assert!(store.cache_mount_point(5).unwrap().is_none());
+        assert!(store.cache_get_incarnation(1).unwrap().is_none());
+
+        // Forged Update with the same TTL split.
+        let expected = cache_row(5, "/t-upd", 1_000);
+        let updated = cache_row(5, "/t-upd", 2_000);
+        let err = mgr
+            .apply_mount_lifecycle(
+                &store,
+                token(6, 2),
+                MountLifecycleKind::Update,
+                5,
+                Some(&expected),
+                Some(1),
+                Some(&updated),
+                Some(1),
+                Some(2),
+                2_222,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("must equal the next row's ttl"),
+            "forged update ttl: {}",
+            err
+        );
+        assert!(store.cache_get_outcome(token(6, 2)).unwrap().is_none());
+
+        // Forged no-new-incarnation entry carrying a non-zero ttl.
+        let row = cache_row(5, "/t-leave", 1_000);
+        let err = mgr
+            .apply_mount_lifecycle(
+                &store,
+                token(6, 3),
+                MountLifecycleKind::Unmount,
+                5,
+                Some(&row),
+                Some(1),
+                None,
+                Some(1),
+                None,
+                500,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("ttl_ms must be 0"),
+            "forged nonzero ttl without a new incarnation: {}",
+            err
+        );
+        assert!(store.cache_get_outcome(token(6, 3)).unwrap().is_none());
     }
 }
