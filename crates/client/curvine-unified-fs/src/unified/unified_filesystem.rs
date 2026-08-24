@@ -437,6 +437,39 @@ impl UnifiedFileSystem {
         Ok((mnt, key, incarnation))
     }
 
+    /// P4-3 bound scoped purge (gpt56 `2a089d5a`): the ONE purge
+    /// primitive for cache-mode mounts. Routes through the Free bridge
+    /// with the caller-observed mount/incarnation binding — the master
+    /// validates the resolved route EXACTLY on the first page of a
+    /// fresh walk, so a remount between observation and purge is the
+    /// typed FENCED terminal and this purge can never delete a
+    /// different incarnation than the caller observed. The derived
+    /// scope (Key for a non-recursive file, Prefix for recursive)
+    /// clears every live row: Valid, Reserved, expired, and
+    /// locations-incomplete.
+    ///
+    /// Callers run this BEFORE the UFS mutation (ordering ruling #3):
+    /// a fenced or failed purge leaves UFS untouched and the whole
+    /// operation is safe to retry. The error is always loud.
+    async fn bound_purge(&self, mount: &MountValue, path: &Path, recursive: bool) -> FsResult<()> {
+        let Some(incarnation) = mount.cache_incarnation.filter(|i| *i != 0) else {
+            return err_box!(
+                "cache-mode mount {} ({}) snapshot has no cache incarnation; refusing unbound purge",
+                mount.info.cv_path,
+                mount.info.mount_id
+            );
+        };
+        self.cv
+            .free_with_binding(
+                path,
+                recursive,
+                Some(mount.info.mount_id),
+                Some(incarnation),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// ONE metadata Get observation with the fenced one-refresh policy
     /// (shared by `cache_status` and `invalidate_cache`).
     ///
@@ -1210,11 +1243,18 @@ impl UnifiedFileSystem {
                 }
 
                 Some((ufs_path, mount)) => {
-                    if let Err(e) = self.cv.delete(path, false).await {
-                        if !matches!(e, FsError::FileNotFound(_)) {
-                            warn!("failed to delete cache for {}: {}", path, e);
-                        }
-                    }
+                    // P4-3 purge fences (gpt56 `2a089d5a` #1+#3): purge
+                    // BEFORE the UFS write. A Key-scoped bound Free clears
+                    // every live row for this file — including expired and
+                    // locations-incomplete rows that an exact Invalidate
+                    // can never clear (Miss ≠ no-entry) and that would
+                    // otherwise pin a fresh CacheAllocate forever. The
+                    // binding is the caller-observed mount/incarnation; a
+                    // remount in between is the typed FENCED terminal, the
+                    // UFS target is untouched, and the open is safe to
+                    // retry. Failure is loud — never write over an
+                    // unconfirmed stale cache state.
+                    self.bound_purge(&mount, path, false).await?;
 
                     write_path = ufs_path.full_path().to_owned();
                     let ufs = mount.ufs()?;
@@ -1337,9 +1377,45 @@ impl UnifiedFileSystem {
                             "rename flags through unified mount"
                         ));
                     }
+
+                    // P4-3 purge fences (gpt56 `2a089d5a` #2): prove dst
+                    // resolves to the SAME mount as src before any purge
+                    // — the purge bindings and the UFS rename must target
+                    // one namespace. A dst under a different mount (or
+                    // under none) is loud; never half-bind a rename.
+                    let Some((_, dst_mount)) = self.get_mount(dst, RpcCode::Rename).await? else {
+                        return err_box!(
+                            "rename dst {} is not covered by a mount (src mount {})",
+                            dst,
+                            mount.info.cv_path
+                        );
+                    };
+                    if dst_mount.info.mount_id != mount.info.mount_id {
+                        return err_box!(
+                            "rename crosses mounts: src mount_id={} ({}), dst mount_id={} ({})",
+                            mount.info.mount_id,
+                            mount.info.cv_path,
+                            dst_mount.info.mount_id,
+                            dst_mount.info.cv_path
+                        );
+                    }
+
                     let dst_ufs = mount.get_ufs_path(dst)?;
+
+                    // P4-3 ordering ruling (#3): purge BEFORE the UFS
+                    // rename. Component-safe Prefix scope on src covers
+                    // the file itself plus descendants; then the same on
+                    // dst. A failure at either purge leaves UFS untouched
+                    // — src still readable via UFS fallback — and the
+                    // whole rename is safe to retry. Purge-after-UFS has
+                    // no recovery path (src is gone) and is forbidden.
+                    self.bound_purge(&mount, src, true).await?;
+                    self.bound_purge(&mount, dst, true).await?;
+
                     let res = mount.ufs()?.rename(&src_ufs, &dst_ufs).await?;
 
+                    // Legacy inode cleanup stays warn-only (P4-4 retires
+                    // it); cache correctness is owned by the purge above.
                     if let Err(e) = self.cv.delete(src, true).await {
                         if !matches!(e, FsError::FileNotFound(_)) {
                             warn!("failed to delete cache for {}: {}", src, e);
@@ -1624,9 +1700,21 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
                         );
                     }
 
+                    // P4-3 ordering ruling (gpt56 `2a089d5a` #3): purge
+                    // BEFORE the UFS delete. Key scope for a file,
+                    // Prefix for a recursive dir delete — bound to the
+                    // caller-observed mount/incarnation so a remount is
+                    // the typed FENCED terminal with UFS untouched and
+                    // the delete safe to retry.
+                    self.bound_purge(&mount, path, recursive).await?;
+
                     let mut delete_res = mount.ufs()?.delete(&ufs_path, recursive).await?;
 
-                    // delete cache
+                    // P4-3 ordering ruling (gpt56 `2a089d5a` #3): the
+                    // cache purge runs BEFORE the UFS delete — see the
+                    // bound_purge call above. This leg is the legacy
+                    // inode cleanup, warn-only (P4-4 retires it); cache
+                    // correctness is owned by the purge, never here.
                     match self.cv.delete(path, recursive).await {
                         Ok(res) => {
                             delete_res.inodes += res.inodes;

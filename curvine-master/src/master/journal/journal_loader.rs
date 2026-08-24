@@ -2396,7 +2396,7 @@ mod tests {
 
             // Key free: EXACT point read — "f" only, never its family.
             let p = cache
-                .remove_free_scope(72, mid, &CacheFreeScope::Key("f".into()), None, 4)
+                .remove_free_scope(72, mid, &CacheFreeScope::Key("f".into()), None, None, 4)
                 .unwrap();
             assert!(p.done && p.processed == 1, "{:?}", p);
             assert_eq!(entry_state("f"), (CacheEntryState::Tombstoned, 2));
@@ -2404,7 +2404,14 @@ mod tests {
 
             // Prefix free: the "pfx" family only.
             let p = cache
-                .remove_free_scope(73, mid, &CacheFreeScope::Prefix("pfx".into()), None, 4)
+                .remove_free_scope(
+                    73,
+                    mid,
+                    &CacheFreeScope::Prefix("pfx".into()),
+                    None,
+                    None,
+                    4,
+                )
                 .unwrap();
             assert!(p.done && p.processed == 2, "{:?}", p);
             assert_eq!(entry_state("pfx/a"), (CacheEntryState::Tombstoned, 2));
@@ -2431,7 +2438,7 @@ mod tests {
                 w.commit().unwrap();
             }));
             let err = cache
-                .remove_free_scope(74, mid, &CacheFreeScope::Mount, None, 16)
+                .remove_free_scope(74, mid, &CacheFreeScope::Mount, None, None, 16)
                 .unwrap_err();
             let wire_err = FsError::from(err);
             assert!(
@@ -2462,7 +2469,7 @@ mod tests {
                 w.commit().unwrap();
             }
             let p = cache
-                .remove_free_scope(75, mid, &CacheFreeScope::Mount, None, 16)
+                .remove_free_scope(75, mid, &CacheFreeScope::Mount, None, None, 16)
                 .unwrap();
             assert!(p.done, "{:?}", p);
             assert_eq!(p.processed, 68);
@@ -2486,7 +2493,14 @@ mod tests {
             }
             .encode();
             let p = cache
-                .remove_free_scope(76, mid, &CacheFreeScope::Mount, Some(token.as_slice()), 16)
+                .remove_free_scope(
+                    76,
+                    mid,
+                    &CacheFreeScope::Mount,
+                    Some(token.as_slice()),
+                    None,
+                    16,
+                )
                 .unwrap();
             assert!(p.done && p.processed == 0, "{:?}", p);
 
@@ -2606,7 +2620,7 @@ mod tests {
             // S2: a fresh Mount free walks page 1 (64 victims, journal +1)
             // and mints the continuation T.
             let p = cache
-                .remove_free_scope(82, mid, &CacheFreeScope::Mount, None, 1)
+                .remove_free_scope(82, mid, &CacheFreeScope::Mount, None, None, 1)
                 .unwrap();
             assert!(!p.done && p.processed == 64, "{:?}", p);
             let t = p.next.expect("done=false mints a continuation");
@@ -2624,7 +2638,7 @@ mod tests {
                 w.commit().unwrap();
             }
             let err = cache
-                .remove_free_scope(83, mid, &CacheFreeScope::Mount, Some(t.as_slice()), 1)
+                .remove_free_scope(83, mid, &CacheFreeScope::Mount, Some(t.as_slice()), None, 1)
                 .unwrap_err();
             assert!(
                 matches!(
@@ -2655,14 +2669,14 @@ mod tests {
             // an immediate replay of T — with no other advancement — must
             // journal NOTHING and mint a byte-identical T'.
             let p = cache
-                .remove_free_scope(84, mid, &CacheFreeScope::Mount, Some(t.as_slice()), 1)
+                .remove_free_scope(84, mid, &CacheFreeScope::Mount, Some(t.as_slice()), None, 1)
                 .unwrap();
             assert!(!p.done && p.processed == 64, "{:?}", p);
             let t2 = p.next.clone().expect("first T replay mints T'");
             let after_first = count_now();
             assert_eq!(after_first, base_count + 1, "the S4 page journaled once");
             let p = cache
-                .remove_free_scope(85, mid, &CacheFreeScope::Mount, Some(t.as_slice()), 1)
+                .remove_free_scope(85, mid, &CacheFreeScope::Mount, Some(t.as_slice()), None, 1)
                 .unwrap();
             assert!(
                 !p.done && p.processed == 0,
@@ -2687,7 +2701,14 @@ mod tests {
                 w.commit().unwrap();
             }
             let err = cache
-                .remove_free_scope(86, mid, &CacheFreeScope::Mount, Some(t2.as_slice()), 1)
+                .remove_free_scope(
+                    86,
+                    mid,
+                    &CacheFreeScope::Mount,
+                    Some(t2.as_slice()),
+                    None,
+                    1,
+                )
                 .unwrap_err();
             assert!(
                 matches!(
@@ -2721,7 +2742,7 @@ mod tests {
                 w.commit().unwrap();
             }));
             let err = cache
-                .remove_free_scope(87, mid, &CacheFreeScope::Mount, None, 4)
+                .remove_free_scope(87, mid, &CacheFreeScope::Mount, None, None, 4)
                 .unwrap_err();
             assert!(
                 matches!(

@@ -340,6 +340,15 @@ impl MasterHandler {
                     info.mount_id,
                     &scope,
                     header.cache_cursor.as_deref(),
+                    match (header.expected_mount_id, header.expected_cache_incarnation) {
+                        (Some(mount_id), Some(incarnation)) => {
+                            Some(crate::master::cache::FreeBinding {
+                                mount_id,
+                                incarnation,
+                            })
+                        }
+                        _ => None,
+                    },
                     crate::master::cache::MUTATION_MAX_PAGES_PER_CALL,
                 )?;
                 Ok((FreeResult::default(), Some(progress)))
@@ -356,6 +365,19 @@ impl MasterHandler {
                 })
             }
             FreeRoute::LegacyInode => {
+                // P4-3 purge fences (gpt56 `2a089d5a` #2): a fresh walk
+                // carrying a client-observed binding is a BOUND PURGE,
+                // never a legacy inode free. If the path no longer
+                // routes cache-mode (cache->fs switch, unmount), the
+                // caller's observation is stale — the same typed FENCED
+                // terminal as a continuation on a dead route; it never
+                // falls through to inode deletion.
+                if header.expected_mount_id.is_some() || header.expected_cache_incarnation.is_some()
+                {
+                    return Err(curvine_error::FsError::cache_incarnation_fenced(
+                        header.expected_cache_incarnation.unwrap_or(0),
+                    ));
+                }
                 if self.check_is_retry(req_id)? {
                     return Ok((FreeResult::default(), None));
                 }

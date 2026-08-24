@@ -1248,6 +1248,338 @@ fn test_cache_read_d5_verify_matrix() {
     });
 }
 
+/// P4-3 purge fences, seam 1 (gpt56 `2a089d5a` #1): an EXPIRED-but-live
+/// row is not "no entry" — the server answers Miss, exact Invalidate can
+/// never clear it, and a fresh CacheAllocate is rejected by the live row
+/// forever. The overwrite's bound Key purge runs BEFORE the UFS write and
+/// re-opens the key: the re-cache Allocate succeeds and the read serves
+/// the NEW content (seam 5, overwrite leg).
+#[test]
+fn test_cache_p43_expired_row_overwrite_repurge() {
+    let (fs, _cluster) = get_fs_cache_meta();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        let ufs_base = env::var("UFS_TEST_PATH").unwrap();
+        let dir = Path::from_str(format!("{}/write_cache_CacheMode_p43ttl", ufs_base)).unwrap();
+        let root = Path::from_str("/write_cache_p43ttl").unwrap();
+        let opts = MountOptionsBuilder::new()
+            .write_type(WriteType::CacheMode)
+            .access_mode(AccessMode::ReadWrite)
+            .ttl_ms(2000)
+            .build();
+        let ufs = UfsFileSystem::new(&dir, opts.add_properties.clone(), None).unwrap();
+        ufs.mkdir(&dir, true).await.unwrap();
+        fs.mount(&dir, &root, opts).await.unwrap();
+
+        let path: Path = "/write_cache_p43ttl/expired.log".into();
+        let a = Utils::rand_str(2048);
+        let mut w = fs.create(&path, true).await.unwrap();
+        w.write_string(&a).await.unwrap();
+        w.complete().await.unwrap();
+        let (ufs_path, mnt) = fs
+            .get_mount(&path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        fs.async_cache(&ufs_path).unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
+        assert!(matches!(
+            fs.cache_status(&path).await.unwrap(),
+            CacheEntryStatus::Hit { .. }
+        ));
+
+        // Cross the ttl: the public status answers Miss ...
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(
+            fs.cache_status(&path).await.unwrap(),
+            CacheEntryStatus::Miss
+        );
+
+        // ... but the row is STILL LIVE (Miss != no entry): a re-cache
+        // Allocate on the un-purged key is rejected by the live row.
+        fs.async_cache(&ufs_path).unwrap();
+        let err = fs.wait_job_complete(&path, false).await.unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("live entry"),
+            "the expired live row must reject the re-cache Allocate, got {:?}",
+            err
+        );
+
+        // The overwrite's bound Key purge (BEFORE the UFS write) clears
+        // the expired live row and re-opens the key ...
+        let b = Utils::rand_str(3072);
+        let mut w = fs.create(&path, true).await.unwrap();
+        w.write_string(&b).await.unwrap();
+        w.complete().await.unwrap();
+
+        // ... so the re-cache Allocate now succeeds.
+        fs.async_cache(&ufs_path).unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
+        match fs.cache_status(&path).await.unwrap() {
+            CacheEntryStatus::Hit { len, .. } => assert_eq!(len, b.len() as i64),
+            other => panic!("re-cache after the purge must hit, got {:?}", other),
+        }
+        // Seam 5 (overwrite): the read serves the NEW content.
+        let mut r = fs.open(&path).await.unwrap();
+        assert_eq!(r.read_as_string().await.unwrap(), b);
+        let _ = mnt;
+    });
+}
+
+/// P4-3 purge fences, seam 2 (gpt56 `2a089d5a` #2): a different-UFS-target
+/// remount between the client's observation and the purge is the typed
+/// FENCED terminal — the purge NEVER deletes a different incarnation than
+/// the caller observed, and the UFS targets stay untouched. A cache->fs
+/// switch is the same fence (a bound free never falls through to the
+/// legacy inode free). After the client re-observes, the retry succeeds.
+#[test]
+fn test_cache_p43_remount_bound_purge_fenced() {
+    let (fs, cluster) = get_fs_cache_meta();
+    let master_fs = cluster.get_active_master_fs();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        let ufs_base = env::var("UFS_TEST_PATH").unwrap();
+        let dir_a = Path::from_str(format!("{}/write_cache_CacheMode_p43a", ufs_base)).unwrap();
+        let dir_b = Path::from_str(format!("{}/write_cache_CacheMode_p43b", ufs_base)).unwrap();
+        let root = Path::from_str("/write_cache_p43").unwrap();
+        let opts = MountOptionsBuilder::new()
+            .write_type(WriteType::CacheMode)
+            .access_mode(AccessMode::ReadWrite)
+            .build();
+        let ufs_a = UfsFileSystem::new(&dir_a, opts.add_properties.clone(), None).unwrap();
+        ufs_a.mkdir(&dir_a, true).await.unwrap();
+        fs.mount(&dir_a, &root, opts.clone()).await.unwrap();
+
+        // Observe the mount (client snapshot binds to this incarnation).
+        let path: Path = "/write_cache_p43/swap.log".into();
+        let old_data = Utils::rand_str(2048);
+        let mut w = fs.create(&path, true).await.unwrap();
+        w.write_string(&old_data).await.unwrap();
+        w.complete().await.unwrap();
+        let (ufs_path, mnt) = fs
+            .get_mount(&path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        fs.async_cache(&ufs_path).unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
+        let inc1 = master_fs
+            .cache_service
+            .current_incarnation_for_mount(mnt.info.mount_id)
+            .unwrap()
+            .unwrap();
+
+        // Stage a SECOND UFS target directly (no second mount — one UFS
+        // dir cannot sit at two cv roots): same-named file, different
+        // content.
+        let new_data = "swapped-target".to_string();
+        let ufs_b = UfsFileSystem::new(&dir_b, opts.add_properties.clone(), None).unwrap();
+        ufs_b.mkdir(&dir_b, true).await.unwrap();
+        let b_file = Path::from_str(format!("{}/swap.log", dir_b.full_path())).unwrap();
+        let mut w = ufs_b.create(&b_file, true).await.unwrap();
+        w.write_string(&new_data).await.unwrap();
+        w.complete().await.unwrap();
+
+        // Raw umount + remount onto the DIFFERENT UFS target: the client
+        // snapshot stays on the dead (mount_id, incarnation) binding.
+        fs.cv().umount(&root).await.unwrap();
+        fs.cv().mount(&dir_b, &root, opts.clone()).await.unwrap();
+
+        // The stale-bound overwrite is the typed FENCED terminal — never
+        // a purge of the new incarnation, never a UFS write.
+        let err = match fs.create(&path, true).await {
+            Err(e) => e,
+            Ok(_) => panic!("the stale-bound overwrite must fence, not open"),
+        };
+        assert!(
+            matches!(err.kind(), curvine_error::ErrorKind::CacheIncarnationFenced),
+            "stale-bound purge must be the typed FENCED terminal, got {:?}",
+            err
+        );
+        // The new target is untouched (the overwrite never happened) and
+        // the new incarnation is at ZERO cache rows for this key.
+        let mut r = ufs_b.open(&b_file).await.unwrap();
+        assert_eq!(
+            r.read_as_string().await.unwrap(),
+            new_data,
+            "the fenced purge must leave the new UFS target untouched"
+        );
+        let table = fs.cv().get_mount_table().await.unwrap();
+        let mnt2 = table
+            .iter()
+            .find(|m| m.cv_path == "/write_cache_p43")
+            .expect("remounted mount must be in the table");
+        let inc2 = master_fs
+            .cache_service
+            .current_incarnation_for_mount(mnt2.mount_id)
+            .unwrap()
+            .unwrap();
+        assert_ne!((mnt2.mount_id, inc2), (mnt.info.mount_id, inc1));
+        let b_key = {
+            let ufs_b_path = mnt2.get_ufs_path(&path).unwrap();
+            mnt2.get_cache_key(&ufs_b_path).unwrap()
+        };
+        assert!(
+            master_fs
+                .cache_service
+                .get(inc2, &b_key, false)
+                .unwrap()
+                .is_none(),
+            "the fenced purge must leave the new incarnation at zero changes"
+        );
+
+        // Cache->fs switch while the snapshot is STILL stale (cache-mode):
+        // the bound purge's path no longer routes cache-mode at the
+        // master — the SAME typed fence, never a fall-through to the
+        // legacy inode free.
+        fs.cv().umount(&root).await.unwrap();
+        let fs_opts = MountOptionsBuilder::new()
+            .write_type(WriteType::FsMode)
+            .access_mode(AccessMode::ReadWrite)
+            .build();
+        fs.cv().mount(&dir_b, &root, fs_opts).await.unwrap();
+        let err = match fs.create(&path, true).await {
+            Err(e) => e,
+            Ok(_) => panic!("a bound purge on a cache->fs route must fence, not open"),
+        };
+        assert!(
+            matches!(err.kind(), curvine_error::ErrorKind::CacheIncarnationFenced),
+            "a bound purge on a cache->fs switched route must fence, got {:?}",
+            err
+        );
+
+        // Back to cache-mode, re-observe through the cache-domain
+        // fence-refresh path (the write path is loud by design — no
+        // silent re-resolve), then the RETRY succeeds against the new
+        // binding.
+        fs.cv().umount(&root).await.unwrap();
+        fs.cv().mount(&dir_b, &root, opts).await.unwrap();
+        assert_eq!(
+            fs.cache_status(&path).await.unwrap(),
+            CacheEntryStatus::Miss
+        );
+        let retry_data = Utils::rand_str(1024);
+        let mut w = fs.create(&path, true).await.unwrap();
+        w.write_string(&retry_data).await.unwrap();
+        w.complete().await.unwrap();
+        let mut r = fs.open(&path).await.unwrap();
+        assert_eq!(r.read_as_string().await.unwrap(), retry_data);
+    });
+}
+
+/// P4-3 purge fences, seams 3+4+5 (gpt56 `2a089d5a` #3): the purge runs
+/// BEFORE the UFS mutation. When the UFS rename/delete fails (read-only
+/// UFS parent), the purge has already cleared the cache but the ORIGINAL
+/// data stays readable via the UFS fallback, and the retry succeeds —
+/// purge-after-UFS has no recovery path (src gone) and is forbidden.
+/// After a SUCCESSFUL rename/delete nothing serves the old cache (seam 5).
+#[test]
+fn test_cache_p43_purge_before_ufs_rename_delete() {
+    let (fs, _cluster) = get_fs_cache_meta();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        use std::os::unix::fs::PermissionsExt;
+
+        let ufs_base = env::var("UFS_TEST_PATH").unwrap();
+        let dir = Path::from_str(format!("{}/write_cache_CacheMode_p43ro", ufs_base)).unwrap();
+        let root = Path::from_str("/write_cache_p43ro").unwrap();
+        let opts = MountOptionsBuilder::new()
+            .write_type(WriteType::CacheMode)
+            .access_mode(AccessMode::ReadWrite)
+            .build();
+        let ufs = UfsFileSystem::new(&dir, opts.add_properties.clone(), None).unwrap();
+        ufs.mkdir(&dir, true).await.unwrap();
+        fs.mount(&dir, &root, opts).await.unwrap();
+
+        let src: Path = "/write_cache_p43ro/f1.log".into();
+        let dst: Path = "/write_cache_p43ro/f2.log".into();
+        let data = Utils::rand_str(2048);
+        let mut w = fs.create(&src, true).await.unwrap();
+        w.write_string(&data).await.unwrap();
+        w.complete().await.unwrap();
+        let (ufs_path, mnt) = fs
+            .get_mount(&src, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        fs.async_cache(&ufs_path).unwrap();
+        fs.wait_job_complete(&src, false).await.unwrap();
+        assert!(matches!(
+            fs.cache_status(&src).await.unwrap(),
+            CacheEntryStatus::Hit { .. }
+        ));
+
+        // Read-only UFS parent: the purges still succeed (master-side),
+        // the UFS rename fails — src keeps serving via the UFS fallback.
+        let ufs_dir = std::path::Path::new(dir.path());
+        std::fs::set_permissions(ufs_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let err = fs.rename(&src, &dst).await.unwrap_err();
+        assert!(
+            format!("{:?}", err).to_lowercase().contains("permission")
+                || format!("{:?}", err).to_lowercase().contains("denied")
+                || format!("{:?}", err).to_lowercase().contains("read-only"),
+            "the read-only UFS parent must fail the rename, got {:?}",
+            err
+        );
+        // Purge-before is observable: the src cache entry is GONE even
+        // though the UFS rename failed ...
+        assert_eq!(fs.cache_status(&src).await.unwrap(), CacheEntryStatus::Miss);
+        // ... and the original data still serves (UFS fallback).
+        let mut r = fs.open(&src).await.unwrap();
+        assert_eq!(r.read_as_string().await.unwrap(), data);
+
+        // Retry after the permission fix: the rename succeeds and NOTHING
+        // serves the old cache anywhere (seam 5, rename/delete legs).
+        std::fs::set_permissions(ufs_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(fs.rename(&src, &dst).await.unwrap());
+        let err = fs.get_status(&src).await.unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("not found") || format!("{:?}", err).contains("NotFound"),
+            "src must be gone after the rename, got {:?}",
+            err
+        );
+        let mut r = fs.open(&dst).await.unwrap();
+        assert_eq!(r.read_as_string().await.unwrap(), data);
+
+        // Delete leg: the same purge-before ordering on a failing UFS
+        // delete, then the successful delete leaves nothing behind.
+        let f3: Path = "/write_cache_p43ro/f3.log".into();
+        let mut w = fs.create(&f3, true).await.unwrap();
+        w.write_string(&data).await.unwrap();
+        w.complete().await.unwrap();
+        let (f3_ufs, _) = fs
+            .get_mount(&f3, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        fs.async_cache(&f3_ufs).unwrap();
+        fs.wait_job_complete(&f3, false).await.unwrap();
+
+        std::fs::set_permissions(ufs_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let err = fs.delete(&f3, false).await.unwrap_err();
+        assert!(
+            format!("{:?}", err).to_lowercase().contains("permission")
+                || format!("{:?}", err).to_lowercase().contains("denied")
+                || format!("{:?}", err).to_lowercase().contains("read-only"),
+            "the read-only UFS parent must fail the delete, got {:?}",
+            err
+        );
+        assert_eq!(fs.cache_status(&f3).await.unwrap(), CacheEntryStatus::Miss);
+        let mut r = fs.open(&f3).await.unwrap();
+        assert_eq!(r.read_as_string().await.unwrap(), data);
+
+        std::fs::set_permissions(ufs_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fs.delete(&f3, false).await.unwrap();
+        let err = fs.get_status(&f3).await.unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("not found") || format!("{:?}", err).contains("NotFound"),
+            "the deleted file must be gone, got {:?}",
+            err
+        );
+        let _ = mnt;
+    });
+}
+
 /// P4-1 default-off + non-cache-mode seams (gpt56 `88cda9cf`): the public
 /// entries are cache-domain only — an FsMode mount is loud, an unmounted
 /// path is loud, and the RAW binding against a default (capability-off)

@@ -191,6 +191,26 @@ impl CurvineFileSystem {
         self.fs_client.free(path, recursive).await
     }
 
+    /// P4-3 purge fences (gpt56 `2a089d5a`): free carrying the
+    /// client-observed mount/incarnation binding. See
+    /// [`FsClient::free_with_binding`].
+    pub async fn free_with_binding(
+        &self,
+        path: &Path,
+        recursive: bool,
+        expected_mount_id: Option<u32>,
+        expected_cache_incarnation: Option<u64>,
+    ) -> FsResult<FreeResult> {
+        self.fs_client
+            .free_with_binding(
+                path,
+                recursive,
+                expected_mount_id,
+                expected_cache_incarnation,
+            )
+            .await
+    }
+
     pub async fn get_status(&self, path: &Path) -> FsResult<FileStatus> {
         self.fs_client.file_status(path).await
     }

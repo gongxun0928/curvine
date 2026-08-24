@@ -1504,6 +1504,17 @@ pub struct FreeContinuation {
     pub resume_key: String,
 }
 
+/// P4-3 purge fences (gpt56 `2a089d5a` #2): the client-observed route
+/// binding riding the FIRST page of a fresh bound free walk. The master
+/// validates the resolved `(mount_id, incarnation)` EXACTLY against it;
+/// a mismatch is the typed FENCED terminal. Continuation pages keep the
+/// master-minted token binding — a `FreeBinding` is ignored there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FreeBinding {
+    pub mount_id: u32,
+    pub incarnation: u64,
+}
+
 impl FreeContinuation {
     /// Wire format v1 (all integers little-endian, explicit lengths,
     /// NO trailing bytes accepted on decode):
@@ -3738,6 +3749,7 @@ impl CacheService {
         mount_id: u32,
         scope: &CacheFreeScope,
         continuation: Option<&[u8]>,
+        expected: Option<FreeBinding>,
         max_pages: usize,
     ) -> CommonResult<FreeScopeProgress> {
         self.require_enabled()?;
@@ -3821,6 +3833,20 @@ impl CacheService {
                             if c.mount_id != mount_id || c.incarnation != inc {
                                 return Err(Self::fenced(c.incarnation));
                             }
+                        }
+                        // P4-3 purge fences (gpt56 `2a089d5a` #2): a
+                        // FRESH walk carrying a client-observed binding
+                        // must match the resolved route EXACTLY — a
+                        // remount/moved namespace is the same typed
+                        // FENCED terminal, so a purge can never delete a
+                        // different incarnation than the caller
+                        // observed. Continuation pages keep the token
+                        // binding; expectations are ignored there.
+                        if cont.is_none()
+                            && expected
+                                .is_some_and(|b| b.mount_id != mount_id || b.incarnation != inc)
+                        {
+                            return Err(Self::fenced(inc));
                         }
                         inc
                     }
@@ -9699,10 +9725,10 @@ mod tests {
             Duration::from_secs(3600),
         );
         assert!(disabled
-            .remove_free_scope(7, 5, &CacheFreeScope::Mount, None, 4)
+            .remove_free_scope(7, 5, &CacheFreeScope::Mount, None, None, 4)
             .is_err());
         assert!(disabled
-            .remove_free_scope(7, 5, &CacheFreeScope::Key("a".into()), None, 4)
+            .remove_free_scope(7, 5, &CacheFreeScope::Key("a".into()), None, None, 4)
             .is_err());
 
         // Shape gates fire BEFORE any binding resolution: an empty
@@ -9710,10 +9736,10 @@ mod tests {
         // well-formed token whose resume key is not the exact Key (or is
         // outside the Prefix family) is rejected at membership.
         assert!(service
-            .remove_free_scope(7, 5, &CacheFreeScope::Key(String::new()), None, 4)
+            .remove_free_scope(7, 5, &CacheFreeScope::Key(String::new()), None, None, 4)
             .is_err());
         assert!(service
-            .remove_free_scope(7, 5, &CacheFreeScope::Prefix(String::new()), None, 4)
+            .remove_free_scope(7, 5, &CacheFreeScope::Prefix(String::new()), None, None, 4)
             .is_err());
         let wrong_key = FreeContinuation {
             mount_id: 5,
@@ -9728,6 +9754,7 @@ mod tests {
                 5,
                 &CacheFreeScope::Key("a".into()),
                 Some(wrong_key.as_slice()),
+                None,
                 4,
             )
             .unwrap_err();
@@ -9745,6 +9772,7 @@ mod tests {
                 5,
                 &CacheFreeScope::Prefix("a".into()),
                 Some(outside.as_slice()),
+                None,
                 4,
             )
             .unwrap_err();
@@ -9754,7 +9782,7 @@ mod tests {
         // truncated/garbage continuation is a wire-protocol violation
         // whatever the live state says.
         let err = service
-            .remove_free_scope(7, 5, &CacheFreeScope::Mount, Some(b"garbage"), 4)
+            .remove_free_scope(7, 5, &CacheFreeScope::Mount, Some(b"garbage"), None, 4)
             .unwrap_err();
         assert!(
             err.to_string().contains("continuation token is malformed"),
@@ -9765,7 +9793,7 @@ mod tests {
         // Binding resolution is fail-closed: no pointer at all is loud,
         // never an empty no-op free.
         let err = service
-            .remove_free_scope(7, 5, &CacheFreeScope::Mount, None, 4)
+            .remove_free_scope(7, 5, &CacheFreeScope::Mount, None, None, 4)
             .unwrap_err();
         assert!(
             err.to_string().contains("no current incarnation"),
@@ -9776,7 +9804,7 @@ mod tests {
         // Pointer to a REVOKED row is equally loud at resolution.
         install(&service, 5, 1, true);
         let err = service
-            .remove_free_scope(7, 5, &CacheFreeScope::Mount, None, 4)
+            .remove_free_scope(7, 5, &CacheFreeScope::Mount, None, None, 4)
             .unwrap_err();
         assert!(err.to_string().contains("is not live"), "{}", err);
 
@@ -9788,7 +9816,9 @@ mod tests {
             CacheFreeScope::Key("a".into()),
             CacheFreeScope::Prefix("a".into()),
         ] {
-            let p = service.remove_free_scope(7, 5, &scope, None, 4).unwrap();
+            let p = service
+                .remove_free_scope(7, 5, &scope, None, None, 4)
+                .unwrap();
             assert_eq!(
                 p,
                 FreeScopeProgress {
@@ -9816,7 +9846,14 @@ mod tests {
         .encode();
         install(&service, 5, 3, false);
         let err = service
-            .remove_free_scope(7, 5, &CacheFreeScope::Mount, Some(stale.as_slice()), 4)
+            .remove_free_scope(
+                7,
+                5,
+                &CacheFreeScope::Mount,
+                Some(stale.as_slice()),
+                None,
+                4,
+            )
             .unwrap_err();
         assert!(
             matches!(
@@ -9828,7 +9865,7 @@ mod tests {
         // A fresh call after the switch resolves and fixes the NEW
         // incarnation (gpt56 `fdbe3786` cross-call re-resolve).
         let p = service
-            .remove_free_scope(7, 5, &CacheFreeScope::Mount, None, 4)
+            .remove_free_scope(7, 5, &CacheFreeScope::Mount, None, None, 4)
             .unwrap();
         assert!(p.done && p.processed == 0, "{:?}", p);
         // A continuation whose scope no longer matches the derived scope
@@ -9846,6 +9883,7 @@ mod tests {
                 5,
                 &CacheFreeScope::Prefix("a".into()),
                 Some(other_scope.as_slice()),
+                None,
                 4,
             )
             .unwrap_err();
@@ -9859,6 +9897,129 @@ mod tests {
         // needs a real page proposal and is therefore proven only in the
         // real-raft free-bridge phases (`real_raft_mount_lifecycle`) via
         // the post-barrier hook.
+    }
+
+    /// P4-3 purge fences (gpt56 `2a089d5a` #2): a FRESH walk carrying a
+    /// client-observed binding must match the resolved route EXACTLY —
+    /// mount id AND incarnation. A mismatch is the typed FENCED terminal
+    /// (the purge never deletes a different incarnation than the caller
+    /// observed); a matching binding proceeds; a continuation carrying
+    /// expectations IGNORES them (the token binding is authoritative).
+    #[test]
+    fn test_free_scope_expected_binding_gates() {
+        use crate::master::meta::cache::entry::IncarnationRow;
+
+        let service = build_service("free-scope-expected-binding", chooser(vec![worker(1)]));
+        let install = |svc: &CacheService, mount_id: u32, inc: u64, revoked: bool| {
+            let store = svc.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let mut w = rocks.cache_write();
+            w.put_incarnation(inc, IncarnationRow { mount_id, revoked })
+                .unwrap();
+            w.set_current_incarnation(mount_id, inc).unwrap();
+            w.commit().unwrap();
+        };
+        install(&service, 5, 2, false);
+
+        // Matching binding on a fresh walk proceeds (empty namespace:
+        // resolution semantics only — the unit-test raft barrier fails
+        // closed, so no page is ever proposed).
+        let p = service
+            .remove_free_scope(
+                7,
+                5,
+                &CacheFreeScope::Mount,
+                None,
+                Some(FreeBinding {
+                    mount_id: 5,
+                    incarnation: 2,
+                }),
+                4,
+            )
+            .unwrap();
+        assert!(p.done && p.processed == 0, "{:?}", p);
+
+        // Remount (same mount id, NEW incarnation): the caller's stale
+        // incarnation is the typed FENCED terminal — zero changes.
+        install(&service, 5, 3, false);
+        let err = service
+            .remove_free_scope(
+                7,
+                5,
+                &CacheFreeScope::Mount,
+                None,
+                Some(FreeBinding {
+                    mount_id: 5,
+                    incarnation: 2,
+                }),
+                4,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                curvine_error::FsError::from(err).kind(),
+                curvine_error::ErrorKind::CacheIncarnationFenced
+            ),
+            "stale expected incarnation must fence"
+        );
+
+        // Namespace moved on (DIFFERENT mount id now owns the route):
+        // stale mount id fences even when the incarnation number
+        // happens to collide.
+        install(&service, 6, 2, false);
+        let err = service
+            .remove_free_scope(
+                7,
+                6,
+                &CacheFreeScope::Mount,
+                None,
+                Some(FreeBinding {
+                    mount_id: 5,
+                    incarnation: 2,
+                }),
+                4,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                curvine_error::FsError::from(err).kind(),
+                curvine_error::ErrorKind::CacheIncarnationFenced
+            ),
+            "stale expected mount id must fence"
+        );
+
+        // A CONTINUATION keeps the token binding: expectations are
+        // ignored there, the token itself decides (here: token names the
+        // dead incarnation 2 while the pointer is at 3 → fenced by the
+        // token check, not by the ignored expectations).
+        let stale = FreeContinuation {
+            mount_id: 5,
+            incarnation: 2,
+            scope: CacheFreeScope::Mount,
+            resume_key: "a".into(),
+        }
+        .encode();
+        install(&service, 5, 3, false);
+        let err = service
+            .remove_free_scope(
+                7,
+                5,
+                &CacheFreeScope::Mount,
+                Some(stale.as_slice()),
+                Some(FreeBinding {
+                    mount_id: 5,
+                    incarnation: 3,
+                }),
+                4,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                curvine_error::FsError::from(err).kind(),
+                curvine_error::ErrorKind::CacheIncarnationFenced
+            ),
+            "continuation must stay token-bound"
+        );
     }
 
     /// Free-bridge continuation token codec (RC `6106ab2e` tightening 2):

@@ -217,6 +217,24 @@ impl FsClient {
     }
 
     pub async fn free(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
+        self.free_with_binding(path, recursive, None, None).await
+    }
+
+    /// P4-3 purge fences (gpt56 `2a089d5a` #2): free carrying the
+    /// client-observed mount/incarnation binding. The master validates
+    /// the resolved route EXACTLY on the first page of a fresh walk; a
+    /// mismatch (remount, namespace moved on) is the typed FENCED
+    /// terminal — the purge can never delete a different incarnation
+    /// than the caller observed. Continuation pages keep the
+    /// master-minted token binding; expectations only ride the first
+    /// request. Absent expectations = public Free, unchanged compat.
+    pub async fn free_with_binding(
+        &self,
+        path: &Path,
+        recursive: bool,
+        expected_mount_id: Option<u32>,
+        expected_cache_incarnation: Option<u64>,
+    ) -> FsResult<FreeResult> {
         let encoded = path.encode();
         // Free bridge (task #6, RC `83a05ee8` P0-1 + `6106ab2e`): one
         // public free call drives the cache-mode bounded walk to
@@ -228,6 +246,8 @@ impl FsClient {
                     path,
                     recursive,
                     cache_cursor: cursor,
+                    expected_mount_id,
+                    expected_cache_incarnation,
                 };
                 self.rpc(RpcCode::Free, header).await
             }

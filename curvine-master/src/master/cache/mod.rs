@@ -19,7 +19,7 @@ pub mod cache_service;
 
 pub use self::cache_service::{
     reserved_lease_ms, CacheAllocateResult, CacheBlockLocation, CacheCommitParams, CacheFreeScope,
-    CacheGetResult, CacheOpStatus, CacheService, CacheWorkerChooser, FreeContinuation,
+    CacheGetResult, CacheOpStatus, CacheService, CacheWorkerChooser, FreeBinding, FreeContinuation,
     FreeScopeProgress, PolicyWorkerChooser, ScopeRemoveProgress, MAX_COMMIT_BLOCKS, MAX_KEY_BYTES,
     MAX_LOCATIONS_PER_BLOCK, MUTATION_MAX_PAGES_PER_CALL,
 };
