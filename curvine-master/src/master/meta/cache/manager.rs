@@ -1040,10 +1040,14 @@ impl CacheManager {
         let pointer = store.cache_current_incarnation(mount_id).map_err(cv)?;
 
         let row_exact = row.as_ref() == next_mount && pointer == new_incarnation;
+        // The old row must be THIS mount's revoked row — an incarnation's
+        // mount binding is immutable, so a revoked row belonging to another
+        // mount is corruption, never proof (gpt56 3b1c75a2, same law as
+        // minted_revoked below).
         let old_revoked = match old_incarnation {
             Some(old) => matches!(
                 store.cache_get_incarnation(old).map_err(cv)?,
-                Some(r) if r.revoked
+                Some(r) if r.revoked && r.mount_id == mount_id
             ),
             None => true,
         };
@@ -5022,5 +5026,111 @@ mod tests {
             err
         );
         assert!(store.cache_get_outcome(token(6, 3)).unwrap().is_none());
+    }
+
+    /// gpt56 3b1c75a2: the OLD incarnation row's mount binding is as
+    /// immutable as the minted one's. An exact-target replay whose old row
+    /// was corrupted to belong to ANOTHER mount (still revoked) must be
+    /// loud corruption — never AlreadyApplied, never benign drift.
+    #[test]
+    fn lifecycle_old_row_rebind_is_corruption() {
+        let store = new_store("mlc-old-rebind");
+        let mgr = CacheManager::new();
+
+        // Mount 11: Add (inc 1) then a composite TTL Update (old 1 → new 2).
+        let row_v1 = cache_row(11, "/o-a", 1_000);
+        mgr.apply_mount_lifecycle(
+            &store,
+            token(7, 1),
+            MountLifecycleKind::Add,
+            11,
+            None,
+            None,
+            Some(&row_v1),
+            None,
+            Some(1),
+            1_000,
+        )
+        .unwrap();
+        let row_v2 = cache_row(11, "/o-a", 2_000);
+        let status = mgr
+            .apply_mount_lifecycle(
+                &store,
+                token(7, 2),
+                MountLifecycleKind::Update,
+                11,
+                Some(&row_v1),
+                Some(1),
+                Some(&row_v2),
+                Some(1),
+                Some(2),
+                2_000,
+            )
+            .unwrap();
+        assert_eq!(status, MountLifecycleStatus::Executed);
+
+        // Corrupt ONLY the old row's mount binding: revoked stays true,
+        // row/pointer/new-inc remain the exact target of the Update.
+        {
+            let mut w = store.cache_write();
+            w.put_incarnation(
+                1,
+                IncarnationRow {
+                    mount_id: 99,
+                    revoked: true,
+                },
+            )
+            .unwrap();
+            w.commit().unwrap();
+        }
+
+        let err = mgr
+            .apply_mount_lifecycle(
+                &store,
+                token(7, 2),
+                MountLifecycleKind::Update,
+                11,
+                Some(&row_v1),
+                Some(1),
+                Some(&row_v2),
+                Some(1),
+                Some(2),
+                2_000,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("neither the exact target nor provably superseded"),
+            "corrupted old-row rebind: {}",
+            err
+        );
+
+        // Repair the binding: the same replay self-heals to AlreadyApplied.
+        {
+            let mut w = store.cache_write();
+            w.put_incarnation(
+                1,
+                IncarnationRow {
+                    mount_id: 11,
+                    revoked: true,
+                },
+            )
+            .unwrap();
+            w.commit().unwrap();
+        }
+        let status = mgr
+            .apply_mount_lifecycle(
+                &store,
+                token(7, 2),
+                MountLifecycleKind::Update,
+                11,
+                Some(&row_v1),
+                Some(1),
+                Some(&row_v2),
+                Some(1),
+                Some(2),
+                2_000,
+            )
+            .unwrap();
+        assert_eq!(status, MountLifecycleStatus::AlreadyApplied);
     }
 }
