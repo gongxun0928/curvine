@@ -20,6 +20,7 @@ use curvine_model::{AccessMode, MountOptionsBuilder, WriteType};
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
 use curvine_tests::Testing;
+use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,51 +60,90 @@ fn get_fs_cache_meta() -> (UnifiedFileSystem, Arc<curvine_server::test::MiniClus
 
 #[test]
 fn test_cache_mode() {
-    let fs = get_fs();
+    let (fs, cluster) = get_fs_cache_meta();
+    let master_fs = cluster.get_active_master_fs();
     let rt = fs.clone_runtime();
     rt.block_on(async move {
         mount(&fs, WriteType::CacheMode).await;
 
+        // Capability ruling (gpt56 1a641daf): cache-mode mounts REQUIRE
+        // cache_metadata_enabled — their metadata lives in the master
+        // cache INDEX (dual-mode split), the CV inode tree is never
+        // populated, and reads fall back to UFS.
+
+        let data = Utils::rand_str(4096);
         let path = format!("/write_cache_{:?}/test.log", WriteType::CacheMode).into();
 
-        // Test 1: verify data write is correct
-        write(&fs, &path, false).await;
+        // Test 1: the unified write lands in UFS and reads back intact;
+        // no CV inode exists for a cache-mode path.
+        let mut writer = fs.create(&path, true).await.unwrap();
+        writer.write_string(&data).await.unwrap();
+        writer.complete().await.unwrap();
+        assert!(!fs.cv().exists(&path).await.unwrap());
 
-        // Test 2: resubmit async task (skipped if data already synced); then check UFS mtime unchanged
         let (ufs_path, mnt) = fs
             .get_mount(&path, RpcCode::GetMountInfo)
             .await
             .unwrap()
             .unwrap();
         let ufs = mnt.ufs().unwrap();
-        let ufs_reader_before = ufs.open(&ufs_path).await.unwrap();
-        let mtime_before = ufs_reader_before.status().mtime;
-        drop(ufs_reader_before);
+        assert!(ufs.exists(&ufs_path).await.unwrap());
+        let mount_id = mnt.info.mount_id;
+        let key_ufs = mnt.info.get_ufs_path(&path).unwrap();
+        let key = mnt.info.get_cache_key(&key_ufs).unwrap();
+        let inc = master_fs
+            .cache_service
+            .current_incarnation_for_mount(mount_id)
+            .unwrap()
+            .unwrap();
 
-        fs.async_cache(&path).unwrap();
+        // Test 2: cache loads (resubmits included) never modify the UFS
+        // source. Loads are import-style: the UFS source path is what
+        // schedules the job (a CV-path submit is rejected FileNotFound —
+        // cache-mode paths have no inode).
+        let mtime_before = {
+            let r = ufs.open(&ufs_path).await.unwrap();
+            let m = r.status().mtime;
+            drop(r);
+            m
+        };
+        fs.async_cache(&ufs_path).unwrap();
         fs.wait_job_complete(&path, false).await.unwrap();
-
-        let ufs_reader_after = ufs.open(&ufs_path).await.unwrap();
-        let mtime_after = ufs_reader_after.status().mtime;
-        drop(ufs_reader_after);
+        fs.async_cache(&ufs_path).unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
+        let mtime_after = {
+            let r = ufs.open(&ufs_path).await.unwrap();
+            let m = r.status().mtime;
+            drop(r);
+            m
+        };
         assert_eq!(
             mtime_before, mtime_after,
-            "resubmit should skip, UFS mtime should be unchanged ({} vs {})",
-            mtime_before, mtime_after
+            "cache loads (resubmits included) must not touch the UFS source"
         );
 
-        // Test 3: read cache test
-        let path = format!("/write_cache_{:?}/read_cache.log", WriteType::CacheMode).into();
-
-        // Write file to UFS, then test read
-        let mut writer = fs.create(&path, true).await.unwrap();
-        writer.write_string(Utils::rand_str(1024)).await.unwrap();
-        writer.complete().await.unwrap();
-        test_cache_read(&fs, &path).await;
-
-        // Delete curvine file to simulate expiry
-        fs.cv().delete(&path, false).await.unwrap();
-        test_cache_read(&fs, &path).await;
+        // Test 3: the load committed an index entry; the typed free
+        // expires it (the index-world replacement of the old delete-CV
+        // expiry simulation); reads keep serving the content from UFS.
+        assert!(
+            master_fs
+                .cache_service
+                .get(inc, &key, false)
+                .unwrap()
+                .is_some(),
+            "the load must commit an index entry"
+        );
+        fs.free(&path, false).await.unwrap();
+        assert!(
+            master_fs
+                .cache_service
+                .get(inc, &key, false)
+                .unwrap()
+                .is_none(),
+            "free must expire the index entry"
+        );
+        let mut reader = fs.open(&path).await.unwrap();
+        assert_eq!(reader.read_as_string().await.unwrap(), data);
     });
 }
 
@@ -115,6 +155,9 @@ fn test_cache_mode_recaches_after_lost_worker_cleanup() {
         // master treats it as lost. The next heartbeat leaves enough time for
         // the cache reload while still allowing the mini-cluster to start.
         .mutate_conf(|conf| {
+            // Capability ruling (gpt56 1a641daf): cache-mode mounts REQUIRE
+            // the cache metadata capability.
+            conf.master.cache_metadata_enabled = true;
             conf.master.heartbeat_interval = "10s".to_string();
             conf.master.worker_blacklist_interval = "20s".to_string();
             conf.master.worker_lost_interval = "30s".to_string();
@@ -160,64 +203,144 @@ fn test_cache_mode_recaches_after_lost_worker_cleanup() {
         writer.write_string(data.to_string()).await.unwrap();
         writer.complete().await.unwrap();
 
-        // First read is from UFS and schedules a normal cache load job.
-        let mut miss = fs.open(&cv_path).await.unwrap();
-        assert!(!matches!(miss, UnifiedReader::Fallback(_)));
-        assert_eq!(miss.read_as_string().await.unwrap(), data);
+        // Import-style load (the UFS source schedules the job — the
+        // cache-mode CV path has no inode).
+        fs.async_cache(&source_path).unwrap();
         fs.wait_job_complete(&cv_path, false).await.unwrap();
 
-        let cached = fs.cv().get_block_locations(&cv_path).await.unwrap();
-        assert_eq!(cached.block_locs.len(), 1);
-        assert_eq!(cached.block_locs[0].locs.len(), 1);
-        let lost_worker_id = cached.block_locs[0].locs[0].worker_id;
+        let mount_id = mount.info.mount_id;
+        let key_ufs = mount.info.get_ufs_path(&cv_path).unwrap();
+        let key = mount.info.get_cache_key(&key_ufs).unwrap();
+        let inc = master
+            .cache_service
+            .current_incarnation_for_mount(mount_id)
+            .unwrap()
+            .unwrap();
+        let serving = master
+            .cache_service
+            .get(inc, &key, true)
+            .unwrap()
+            .expect("the load must commit a serving entry");
+        let lost_worker_id = serving.blocks[0].workers[0].worker_id;
 
-        // Match HeartbeatChecker's lost-worker sequence: remove the worker
-        // from placement, then clear its block locations at the master.
+        // Match the lost-worker sequence: remove the worker from
+        // placement, then purge its cache session — the index-world
+        // equivalent of clearing its block locations at the master.
         assert!(master
             .worker_manager
             .write()
             .remove_expired_worker(lost_worker_id)
             .is_some());
-        let cleanup = master.delete_locations(lost_worker_id).unwrap();
-        assert!(cleanup.replication_block_ids.is_empty());
+        master
+            .cache_service
+            .purge_worker_cache_session(lost_worker_id);
 
-        let invalidated = fs.cv().get_status(&cv_path).await.unwrap();
-        assert!(!invalidated.cv_valid(None));
-        assert!(invalidated.ufs_exists());
+        // 4d.2 R9-1: the purged worker's replicas are no longer served —
+        // with the last replica gone the whole object is a miss — while
+        // the row itself stays Valid (retirement is the reconcile path's
+        // job, never a silent downgrade).
+        assert!(
+            master.cache_service.get(inc, &key, true).unwrap().is_none(),
+            "a purged session must not serve replicas"
+        );
+        assert!(
+            master
+                .cache_service
+                .get(inc, &key, false)
+                .unwrap()
+                .is_some(),
+            "the row itself must stay Valid after the session purge"
+        );
 
-        // The next open must be a cache miss: it reads UFS and schedules a
-        // replacement load job. Once that job finishes, Curvine serves the
-        // following read again.
-        let mut reload_miss = fs.open(&cv_path).await.unwrap();
-        assert!(!matches!(reload_miss, UnifiedReader::Fallback(_)));
-        assert_eq!(reload_miss.read_as_string().await.unwrap(), data);
+        // Re-admission: the typed free tombstones the dead-serving entry
+        // and a fresh load re-serves the key. (Automatic reconcile-driven
+        // retirement is covered by the 4d master-lib tests; the E2E seam
+        // proves the user-visible recovery path.)
+        fs.free(&cv_path, false).await.unwrap();
+        assert!(
+            master
+                .cache_service
+                .get(inc, &key, false)
+                .unwrap()
+                .is_none(),
+            "free must tombstone the entry before the reload"
+        );
+        fs.async_cache(&source_path).unwrap();
         fs.wait_job_complete(&cv_path, false).await.unwrap();
+        let recached = master
+            .cache_service
+            .get(inc, &key, true)
+            .unwrap()
+            .expect("the reload must re-serve the key");
+        assert_ne!(
+            recached.blocks[0].workers[0].worker_id, lost_worker_id,
+            "the reload must place replicas on a live worker"
+        );
 
-        let mut reloaded_hit = fs.open(&cv_path).await.unwrap();
-        assert!(matches!(reloaded_hit, UnifiedReader::Fallback(_)));
-        assert_eq!(reloaded_hit.read_as_string().await.unwrap(), data);
+        // The data is intact end-to-end.
+        let mut reader = fs.open(&cv_path).await.unwrap();
+        assert_eq!(reader.read_as_string().await.unwrap(), data);
     });
 }
 
-async fn test_cache_read(fs: &UnifiedFileSystem, path: &Path) {
-    let mut reader1 = fs.open(path).await.unwrap();
-    assert!(
-        !matches!(reader1, UnifiedReader::Cv(_)),
-        "first read should be from ufs"
-    );
+#[test]
+fn test_cache_mode_mount_requires_capability_default_off() {
+    // Capability ruling (gpt56 1a641daf): a visible cache-mode mount
+    // MUST have an authoritative current incarnation, and the
+    // incarnation lifecycle is a default-off capability — so on a
+    // default cluster a CacheMode mount fails CLOSED (never a silent
+    // incarnation-less legacy mount), while an FsMode mount on the very
+    // same cluster is unaffected.
+    let fs = get_fs();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        let ufs_base = env::var("UFS_TEST_PATH").unwrap();
+        let base = Path::from_str(format!("{}/capability_gate", ufs_base)).unwrap();
+        let ufs = UfsFileSystem::new(&base, HashMap::new(), None).unwrap();
+        ufs.mkdir(&base, true).await.unwrap();
 
-    let str1 = reader1.read_as_string().await.unwrap();
+        // CacheMode on the default (capability-off) cluster: fail-closed.
+        let cache_root = Path::from_str("/capability_gate_cache").unwrap();
+        let cache_ufs = Path::from_str(format!("{ufs_base}/capability_gate/cache")).unwrap();
+        let err = fs
+            .mount(
+                &cache_ufs,
+                &cache_root,
+                MountOptionsBuilder::new()
+                    .write_type(WriteType::CacheMode)
+                    .access_mode(AccessMode::ReadWrite)
+                    .build(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cache metadata capability is disabled"),
+            "cache-mode mount must fail closed on a default cluster, got: {}",
+            err
+        );
 
-    fs.wait_job_complete(path, false).await.unwrap();
+        // FsMode on the SAME cluster: fully unaffected.
+        let fs_root = Path::from_str("/capability_gate_fs").unwrap();
+        let fs_ufs = Path::from_str(format!("{ufs_base}/capability_gate/fs")).unwrap();
+        fs.mount(
+            &fs_ufs,
+            &fs_root,
+            MountOptionsBuilder::new()
+                .write_type(WriteType::FsMode)
+                .build(),
+        )
+        .await
+        .unwrap();
 
-    let mut reader2 = fs.open(path).await.unwrap();
-    assert!(
-        matches!(reader2, UnifiedReader::Fallback(_)),
-        "second read should be from curvine via FallbackFsReader"
-    );
-
-    let str2 = reader2.read_as_string().await.unwrap();
-    assert_eq!(str1, str2);
+        let path = Path::from_str("/capability_gate_fs/data.log").unwrap();
+        let data = "fs-mode is unaffected by the cache capability gate";
+        let mut writer = fs.create(&path, true).await.unwrap();
+        writer.write_string(data.to_string()).await.unwrap();
+        writer.complete().await.unwrap();
+        let mut reader = fs.open(&path).await.unwrap();
+        assert_eq!(reader.read_as_string().await.unwrap(), data);
+    });
 }
 
 #[test]
