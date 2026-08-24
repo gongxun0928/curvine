@@ -35,6 +35,28 @@ fn get_fs() -> UnifiedFileSystem {
     testing.get_unified_fs_with_rt(rt.clone()).unwrap()
 }
 
+/// Free bridge (task #6): the master-side typed free lives in the cache
+/// metadata index, so the E2E seam runs with the capability ENABLED
+/// (`master.cache_metadata_enabled` defaults to false). The in-process
+/// master handle is returned so the seam can observe index entries
+/// directly (the bridged free exposes no exact public stats — gpt56
+/// `8336e8a8`).
+fn get_fs_cache_meta() -> (UnifiedFileSystem, Arc<curvine_server::test::MiniCluster>) {
+    let testing = Testing::builder()
+        .workers(1)
+        .mutate_conf(|conf| conf.master.cache_metadata_enabled = true)
+        .build()
+        .unwrap();
+    if env::var("UFS_TEST_PATH").is_err() {
+        env::set_var("UFS_TEST_PATH", testing.ufs_path.clone());
+    }
+
+    let cluster = testing.start_cluster().unwrap();
+    let rt = Arc::new(AsyncRuntime::single());
+    let fs = testing.get_unified_fs_with_rt(rt.clone()).unwrap();
+    (fs, cluster)
+}
+
 #[test]
 fn test_cache_mode() {
     let fs = get_fs();
@@ -243,7 +265,8 @@ fn test_fs_mode() {
 
 #[test]
 fn test_cache_mode_free() {
-    let fs = get_fs();
+    let (fs, cluster) = get_fs_cache_meta();
+    let master_fs = cluster.get_active_master_fs();
     let rt = fs.clone_runtime();
     rt.block_on(async move {
         mount(&fs, WriteType::CacheMode).await;
@@ -259,44 +282,88 @@ fn test_cache_mode_free() {
         writer.write_string(&data).await.unwrap();
         writer.complete().await.unwrap();
 
-        let _ = fs.open(&path).await.unwrap();
-        fs.wait_job_complete(&path, false).await.unwrap();
-
         let (ufs_path, mnt) = fs
             .get_mount(&path, RpcCode::GetMountInfo)
             .await
             .unwrap()
             .unwrap();
         assert!(mnt.ufs().unwrap().exists(&ufs_path).await.unwrap());
-
-        let free_res = fs.free(&path, false).await.unwrap();
-        assert!(
-            free_res.inodes > 0,
-            "cache mode free should report deleted inodes"
-        );
-        assert!(
-            free_res.bytes > 0,
-            "cache mode free should report released bytes"
-        );
-
         assert!(
             !fs.cv().exists(&path).await.unwrap(),
-            "cache mode free should remove Curvine file metadata"
+            "cache-mode metadata lives in the cache index, not the CV inode tree"
+        );
+
+        // Import-style cache load (UFS source): with cache metadata
+        // enabled the dual-mode split tracks cache-mode files in the
+        // master cache INDEX only — a load submitted with the CV path is
+        // rejected FileNotFound because no inode exists, so the load is
+        // sourced from the mount-mapped UFS path exactly as a cache miss
+        // read would.
+        fs.async_cache(&ufs_path).unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
+
+        // The same key derivation the master uses for the typed free
+        // (mount-relative cache key of the mount-mapped UFS path).
+        let mount_id = mnt.info.mount_id;
+        let key_ufs = mnt.info.get_ufs_path(&path).unwrap();
+        let key = mnt.info.get_cache_key(&key_ufs).unwrap();
+        let inc = master_fs
+            .cache_service
+            .current_incarnation_for_mount(mount_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            master_fs
+                .cache_service
+                .get(inc, &key, false)
+                .unwrap()
+                .is_some(),
+            "the write-through mirror must have committed an index entry before the free"
+        );
+
+        // Free bridge (task #6, gpt56 `961e17b5` P0 + `6e4a5599`): the
+        // PUBLIC free on an interior cache-mode path is unconditionally
+        // `FsClient::free` — Free on the wire — and the MASTER routes it
+        // to the typed Key free. The Unified/SDK layer NEVER deletes CV
+        // inodes for a free. The bridge exposes no exact inode/byte
+        // stats (response-loss replay would under-report, gpt56
+        // `8336e8a8`), so the seam observes the INDEX directly.
+        fs.free(&path, false).await.unwrap();
+
+        // The typed free tombstoned the entry: the point read now misses.
+        assert!(
+            master_fs
+                .cache_service
+                .get(inc, &key, false)
+                .unwrap()
+                .is_none(),
+            "free must remove the index entry"
+        );
+        // Never an inode delete, and UFS is untouched.
+        assert!(
+            !fs.cv().exists(&path).await.unwrap(),
+            "free must not create or delete CV inodes"
         );
         assert!(
             mnt.ufs().unwrap().exists(&ufs_path).await.unwrap(),
             "cache mode free must not delete the UFS file"
         );
 
+        // Idempotent re-free of the same exact key: the typed tombstones
+        // make the second walk a no-op that still succeeds.
+        fs.free(&path, false).await.unwrap();
+
+        // The file is still readable end-to-end after the free (straight
+        // from UFS — the content is the contract).
         let mut reader = fs.open(&path).await.unwrap();
-        assert!(!matches!(reader, UnifiedReader::Cv(_)));
         assert_eq!(reader.read_as_string().await.unwrap(), data);
     });
 }
 
 #[test]
 fn test_cache_mode_free_child_with_unified_disabled() {
-    let mut fs = get_fs();
+    let (mut fs, cluster) = get_fs_cache_meta();
+    let master_fs = cluster.get_active_master_fs();
     let rt = fs.clone_runtime();
     rt.block_on(async move {
         mount(&fs, WriteType::CacheMode).await;
@@ -307,35 +374,105 @@ fn test_cache_mode_free_child_with_unified_disabled() {
         let mut writer = fs.create(&path, true).await.unwrap();
         writer.write_string("cache-only free").await.unwrap();
         writer.complete().await.unwrap();
-        let _ = fs.open(&path).await.unwrap();
+        let (child_ufs, _) = fs
+            .get_mount(&path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        fs.async_cache(&child_ufs).unwrap();
         fs.wait_job_complete(&path, false).await.unwrap();
+
+        // A second file directly under the mount root: the PREFIX free
+        // below must NOT touch its entry; the ROOT free afterwards must.
+        let sibling = Path::from_str("/write_cache_CacheMode/cache_only_root_free.log").unwrap();
+        let mut writer = fs.create(&sibling, true).await.unwrap();
+        writer.write_string("cache-only root free").await.unwrap();
+        writer.complete().await.unwrap();
+        let (sibling_ufs, _) = fs
+            .get_mount(&sibling, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        fs.async_cache(&sibling_ufs).unwrap();
+        fs.wait_job_complete(&sibling, false).await.unwrap();
 
         let (ufs_path, mount) = fs
             .get_mount(&path, RpcCode::GetMountInfo)
             .await
             .unwrap()
             .unwrap();
+        let mount_id = mount.info.mount_id;
+        let child_key = {
+            let ufs = mount.info.get_ufs_path(&path).unwrap();
+            mount.info.get_cache_key(&ufs).unwrap()
+        };
+        let sibling_key = {
+            let ufs = mount.info.get_ufs_path(&sibling).unwrap();
+            mount.info.get_cache_key(&ufs).unwrap()
+        };
+        let inc = master_fs
+            .cache_service
+            .current_incarnation_for_mount(mount_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            master_fs
+                .cache_service
+                .get(inc, &child_key, false)
+                .unwrap()
+                .is_some()
+                && master_fs
+                    .cache_service
+                    .get(inc, &sibling_key, false)
+                    .unwrap()
+                    .is_some(),
+            "both write-through mirrors must have committed index entries before the frees"
+        );
 
+        // Unified DISABLED (the old free path branched on the local mount
+        // snapshot here): the unconditional `cv.free` still sends Free
+        // and the master still routes to the typed bridge.
         fs.disable_unified();
-        let free_res = fs.free(&parent, true).await.unwrap();
-        assert!(
-            free_res.inodes > 0,
-            "cache-only cache mode free should report deleted inodes"
-        );
-        assert!(
-            free_res.bytes > 0,
-            "cache-only cache mode free should report released bytes"
-        );
 
-        assert!(!fs.cv().exists(&path).await.unwrap());
+        // Interior PREFIX free (recursive over the parent directory):
+        // the child entry dies, the sibling outside the prefix survives.
+        fs.free(&parent, true).await.unwrap();
+        assert!(
+            master_fs
+                .cache_service
+                .get(inc, &child_key, false)
+                .unwrap()
+                .is_none(),
+            "prefix free must remove the child index entry"
+        );
+        assert!(
+            master_fs
+                .cache_service
+                .get(inc, &sibling_key, false)
+                .unwrap()
+                .is_some(),
+            "prefix free must not touch an entry outside the prefix"
+        );
         assert!(mount.ufs().unwrap().exists(&ufs_path).await.unwrap());
         assert!(
-            fs.cv()
-                .exists(&Path::from_str("/write_cache_CacheMode").unwrap())
-                .await
-                .unwrap(),
-            "free must preserve the cache-mode mount point"
+            !fs.cv().exists(&path).await.unwrap(),
+            "free must not create or delete CV inodes"
         );
+
+        // ROOT free (the mount root itself): the typed Mount scope of the
+        // whole current incarnation — the sibling entry dies, its UFS
+        // file stays.
+        let root = Path::from_str("/write_cache_CacheMode").unwrap();
+        fs.free(&root, true).await.unwrap();
+        assert!(
+            master_fs
+                .cache_service
+                .get(inc, &sibling_key, false)
+                .unwrap()
+                .is_none(),
+            "root free must remove the sibling index entry"
+        );
+        assert!(mount.ufs().unwrap().exists(&sibling_ufs).await.unwrap());
     });
 }
 

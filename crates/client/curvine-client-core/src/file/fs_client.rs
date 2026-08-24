@@ -1031,23 +1031,24 @@ impl FsClient {
 /// one public free call drives the cache-mode bounded walk to done=true.
 /// `send` issues one Free request with the given continuation and returns
 /// the response; the driver echoes the master-minted OPAQUE continuation
-/// verbatim (it never interprets it) and accumulates the per-call removed
-/// counts into `FreeResult::inodes`. A legacy response (no cache_done
-/// field) answers once and exits immediately, byte-for-byte the old
-/// single-shot behavior.
+/// verbatim (it never interprets it). Per-page `cache_removed` is NOT
+/// mapped into the public `FreeResult`: a response-lost page is replayed
+/// by the connector under the same req_id and the replay answers
+/// `processed=0` (S4), so summing it would under-report what actually
+/// completed — there is no durable per-page outcome yet (gpt56 8336e8a8).
+/// A legacy response (no cache_done field) answers once and exits
+/// immediately, byte-for-byte the old single-shot behavior.
 pub(crate) async fn drive_free<S, Fut>(mut send: S) -> FsResult<FreeResult>
 where
     S: FnMut(Option<Vec<u8>>) -> Fut,
     Fut: std::future::Future<Output = FsResult<FreeResponse>>,
 {
     let mut cursor: Option<Vec<u8>> = None;
-    let mut removed: i64 = 0;
     let out = loop {
         let rep = send(cursor.clone()).await?;
         let out = ProtoUtils::free_res_from_pb(rep.res);
         match rep.cache_done {
             Some(false) => {
-                removed += rep.cache_removed.unwrap_or(0);
                 let next = match rep.cache_next_cursor {
                     Some(c) => c,
                     None => {
@@ -1058,15 +1059,10 @@ where
                 };
                 cursor = Some(next);
             }
-            Some(true) => {
-                removed += rep.cache_removed.unwrap_or(0);
-                break out;
-            }
+            Some(true) => break out,
             None => break out,
         }
     };
-    let mut out = out;
-    out.inodes += removed;
     Ok(out)
 }
 
@@ -1133,11 +1129,15 @@ mod tests {
             .block_on(f)
     }
 
-    /// RC `83a05ee8` seam S1: >16384 rows (256 pages x 64) fully consumed
-    /// within ONE public free call — the driver echoes every continuation
-    /// and accumulates every removed count.
+    /// RC `83a05ee8` seam S1 (revised per gpt56 `8336e8a8` to the real RPC
+    /// boundary): the server walks up to 256 pages x 64 rows = 16384 per
+    /// RPC, so a >16384-row namespace takes exactly TWO RPCs — a full
+    /// done=false RPC then the final done=true RPC — within ONE public
+    /// free call. The driver echoes the master-minted continuation
+    /// verbatim and must NOT surface `cache_removed` as an exact public
+    /// stat (response-loss replay answers 0, so the sum under-reports).
     #[test]
-    fn free_drive_consumes_16k_plus_rows_to_done() {
+    fn free_drive_consumes_full_rpc_pages_to_done() {
         block_on_drive(async {
             let mut sends = 0usize;
             let mut seen_cursors: Vec<Option<Vec<u8>>> = Vec::new();
@@ -1145,29 +1145,24 @@ mod tests {
                 sends += 1;
                 seen_cursors.push(cursor.clone());
                 async move {
-                    if sends <= 256 {
-                        Ok(free_rep(
-                            Some(false),
-                            Some(format!("cont-{}", sends).into_bytes()),
-                            Some(64),
-                        ))
+                    if sends == 1 {
+                        // One server RPC is capped at 256 pages x 64 rows.
+                        Ok(free_rep(Some(false), Some(b"cont-1".to_vec()), Some(16384)))
                     } else {
-                        assert_eq!(sends, 257);
+                        assert_eq!(sends, 2);
                         Ok(free_rep(Some(true), None, Some(1)))
                     }
                 }
             })
             .await
             .unwrap();
-            // 256 full pages (16384 rows) + the final 1-row page.
-            assert_eq!(res.inodes, 256 * 64 + 1);
-            assert_eq!(sends, 257);
-            // First call is a fresh start; each later call echoes the
-            // previous response's continuation verbatim.
+            assert_eq!(sends, 2);
+            // Fresh start, then the continuation echoed verbatim.
             assert_eq!(seen_cursors[0], None);
-            for (i, cur) in seen_cursors.iter().enumerate().skip(1) {
-                assert_eq!(cur.as_deref(), Some(format!("cont-{}", i).as_bytes()));
-            }
+            assert_eq!(seen_cursors[1].as_deref(), Some(b"cont-1".as_slice()));
+            // The bridged walk exposes no exact inode/byte stats: the
+            // per-page counts are diagnostics only.
+            assert_eq!(res.inodes, 0);
         });
     }
 

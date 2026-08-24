@@ -344,61 +344,18 @@ impl UnifiedFileSystem {
     }
 
     pub async fn free(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
-        let fut = async {
-            let mount = if self.enable_unified {
-                self.get_mount(path, RpcCode::Free)
-                    .await?
-                    .map(|(_, mount)| mount.info.clone())
-            } else {
-                // Cache-only commands still need the master's hierarchical mount
-                // lookup, but must not initialize or access a UFS client.
-                self.get_mount_info(path).await?
-            };
-
-            match mount {
-                None => err_box!(
-                    "the current path is not mounted to ufs, so the `free` command cannot be executed."
-                ),
-                // Cache mode: drop Curvine metadata and blocks via cv.delete.
-                // UFS is untouched; the returned DeleteResult is converted to
-                // FreeResult so the CLI can report inode/byte stats.
-                Some(mount) if mount.is_cache_mode() => {
-                    self.free_cache_mode(path, &mount, recursive).await
-                }
-                Some(_) => self.cv.free(path, recursive).await,
-            }
-        };
+        // Free bridge (task #6, gpt56 `961e17b5` P0 + `6e4a5599`): the
+        // public Free NEVER branches on the local mount snapshot — the
+        // client always sends Free and the MASTER is the sole
+        // authoritative route: cache-mode paths go to the typed
+        // Key/Prefix/Mount free bound to the current incarnation,
+        // everything else falls to the legacy inode free, all decided
+        // server-side. The Unified/SDK layer NEVER deletes CV inodes for
+        // a free (the old list+`cv.delete` helper is removed).
+        // `FsClient::free` drives the bounded continuation walk to
+        // done=true.
+        let fut = self.cv.free(path, recursive);
         self.track("Free", path.path(), "", fut).await
-    }
-
-    async fn free_cache_mode(
-        &self,
-        path: &Path,
-        mount: &MountInfo,
-        recursive: bool,
-    ) -> FsResult<FreeResult> {
-        let mut total = FreeResult::default();
-
-        if path.path() == mount.cv_path && recursive {
-            for status in self.cv.list_status(path).await? {
-                let child = Path::from_str(status.path)?;
-                match self.cv.delete(&child, true).await {
-                    Ok(res) => {
-                        let res: FreeResult = res.into();
-                        total.inodes += res.inodes;
-                        total.bytes += res.bytes;
-                    }
-                    Err(FsError::FileNotFound(_)) => {}
-                    Err(e) => {
-                        return Err(e);
-                    }
-                }
-            }
-        } else {
-            total = self.cv.delete(path, recursive).await?.into();
-        }
-
-        Ok(total)
     }
 
     pub async fn symlink(&self, target: &str, link: &Path, force: bool) -> FsResult<()> {
