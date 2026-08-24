@@ -348,6 +348,27 @@ pub struct CacheScopeRemoveEntry {
     pub(crate) victims: Vec<ScopeRemoveVictim>,
 }
 
+/// Conditional batch CAS (Free bridge, task #6 P4-0): Mount-scope remove.
+/// The caller's Free resolved the mount's CURRENT incarnation and the
+/// leader paged EVERY key of that one incarnation with the 4c.1 full
+/// entry scan; the apply tombstones each victim exactly like a
+/// scope-remove. Unlike `CacheScopeRemove` there is no scope string: the
+/// scope IS the incarnation (typed Mount branch — an empty prefix string
+/// may never smuggle the full-namespace semantics, gpt56 `9f83a317`).
+/// Historical revoked incarnations are reclaimed by vacuum, never here.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct CacheMountScopeRemoveEntry {
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
+    pub(crate) incarnation: u64,
+    /// The mount the free call bound at resolution (audit + apply-time
+    /// ownership cross-check against the incarnation row).
+    pub(crate) mount_id: u32,
+    /// Strictly ascending by key (a page of the ordered full scan).
+    /// `1..=MUTATION_PAGE_CAP`.
+    pub(crate) victims: Vec<ScopeRemoveVictim>,
+}
+
 /// Conditional batch CAS (4c.2): TTL sweep. The leader paged due expiry
 /// rows with the 4c.1 `cache_scan_expiry(now, cursor)` cursor and journals
 /// the exact expiry-row identities. The apply first exact-CAS-deletes each
@@ -518,6 +539,7 @@ pub enum JournalEntry {
     CacheAbort(CacheAbortEntry),
     CacheReservedReap(CacheReservedReapEntry),
     MountLifecycleV2(MountLifecycleV2Entry),
+    CacheMountScopeRemove(CacheMountScopeRemoveEntry),
 }
 
 impl JournalEntry {
@@ -555,6 +577,7 @@ impl JournalEntry {
             JournalEntry::CacheReservedReap(e) => e.op_id,
             JournalEntry::CacheAbort(e) => e.op_id,
             JournalEntry::MountLifecycleV2(e) => e.op_id,
+            JournalEntry::CacheMountScopeRemove(e) => e.op_id,
         }
     }
 
@@ -592,6 +615,7 @@ impl JournalEntry {
             JournalEntry::CacheReservedReap(e) => e.rpc_id,
             JournalEntry::CacheAbort(e) => e.rpc_id,
             JournalEntry::MountLifecycleV2(e) => e.rpc_id,
+            JournalEntry::CacheMountScopeRemove(e) => e.rpc_id,
         }
     }
 
@@ -647,7 +671,8 @@ impl JournalEntry {
             | JournalEntry::CacheVacuum(_)
             | JournalEntry::CacheOutcomeGc(_)
             | JournalEntry::CacheReservedReap(_)
-            | JournalEntry::MountLifecycleV2(_) => Vec::new(),
+            | JournalEntry::MountLifecycleV2(_)
+            | JournalEntry::CacheMountScopeRemove(_) => Vec::new(),
         }
     }
 
@@ -681,6 +706,7 @@ impl JournalEntry {
                 | JournalEntry::CacheOutcomeGc(_)
                 | JournalEntry::CacheReservedReap(_)
                 | JournalEntry::MountLifecycleV2(_)
+                | JournalEntry::CacheMountScopeRemove(_)
         )
     }
 }
@@ -1380,6 +1406,17 @@ mod tests {
                 }),
                 31,
             ),
+            // Free bridge append: Mount-scope remove at the tail.
+            (
+                JournalEntry::CacheMountScopeRemove(CacheMountScopeRemoveEntry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    incarnation: 1,
+                    mount_id: 5,
+                    victims: vec![],
+                }),
+                32,
+            ),
         ];
 
         for (entry, expected) in cases {
@@ -1400,6 +1437,22 @@ mod tests {
             rpc_id: -7,
             incarnation: 12,
             scope: "/s".into(),
+            victims: vec![ScopeRemoveVictim {
+                key: "/k".into(),
+                expected_generation: 1,
+                new_generation: 2,
+                object_id: crate::master::meta::cache::BlockIdCodec::CACHE_OBJECT_MIN,
+                expire_at: 5000,
+            }],
+        }
+    }
+
+    fn mount_scope_remove_fixture() -> CacheMountScopeRemoveEntry {
+        CacheMountScopeRemoveEntry {
+            op_id: 41,
+            rpc_id: -7,
+            incarnation: 12,
+            mount_id: 3,
             victims: vec![ScopeRemoveVictim {
                 key: "/k".into(),
                 expected_generation: 1,
@@ -1466,6 +1519,7 @@ mod tests {
         const TTL_HEX: &str = "1a0000002900000000000000f9ffffffffffffff8813000000000000010000000000000088130000000000000c00000000000000000000004000000002000000000000002f6b0100000000000000";
         const VACUUM_HEX: &str = "1b0000002900000000000000f9ffffffffffffff0c0000000000000003000000010000000000000002000000000000002f6b010000000000000000000000400000008813000000000000";
         const GC_HEX: &str = "1c0000002900000000000000f9ffffffffffffff010000000000000063000000000000000700000000000000020000000000000001000000000000000200000000000000";
+        const MOUNT_SCOPE_HEX: &str = "200000002900000000000000f9ffffffffffffff0c0000000000000003000000010000000000000002000000000000002f6b0100000000000000020000000000000000000000400000008813000000000000";
 
         // Round-trip each literal: encode == frozen bytes, decode keeps
         // the variant and every frozen field.
@@ -1532,6 +1586,26 @@ mod tests {
             }
             other => panic!("gc bytes crosswalked to {:?}", other),
         }
+
+        // Free bridge (task #6): the Mount-scope batch freezes the same
+        // way — discriminant 0x20 (32), strictly above every prior
+        // variant, so an old binary rejects it loudly.
+        let bytes = SerdeUtils::serialize(&JournalEntry::CacheMountScopeRemove(
+            mount_scope_remove_fixture(),
+        ))
+        .unwrap();
+        assert_eq!(hex_encode(&bytes), MOUNT_SCOPE_HEX);
+        match SerdeUtils::deserialize::<JournalEntry>(&bytes).unwrap() {
+            JournalEntry::CacheMountScopeRemove(e) => {
+                assert_eq!(
+                    (e.op_id, e.rpc_id, e.incarnation, e.mount_id),
+                    (41, -7, 12, 3)
+                );
+                assert_eq!(e.victims.len(), 1);
+                assert_eq!(e.victims[0].key, "/k");
+            }
+            other => panic!("mount scope bytes crosswalked to {:?}", other),
+        }
     }
 
     /// A journal segment mixing pre-4b, 4b, and 4c.2 entries must decode
@@ -1543,21 +1617,23 @@ mod tests {
             JournalEntry::CacheIncarnationAllocate(legacy_allocate_fixture()),
             JournalEntry::CacheIncarnationAllocateV2(v2_allocate_fixture()),
             JournalEntry::CacheScopeRemove(scope_remove_fixture()),
+            JournalEntry::CacheMountScopeRemove(mount_scope_remove_fixture()),
             JournalEntry::CacheTtlSweep(ttl_sweep_fixture()),
             JournalEntry::CacheVacuum(vacuum_fixture()),
             JournalEntry::CacheOutcomeGc(outcome_gc_fixture()),
         ];
         let bytes = SerdeUtils::serialize(&mixed).unwrap();
         let back: Vec<JournalEntry> = SerdeUtils::deserialize(&bytes).unwrap();
-        assert_eq!(back.len(), 6);
+        assert_eq!(back.len(), 7);
         assert!(matches!(back[0], JournalEntry::CacheIncarnationAllocate(_)));
         assert!(matches!(
             back[1],
             JournalEntry::CacheIncarnationAllocateV2(_)
         ));
         assert!(matches!(back[2], JournalEntry::CacheScopeRemove(_)));
-        assert!(matches!(back[3], JournalEntry::CacheTtlSweep(_)));
-        assert!(matches!(back[4], JournalEntry::CacheVacuum(_)));
-        assert!(matches!(back[5], JournalEntry::CacheOutcomeGc(_)));
+        assert!(matches!(back[3], JournalEntry::CacheMountScopeRemove(_)));
+        assert!(matches!(back[4], JournalEntry::CacheTtlSweep(_)));
+        assert!(matches!(back[5], JournalEntry::CacheVacuum(_)));
+        assert!(matches!(back[6], JournalEntry::CacheOutcomeGc(_)));
     }
 }

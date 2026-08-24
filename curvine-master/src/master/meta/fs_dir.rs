@@ -1115,6 +1115,10 @@ impl FsDir {
                 self.cache
                     .apply_scope_remove(store, e.incarnation, &e.scope, &e.victims)
             }
+            JournalEntry::CacheMountScopeRemove(e) => {
+                self.cache
+                    .apply_mount_scope_remove(store, e.incarnation, e.mount_id, &e.victims)
+            }
             JournalEntry::CacheTtlSweep(e) => self.cache.apply_ttl_sweep(store, e.now, &e.victims),
             JournalEntry::CacheVacuum(e) => {
                 self.cache

@@ -272,6 +272,7 @@ impl JournalLoader {
                 | JournalEntry::CacheReservedReap(_)
                 | JournalEntry::CacheIncarnationAllocateV2(_)
                 | JournalEntry::CacheScopeRemove(_)
+                | JournalEntry::CacheMountScopeRemove(_)
                 | JournalEntry::CacheTtlSweep(_)
                 | JournalEntry::CacheVacuum(_)
                 | JournalEntry::CacheOutcomeGc(_) => (),
@@ -2135,14 +2136,21 @@ mod tests {
                 })
                 .count()
         };
-        for phase in ["1", "2"] {
+        for phase in ["1", "2", "3"] {
+            // Phase 3 is a fresh-format free-bridge run: its own meta and
+            // journal dirs so the phase-1/2 lifecycle state never bleeds in.
+            let (phase_meta, phase_journal) = if phase == "3" {
+                (format!("{}/meta-3", base), format!("{}/journal-3", base))
+            } else {
+                (meta_dir.clone(), journal_dir.clone())
+            };
             let output = std::process::Command::new(&exe)
                 .arg("--exact")
                 .arg("master::journal::journal_loader::tests::real_raft_mount_lifecycle")
                 .env(leader_mode_env, "1")
                 .env(phase_env, phase)
-                .env(meta_dir_env, &meta_dir)
-                .env(journal_dir_env, &journal_dir)
+                .env(meta_dir_env, &phase_meta)
+                .env(journal_dir_env, &phase_journal)
                 .output()
                 .unwrap_or_else(|e| panic!("spawn mlc-leader phase {} failed: {}", phase, e));
             assert!(
@@ -2158,16 +2166,29 @@ mod tests {
             // must propose nothing either: its log holds either the same
             // nine entries (no compaction) or none (startup snapshot
             // purged the applied prefix); any OTHER count means a new
-            // proposal.
-            let count = count_data_entries(&journal_dir);
-            if phase == "1" {
-                assert_eq!(count, 9, "unexpected journal entry count after phase 1");
-            } else {
-                assert!(
-                    count == 0 || count == 9,
-                    "phase 2 must propose nothing (found {} data entries)",
+            // proposal. Phase 3 (fresh format, own dirs) must propose
+            // EXACTLY the seven free-bridge entries: the auto-Mkdir of the
+            // fresh cv path, composite Add, Key free, Prefix free, the
+            // fenced Mount call's first page, and the two completion
+            // pages — the same-cursor retry proposes nothing.
+            if phase == "3" {
+                let count = count_data_entries(&phase_journal);
+                assert_eq!(
+                    count, 7,
+                    "phase 3 must propose exactly the seven free-bridge entries (found {})",
                     count
                 );
+            } else {
+                let count = count_data_entries(&journal_dir);
+                if phase == "1" {
+                    assert_eq!(count, 9, "unexpected journal entry count after phase 1");
+                } else {
+                    assert!(
+                        count == 0 || count == 9,
+                        "phase 2 must propose nothing (found {} data entries)",
+                        count
+                    );
+                }
             }
         }
 
@@ -2195,7 +2216,9 @@ mod tests {
         journal.journal_dir = journal_dir;
         let conf = ClusterConf {
             testing: true,
-            format_master: phase == "1",
+            // Phase 3 is its own fresh-format run (the parent gives it
+            // dedicated meta/journal dirs).
+            format_master: phase != "2",
             journal,
             master: MasterConf {
                 meta_dir,
@@ -2279,6 +2302,170 @@ mod tests {
                 .ttl_ms(7_200_000)
                 .build()
         };
+
+        if phase == "3" {
+            // Free bridge (task #6 P4-0 follow-up, gpt56 `fdbe3786`): the
+            // typed Key/Prefix/Mount free driver over REAL raft — victim
+            // journaling through the production writer/apply worker, the
+            // exact-CAS apply, the MID-PAGE fence terminal, and the
+            // same-cursor retry zero-growth. Fresh format with dedicated
+            // dirs; the parent asserts EXACTLY seven data entries (the
+            // auto-Mkdir of the cv path, composite Add, Key free, Prefix
+            // free, the fenced first page, two completion pages).
+            use crate::master::cache::CacheFreeScope;
+            use crate::master::meta::cache::{CacheEntry, CacheEntryState, IncarnationRow};
+
+            let cvf = "/p4mlcF";
+            let ufsf = "file:///tmp/p4-mlc-f";
+            mount_manager
+                .mount_with_token(
+                    None,
+                    cvf,
+                    ufsf,
+                    &add_opts(),
+                    Some(OpToken {
+                        client_id: 200,
+                        op_seq: 1,
+                    }),
+                    71,
+                )
+                .unwrap();
+            let mid = mount_manager
+                .get_mount_info(&Path::from_str(cvf).unwrap())
+                .unwrap()
+                .unwrap()
+                .mount_id;
+            {
+                let store = fs_dir.read();
+                let rocks = store.get_rocks_store();
+                assert_eq!(rocks.cache_current_incarnation(mid).unwrap(), Some(1));
+            }
+
+            // Direct-seed the incarnation-1 namespace (the scan surface the
+            // driver pages; the committed apply runs the exact CAS whatever
+            // wrote the row). 134 keys in byte order: "f" < "f/child" <
+            // "m000".."m129" < "pfx/a" < "pfx/b".
+            let mut keys: Vec<String> = vec!["f".into(), "f/child".into()];
+            for i in 0..130 {
+                keys.push(format!("m{:03}", i));
+            }
+            keys.push("pfx/a".into());
+            keys.push("pfx/b".into());
+            {
+                let store = fs_dir.read();
+                let rocks = store.get_rocks_store();
+                let mut w = rocks.cache_write();
+                for (i, k) in keys.iter().enumerate() {
+                    w.put_entry(
+                        1,
+                        k,
+                        &CacheEntry {
+                            generation: 1,
+                            state: CacheEntryState::Valid,
+                            object_id: BlockIdCodec::CACHE_OBJECT_MIN + i as i64,
+                            len: 128,
+                            ufs_mtime: 1,
+                            block_size: 64,
+                            expire_at: 0,
+                        },
+                    )
+                    .unwrap();
+                }
+                w.commit().unwrap();
+            }
+            let entry_state = |key: &str| {
+                let store = fs_dir.read();
+                let rocks = store.get_rocks_store();
+                let e = rocks.cache_get_entry(1, key).unwrap().unwrap();
+                (e.state, e.generation)
+            };
+
+            // Key free: EXACT point read — "f" only, never its family.
+            let p = cache
+                .remove_free_scope(72, mid, &CacheFreeScope::Key("f".into()), None, 4)
+                .unwrap();
+            assert!(p.done && p.processed == 1, "{:?}", p);
+            assert_eq!(entry_state("f"), (CacheEntryState::Tombstoned, 2));
+            assert_eq!(entry_state("f/child"), (CacheEntryState::Valid, 1));
+
+            // Prefix free: the "pfx" family only.
+            let p = cache
+                .remove_free_scope(73, mid, &CacheFreeScope::Prefix("pfx".into()), None, 4)
+                .unwrap();
+            assert!(p.done && p.processed == 2, "{:?}", p);
+            assert_eq!(entry_state("pfx/a"), (CacheEntryState::Tombstoned, 2));
+            assert_eq!(entry_state("pfx/b"), (CacheEntryState::Tombstoned, 2));
+
+            // Mid-page fence (`fdbe3786`): the pointer moves to a fresh
+            // incarnation 2 INSIDE the first page's post-barrier hook. The
+            // call is bound to (mid, 1, Mount) — page 2 must TERMINATE with
+            // the typed fenced error, never auto re-resolve + continue.
+            let hook_fs_dir = fs_dir.clone();
+            cache.set_barrier_hook(Box::new(move || {
+                let store = hook_fs_dir.read();
+                let rocks = store.get_rocks_store();
+                let mut w = rocks.cache_write();
+                w.put_incarnation(
+                    2,
+                    IncarnationRow {
+                        mount_id: mid,
+                        revoked: false,
+                    },
+                )
+                .unwrap();
+                w.set_current_incarnation(mid, 2).unwrap();
+                w.commit().unwrap();
+            }));
+            let err = cache
+                .remove_free_scope(74, mid, &CacheFreeScope::Mount, None, 16)
+                .unwrap_err();
+            let wire_err = FsError::from(err);
+            assert!(
+                matches!(
+                    wire_err.kind(),
+                    curvine_error::ErrorKind::CacheIncarnationFenced
+                ),
+                "mid-page fence must be the typed terminal: {}",
+                wire_err
+            );
+            // Page 1 applied (63 victims incl. "f/child"); page 2 never ran.
+            assert_eq!(entry_state("m000"), (CacheEntryState::Tombstoned, 2));
+            assert_eq!(entry_state("m061"), (CacheEntryState::Tombstoned, 2));
+            assert_eq!(entry_state("m062"), (CacheEntryState::Valid, 1));
+
+            // The CALLER's next free re-resolves (cross-call, `fdbe3786`):
+            // restore the pointer and complete the incarnation free — two
+            // more pages journal (page 1 of this call is all-tombstone and
+            // proposes nothing).
+            {
+                let store = fs_dir.read();
+                let rocks = store.get_rocks_store();
+                let mut w = rocks.cache_write();
+                w.set_current_incarnation(mid, 1).unwrap();
+                w.commit().unwrap();
+            }
+            let p = cache
+                .remove_free_scope(75, mid, &CacheFreeScope::Mount, None, 16)
+                .unwrap();
+            assert!(p.done, "{:?}", p);
+            assert_eq!(p.processed, 68);
+            for i in [0usize, 62, 125, 126, 129] {
+                assert_eq!(
+                    entry_state(&format!("m{:03}", i)),
+                    (CacheEntryState::Tombstoned, 2)
+                );
+            }
+
+            // Same-cursor retry (response loss): every row the retry pages
+            // is tombstoned — it journals NOTHING and never inflates a
+            // generation (the parent re-asserts the entry count).
+            let p = cache
+                .remove_free_scope(76, mid, &CacheFreeScope::Mount, Some("m062"), 16)
+                .unwrap();
+            assert!(p.done && p.processed == 0, "{:?}", p);
+
+            std::process::exit(0);
+        }
 
         if phase == "2" {
             // Production startup rebuilds the live mount table from the

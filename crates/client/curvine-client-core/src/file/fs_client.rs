@@ -220,6 +220,9 @@ impl FsClient {
         let header = FreeRequest {
             path: path.encode(),
             recursive,
+            // Free bridge (task #6): the plain client free never paginates;
+            // the cache-mode continuation binding lands with P4-1.
+            cache_cursor: None,
         };
 
         let rep: FreeResponse = self.rpc(RpcCode::Free, header).await?;

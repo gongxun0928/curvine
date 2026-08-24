@@ -265,19 +265,113 @@ impl MasterHandler {
         let header: FreeRequest = ctx.parse_header()?;
         ctx.set_audit(Some(header.path.to_string()), None);
 
-        let res = self.free0(ctx.msg.req_id(), header)?;
-        ctx.response(FreeResponse {
+        let (res, cache) = self.free0(ctx.msg.req_id(), header)?;
+        let mut rep = FreeResponse {
             res: ProtoUtils::free_res_to_pb(res),
-        })
+            ..Default::default()
+        };
+        // Free bridge: echo the bounded-driver continuation only when the
+        // request routed to the cache domain. The legacy inode path leaves
+        // every optional field absent.
+        if let Some(p) = cache {
+            rep.cache_done = Some(p.done);
+            rep.cache_next_cursor = if p.done { None } else { p.cursor };
+            rep.cache_removed = Some(p.processed as i64);
+        }
+        ctx.response(rep)
     }
 
-    pub fn free0(&self, req_id: i64, header: FreeRequest) -> FsResult<FreeResult> {
-        if self.check_is_retry(req_id)? {
-            return Ok(FreeResult::default());
+    /// Free bridge (task #6 P4-0, gpt56 `92883fff`/`fdbe3786`): a Free
+    /// on a cache-mode mount path NEVER touches the inode tree — it is a
+    /// typed Key/Prefix/Mount `remove_free_scope` bound to the mount's
+    /// current incarnation, with a bounded cursor/continuation on the
+    /// wire. Every other path (no mount, fs-mode mount) keeps the legacy
+    /// inode free exactly as before.
+    ///
+    /// The cache branch does NOT use the legacy retry-cache Success
+    /// short-circuit: that path would answer a same-req_id retry with an
+    /// empty FreeResult and DROP the done/cursor continuation. The
+    /// bounded driver is idempotent at the (cursor, victim-CAS) level — a
+    /// retry re-derives the same page and journals nothing new — so the
+    /// continuation survives response loss without a cached response.
+    pub fn free0(
+        &self,
+        req_id: i64,
+        header: FreeRequest,
+    ) -> FsResult<(
+        FreeResult,
+        Option<crate::master::cache::ScopeRemoveProgress>,
+    )> {
+        if let Ok(path) = Path::from_str(&header.path) {
+            if path.is_cv() {
+                if let Some(info) = self.mount_manager.get_mount_info(&path)? {
+                    if info.is_cache_mode() {
+                        let scope = Self::cache_free_scope(&info, &path, header.recursive)?;
+                        let progress = self.fs.cache_service.remove_free_scope(
+                            req_id,
+                            info.mount_id,
+                            &scope,
+                            header.cache_cursor.as_deref(),
+                            crate::master::cache::MUTATION_MAX_PAGES_PER_CALL,
+                        )?;
+                        return Ok((FreeResult::default(), Some(progress)));
+                    }
+                }
+            }
         }
 
+        if self.check_is_retry(req_id)? {
+            return Ok((FreeResult::default(), None));
+        }
         let res = self.fs.free(&header.path, header.recursive);
-        self.set_req_cache(req_id, res)
+        let res = self.set_req_cache(req_id, res)?;
+        Ok((res, None))
+    }
+
+    /// Derive the typed cache free scope from the request (gpt56
+    /// `9f83a317` q1): the mount root is the typed Mount branch; an
+    /// internal cv path maps through the mount to its mount-relative
+    /// cache key (`get_ufs_path` + `get_cache_key`, the same derivation
+    /// as the load tasks / future client routing), with
+    /// `recursive=false` = exact Key and `recursive=true` = the prefix
+    /// family. A non-root path can never legally derive an empty key —
+    /// that would smuggle the Mount branch and fails closed.
+    fn cache_free_scope(
+        info: &curvine_model::MountInfo,
+        path: &Path,
+        recursive: bool,
+    ) -> FsResult<crate::master::cache::CacheFreeScope> {
+        if path.path() == info.cv_path {
+            return Ok(crate::master::cache::CacheFreeScope::Mount);
+        }
+        // Fail-closed guard on the mount mapping: `get_ufs_path`'s
+        // `replacen` silently no-ops on a path outside the cv root (it
+        // would derive a bogus key under this mount), so the prefix
+        // contract is asserted here. The mount table already resolves
+        // only covered paths; this makes the derivation self-contained.
+        if !path.path().starts_with(&info.cv_path) {
+            return err_box!(
+                "cache free path {} is not under mount {} root {}",
+                path.full_path(),
+                info.mount_id,
+                info.cv_path
+            );
+        }
+        let ufs_path = info.get_ufs_path(path)?;
+        let key = info.get_cache_key(&ufs_path)?;
+        if key.is_empty() {
+            return err_box!(
+                "cache free path {} derives an empty cache key under mount {} ({}); only the mount root may free the whole incarnation",
+                path.full_path(),
+                info.mount_id,
+                info.cv_path
+            );
+        }
+        Ok(if recursive {
+            crate::master::cache::CacheFreeScope::Prefix(key)
+        } else {
+            crate::master::cache::CacheFreeScope::Key(key)
+        })
     }
 
     pub fn rename0(&self, req_id: i64, header: RenameRequest) -> FsResult<bool> {
@@ -1596,6 +1690,63 @@ mod tests {
     use std::sync::{Arc, Condvar, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    /// Free bridge scope derivation (task #6, gpt56 `9f83a317` q1): the
+    /// mount root maps to the typed Mount branch; an internal path maps
+    /// through the mount to the mount-relative cache key with
+    /// recursive=false = exact Key and recursive=true = prefix family.
+    /// A non-root path deriving an empty key is fail-closed (never a
+    /// smuggled Mount).
+    #[test]
+    fn cache_free_scope_typed_derivation() {
+        use crate::master::cache::CacheFreeScope;
+        use curvine_model::{AccessMode, MountOptions, WriteType};
+
+        let info = MountOptions::builder()
+            .write_type(WriteType::CacheMode)
+            .access_mode(AccessMode::ReadOnly)
+            .write_cache(false)
+            .build()
+            .to_info(7, "/mnt", "file:///ufs/root");
+
+        // The mount root itself: the typed Mount branch (the WHOLE current
+        // incarnation), regardless of recursive.
+        for recursive in [false, true] {
+            let path = Path::from_str("/mnt").unwrap();
+            assert_eq!(
+                MasterHandler::cache_free_scope(&info, &path, recursive).unwrap(),
+                CacheFreeScope::Mount
+            );
+        }
+
+        // An internal file: mount-relative key "dir/a.csv"; the exact Key
+        // for recursive=false, the prefix family for recursive=true.
+        let path = Path::from_str("/mnt/dir/a.csv").unwrap();
+        assert_eq!(
+            MasterHandler::cache_free_scope(&info, &path, false).unwrap(),
+            CacheFreeScope::Key("dir/a.csv".into())
+        );
+        assert_eq!(
+            MasterHandler::cache_free_scope(&info, &path, true).unwrap(),
+            CacheFreeScope::Prefix("dir/a.csv".into())
+        );
+
+        // A directory free: the prefix family of the mount-relative path.
+        let path = Path::from_str("/mnt/dir").unwrap();
+        assert_eq!(
+            MasterHandler::cache_free_scope(&info, &path, true).unwrap(),
+            CacheFreeScope::Prefix("dir".into())
+        );
+        assert_eq!(
+            MasterHandler::cache_free_scope(&info, &path, false).unwrap(),
+            CacheFreeScope::Key("dir".into())
+        );
+
+        // A path OUTSIDE the ufs mapping contract is loud, not a guess:
+        // get_ufs_path rejects a path that is not under the cv root.
+        let outside = Path::from_str("/other/x").unwrap();
+        assert!(MasterHandler::cache_free_scope(&info, &outside, true).is_err());
+    }
 
     #[test]
     fn process_worker_heartbeat_stores_worker_report_fields() {

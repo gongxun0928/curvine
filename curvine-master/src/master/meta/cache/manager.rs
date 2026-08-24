@@ -1975,14 +1975,24 @@ impl CacheManager {
     /// Validate a scope-remove page: length bound, strictly ascending keys
     /// (a page of the ordered key scan), adjacent generations, and
     /// cache-domain object ids.
-    fn validate_scope_victims(scope: &str, victims: &[ScopeRemoveVictim]) -> CommonResult<()> {
+    /// Validate a scope-remove victim page. `scope` is the prefix family
+    /// (`Some`) or the Mount branch (`None`): a Mount page spans the whole
+    /// incarnation, so there is no per-key membership predicate — every key
+    /// of the incarnation is in scope by definition and an empty-prefix
+    /// stand-in is never accepted (gpt56 `9f83a317` q1).
+    fn validate_scope_victims(
+        scope: Option<&str>,
+        victims: &[ScopeRemoveVictim],
+    ) -> CommonResult<()> {
         validate_page_len(victims.len()).map_err(cv)?;
-        if scope.len() > MAX_CACHE_KEY_BYTES {
-            return err_box!(
-                "cache scope remove scope exceeds {} bytes: {}",
-                MAX_CACHE_KEY_BYTES,
-                scope.len()
-            );
+        if let Some(scope) = scope {
+            if scope.len() > MAX_CACHE_KEY_BYTES {
+                return err_box!(
+                    "cache scope remove scope exceeds {} bytes: {}",
+                    MAX_CACHE_KEY_BYTES,
+                    scope.len()
+                );
+            }
         }
         for (i, v) in victims.iter().enumerate() {
             if v.key.len() > MAX_CACHE_KEY_BYTES {
@@ -1994,12 +2004,14 @@ impl CacheManager {
             }
             // Scope membership (review 303fb807 P0-3): a /a scope batch may
             // never name keys outside /a, whatever the journal claims.
-            if !key_in_scope(&v.key, scope) {
-                return err_box!(
-                    "cache scope remove victim {} is outside scope {}",
-                    v.key,
-                    scope
-                );
+            if let Some(scope) = scope {
+                if !key_in_scope(&v.key, scope) {
+                    return err_box!(
+                        "cache scope remove victim {} is outside scope {}",
+                        v.key,
+                        scope
+                    );
+                }
             }
             if v.expected_generation < 1 {
                 return err_box!(
@@ -2049,7 +2061,7 @@ impl CacheManager {
         if scope.is_empty() {
             return err_box!("cache scope remove scope must be a non-empty prefix path");
         }
-        Self::validate_scope_victims(scope, victims)?;
+        Self::validate_scope_victims(Some(scope), victims)?;
 
         // Apply-time incarnation fence (4b): same terminal semantics as a
         // single-key remove.
@@ -2057,6 +2069,63 @@ impl CacheManager {
             return Ok(());
         }
 
+        self.apply_scope_victims_cas(store, incarnation, victims)
+    }
+
+    /// Conditional batch CAS (Free bridge, task #6 P4-0): Mount-scope
+    /// remove — the victims are one page of the CURRENT incarnation's FULL
+    /// key scan. Identical per-victim exact CAS as a prefix scope-remove;
+    /// the differences are the validation (no prefix membership — every key
+    /// of the incarnation is in scope) and an ownership cross-check: the
+    /// live incarnation row must belong to the mount the free call bound,
+    /// whatever the journal claims. A fenced incarnation is the same
+    /// whole-batch deterministic no-op (the rows die with their namespace,
+    /// reclaimed by vacuum).
+    pub fn apply_mount_scope_remove<S: LocalCacheIndexStore>(
+        &self,
+        store: &S,
+        incarnation: u64,
+        mount_id: u32,
+        victims: &[ScopeRemoveVictim],
+    ) -> CommonResult<()> {
+        validate_incarnation(incarnation)?;
+        Self::validate_scope_victims(None, victims)?;
+
+        if !Self::incarnation_active(store, incarnation)? {
+            return Ok(());
+        }
+        match store.cache_get_incarnation(incarnation).map_err(cv)? {
+            Some(row) if row.mount_id == mount_id => {}
+            Some(row) => {
+                return err_box!(
+                "mount scope remove incarnation {} belongs to mount {}, not the claimed mount {}",
+                incarnation,
+                row.mount_id,
+                mount_id
+            )
+            }
+            None => {
+                return err_box!(
+                    "mount scope remove incarnation {} has no incarnation row",
+                    incarnation
+                )
+            }
+        }
+
+        self.apply_scope_victims_cas(store, incarnation, victims)
+    }
+
+    /// The shared per-victim exact CAS of a scope-remove apply: for each
+    /// victim, `any@expected -> Tombstoned@new` against the authoritative
+    /// entry (missing/stale/advanced = deterministic no-op; identity
+    /// mismatch = loud divergence), plus the expiry-row and object-row
+    /// deletes of each applied tombstone.
+    fn apply_scope_victims_cas<S: LocalCacheIndexStore>(
+        &self,
+        store: &S,
+        incarnation: u64,
+        victims: &[ScopeRemoveVictim],
+    ) -> CommonResult<()> {
         let mut w = store.cache_write();
         for v in victims {
             let cur = match store.cache_get_entry(incarnation, &v.key).map_err(cv)? {
@@ -3868,6 +3937,88 @@ mod tests {
             .is_err());
         bomb.sort_by(|a, b| b.key.cmp(&a.key));
         assert!(mgr.apply_scope_remove(&store, 1, "/a", &bomb[1..]).is_err());
+    }
+
+    /// Free bridge (task #6): Mount-scope remove — the victims span the
+    /// WHOLE incarnation (no prefix membership predicate), the live
+    /// incarnation row must belong to the mount the entry claims, and a
+    /// fenced incarnation is the same whole-batch no-op as a prefix
+    /// scope-remove.
+    #[test]
+    fn test_apply_mount_scope_remove_cas_ownership_fence() {
+        let store = new_store("mount-scope-remove");
+        let mgr = CacheManager::new();
+
+        // Incarnation 3 of mount 7: keys across unrelated prefixes.
+        seed_committed(&store, &mgr, 7, 3, "a", OBJ, 300, 5000);
+        seed_committed(&store, &mgr, 7, 3, "b/y", OBJ + 1, 400, 0);
+        seed_committed(&store, &mgr, 7, 3, "c/z/w", OBJ + 2, 500, 6000);
+        // Installing incarnation 4 moves the mount pointer: 3 is fenced.
+        seed_committed(&store, &mgr, 7, 4, "a", OBJ + 3, 600, 0);
+
+        // Fenced (pointer moved past 3): whole-batch no-op even though the
+        // victims are exact — the rows die with their namespace, reclaimed
+        // by vacuum.
+        mgr.apply_mount_scope_remove(&store, 3, 7, &[scope_victim("a", 1, OBJ, 5000)])
+            .unwrap();
+        assert_eq!(
+            store.cache_get_entry(3, "a").unwrap().unwrap().state,
+            CacheEntryState::Valid
+        );
+
+        // Live incarnation but the entry claims ANOTHER mount: loud, zero
+        // writes — the ownership cross-check is a forged-entry guard.
+        let err = mgr
+            .apply_mount_scope_remove(&store, 4, 9, &[scope_victim("a", 1, OBJ + 3, 0)])
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("belongs to mount 7, not the claimed mount 9"),
+            "expected ownership error, got: {}",
+            err
+        );
+        assert_eq!(
+            store.cache_get_entry(4, "a").unwrap().unwrap().state,
+            CacheEntryState::Valid
+        );
+
+        // Exact page over the whole live incarnation 4: tombstone applies.
+        mgr.apply_mount_scope_remove(&store, 4, 7, &[scope_victim("a", 1, OBJ + 3, 0)])
+            .unwrap();
+        let e = store.cache_get_entry(4, "a").unwrap().unwrap();
+        assert_eq!((e.state, e.generation), (CacheEntryState::Tombstoned, 2));
+
+        // Same-page replay is an exact-tombstone no-op.
+        mgr.apply_mount_scope_remove(&store, 4, 7, &[scope_victim("a", 1, OBJ + 3, 0)])
+            .unwrap();
+
+        // Missing victim (stale page): deterministic no-op.
+        mgr.apply_mount_scope_remove(&store, 4, 7, &[scope_victim("gone", 1, OBJ + 9, 0)])
+            .unwrap();
+        assert!(store.cache_get_entry(4, "gone").unwrap().is_none());
+
+        // Identity divergence at the same generation: loud.
+        assert!(mgr
+            .apply_mount_scope_remove(&store, 4, 7, &[scope_victim("a", 1, OBJ + 99, 0)])
+            .is_err());
+
+        // Unsorted page / non-adjacent generations still rejected (the
+        // shared validation runs for the Mount branch too).
+        assert!(mgr
+            .apply_mount_scope_remove(
+                &store,
+                4,
+                7,
+                &[
+                    scope_victim("a", 1, OBJ + 3, 0),
+                    scope_victim("a", 1, OBJ + 3, 0)
+                ]
+            )
+            .is_err());
+        // A Mount page accepts victims with NO common prefix (unlike the
+        // prefix branch): unrelated keys in one batch are legal here —
+        // proven above by ("a" vs "b/y" vs "c/z/w") lineage and the
+        // "gone" victim.
     }
 
     #[test]

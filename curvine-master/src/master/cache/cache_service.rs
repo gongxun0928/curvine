@@ -65,9 +65,9 @@ use crate::master::fs::policy::ChooseContext;
 use crate::master::fs::WorkerManager;
 use crate::master::journal::{
     CacheAbortEntry, CacheAllocateEntry, CacheCommitEntry, CacheIdReserveEntry,
-    CacheIncarnationAllocateV2Entry, CacheIncarnationRevokeEntry, CacheOutcomeGcEntry,
-    CacheRemoveEntry, CacheReservedReapEntry, CacheScopeRemoveEntry, CacheTtlSweepEntry,
-    CacheVacuumEntry, JournalEntry, JournalWriter, MountLifecycleV2Entry,
+    CacheIncarnationAllocateV2Entry, CacheIncarnationRevokeEntry, CacheMountScopeRemoveEntry,
+    CacheOutcomeGcEntry, CacheRemoveEntry, CacheReservedReapEntry, CacheScopeRemoveEntry,
+    CacheTtlSweepEntry, CacheVacuumEntry, JournalEntry, JournalWriter, MountLifecycleV2Entry,
 };
 use crate::master::meta::cache::entry::{
     CacheEntry, CacheEntryState, ExpiryCursor, ExpiryRow, MountLifecycleKind, MountLifecycleStatus,
@@ -1460,6 +1460,22 @@ pub struct ScopeRemoveProgress {
     pub cursor: Option<String>,
     /// Victims journaled this call.
     pub processed: usize,
+}
+
+/// The EXPLICIT scope of a cache-mode Free (task #6 Free bridge, gpt56
+/// `9f83a317` q1: no sentinel values — the root is the typed Mount
+/// branch, an internal path maps to the mount-relative cache key with
+/// `recursive=false` = exact Key and `recursive=true` = the prefix
+/// family). The store's full-incarnation scan is the Mount branch ALONE;
+/// an empty prefix string may never smuggle it through `key_in_scope`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheFreeScope {
+    /// The mount root: every key of the bound CURRENT incarnation.
+    Mount,
+    /// One exact cache key (a file free) — a point read, never a family.
+    Key(String),
+    /// A prefix family on component boundaries (a directory free).
+    Prefix(String),
 }
 
 /// Resumable progress of one TTL-sweep driver call (4c.2).
@@ -3550,6 +3566,215 @@ impl CacheService {
             }
             // Counts journaled victims only: an all-tombstone (already
             // applied) page journals nothing.
+            processed += journaled;
+            cursor = Some(last_key);
+            if page.len() < MUTATION_PAGE_CAP {
+                return Ok(ScopeRemoveProgress {
+                    done: true,
+                    cursor,
+                    processed,
+                });
+            }
+        }
+        Ok(ScopeRemoveProgress {
+            done: false,
+            cursor,
+            processed,
+        })
+    }
+
+    /// Free bridge (task #6 P4-0, gpt56 `92883fff` + `9f83a317` q1 +
+    /// `fdbe3786`): a typed Key/Prefix/Mount remove bound to the mount's
+    /// CURRENT incarnation, resolved ONCE at call entry. The binding
+    /// `(mount_id, incarnation, scope)` is fixed for the whole call: if the
+    /// pointer/revocation moves mid-pagination the call TERMINATES with a
+    /// typed fenced error — it never re-resolves and continues deleting a
+    /// NEWER incarnation inside the same call (that would bypass the
+    /// fence). Only the caller's NEXT Free call resolves afresh.
+    ///
+    /// Mount pages the whole bound incarnation (historical revoked
+    /// incarnations belong to vacuum); Key is an exact point read (never a
+    /// prefix family); Prefix reuses the 4c.2 prefix-family semantics.
+    /// Bounded exactly like the other 4c.2 drivers; a same-cursor retry
+    /// re-derives the page and journals nothing for already-tombstoned
+    /// rows (`scope_page_victims`).
+    pub fn remove_free_scope(
+        &self,
+        rpc_id: i64,
+        mount_id: u32,
+        scope: &CacheFreeScope,
+        after: Option<&str>,
+        max_pages: usize,
+    ) -> CommonResult<ScopeRemoveProgress> {
+        self.require_enabled()?;
+        self.require_leader()?;
+        let max_pages = max_pages.clamp(1, MUTATION_MAX_PAGES_PER_CALL);
+        Self::validate_key_cursor(after)?;
+        let scope_str: Option<&str> = match scope {
+            CacheFreeScope::Mount => None,
+            CacheFreeScope::Key(s) | CacheFreeScope::Prefix(s) => {
+                if s.is_empty() {
+                    return err_box!(
+                        "cache free scope must be a non-empty key/prefix (Mount is the typed root scope)"
+                    );
+                }
+                if s.len() > MAX_KEY_BYTES {
+                    return err_box!(
+                        "cache free scope exceeds {} bytes: {}",
+                        MAX_KEY_BYTES,
+                        s.len()
+                    );
+                }
+                Some(s)
+            }
+        };
+        if let (Some(a), Some(s)) = (after, scope_str) {
+            match scope {
+                // Exact key: the only legal continuation cursor is the key
+                // itself (and only while the point read still yields a page).
+                CacheFreeScope::Key(k) => {
+                    if a != k {
+                        return err_box!(
+                            "cache free key-scope cursor {} is not the exact key {}",
+                            a,
+                            k
+                        );
+                    }
+                }
+                CacheFreeScope::Prefix(_) => {
+                    if !crate::master::meta::cache::key_in_scope(a, s) {
+                        return err_box!("cache free cursor {} is outside scope {}", a, s);
+                    }
+                }
+                CacheFreeScope::Mount => unreachable!("scope_str is None for Mount"),
+            }
+        }
+
+        // Resolve and FIX the call's binding: (mount_id, incarnation,
+        // scope). A visible cache-mode mount without a current pointer is
+        // fail-closed corruption, never an empty no-op free.
+        let incarnation = {
+            let store = self.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let inc = rocks
+                .cache_current_incarnation(mount_id)
+                .map_err(fs_err)?
+                .ok_or_else(|| {
+                    cm_err(format!(
+                        "cache free: mount {} has no current incarnation (fail-closed)",
+                        mount_id
+                    ))
+                })?;
+            match rocks.cache_get_incarnation(inc).map_err(fs_err)? {
+                Some(row) if !row.revoked && row.mount_id == mount_id => inc,
+                Some(row) => {
+                    return err_box!(
+                        "cache free: incarnation {} of mount {} is not live (revoked {}, owner {})",
+                        inc,
+                        mount_id,
+                        row.revoked,
+                        row.mount_id
+                    )
+                }
+                None => {
+                    return err_box!(
+                        "cache free: incarnation {} of mount {} has no incarnation row",
+                        inc,
+                        mount_id
+                    )
+                }
+            }
+        };
+
+        let mut cursor = after.map(|a| a.to_string());
+        let mut processed = 0usize;
+        for _ in 0..max_pages {
+            // Per-page fence: the binding must still be the call's fixed
+            // (mount, incarnation) for every page of THIS call.
+            if !self.incarnation_active(incarnation)? {
+                return Err(Self::fenced(incarnation));
+            }
+            let page = {
+                let store = self.fs_dir.read();
+                let rocks = store.get_rocks_store();
+                match scope {
+                    CacheFreeScope::Mount => rocks
+                        .cache_scan_entries(incarnation, cursor.as_deref(), MUTATION_PAGE_CAP)
+                        .map_err(fs_err)?,
+                    CacheFreeScope::Prefix(p) => rocks
+                        .cache_scan_entries_in_scope(
+                            incarnation,
+                            p,
+                            cursor.as_deref(),
+                            MUTATION_PAGE_CAP,
+                        )
+                        .map_err(fs_err)?,
+                    // Exact point read: a Key free never sweeps the key's
+                    // prefix family.
+                    CacheFreeScope::Key(k) => rocks
+                        .cache_get_entry(incarnation, k)
+                        .map_err(fs_err)?
+                        .into_iter()
+                        .map(|e| (k.clone(), e))
+                        .collect(),
+                }
+            };
+            if page.is_empty() {
+                return Ok(ScopeRemoveProgress {
+                    done: true,
+                    cursor,
+                    processed,
+                });
+            }
+            let victims = Self::scope_page_victims(&page)?;
+            let last_key = page.last().unwrap().0.clone();
+            let journaled = victims.len();
+            if !victims.is_empty() {
+                let frozen: HashMap<(String, i64), (i64, i64)> = page
+                    .iter()
+                    .filter(|(_, e)| e.state != CacheEntryState::Tombstoned && e.len > 0)
+                    .map(|(k, e)| ((k.clone(), e.object_id), (e.len, e.block_size)))
+                    .collect();
+                let victim_ids: Vec<(u64, String, i64)> = victims
+                    .iter()
+                    .map(|v| (incarnation, v.key.clone(), v.object_id))
+                    .collect();
+                let op_id = self.fs_dir.read().next_op_id();
+                let entry = match scope {
+                    CacheFreeScope::Mount => {
+                        JournalEntry::CacheMountScopeRemove(CacheMountScopeRemoveEntry {
+                            op_id,
+                            rpc_id,
+                            incarnation,
+                            mount_id,
+                            victims,
+                        })
+                    }
+                    CacheFreeScope::Key(k) => {
+                        JournalEntry::CacheScopeRemove(CacheScopeRemoveEntry {
+                            op_id,
+                            rpc_id,
+                            incarnation,
+                            scope: k.clone(),
+                            victims,
+                        })
+                    }
+                    CacheFreeScope::Prefix(p) => {
+                        JournalEntry::CacheScopeRemove(CacheScopeRemoveEntry {
+                            op_id,
+                            rpc_id,
+                            incarnation,
+                            scope: p.clone(),
+                            victims,
+                        })
+                    }
+                };
+                self.journal_writer
+                    .sync_propose_cache(entry)
+                    .map_err(fs_err)?;
+                self.fire_barrier_hook();
+                self.retire_dead_victims(&victim_ids, &frozen)?;
+            }
             processed += journaled;
             cursor = Some(last_key);
             if page.len() < MUTATION_PAGE_CAP {
@@ -9243,6 +9468,120 @@ mod tests {
             "expected cursor byte-cap error, got: {}",
             err
         );
+    }
+
+    /// Free bridge driver gates (task #6, gpt56 `92883fff`/`9f83a317`/
+    /// `fdbe3786`): capability gate, fail-closed binding resolution, the
+    /// typed scope/cursor shape matrix, the per-page fence terminal, and
+    /// the empty-namespace fast termination. Victim journaling itself is
+    /// raft-gated (covered by the real-Raft free-bridge phase).
+    #[test]
+    fn test_free_scope_driver_gates() {
+        use crate::master::meta::cache::entry::IncarnationRow;
+
+        let service = build_service("free-scope-gates", chooser(vec![worker(1)]));
+        // Direct-store install: pointer + incarnation row without entries.
+        let install = |svc: &CacheService, mount_id: u32, inc: u64, revoked: bool| {
+            let store = svc.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let mut w = rocks.cache_write();
+            w.put_incarnation(inc, IncarnationRow { mount_id, revoked })
+                .unwrap();
+            w.set_current_incarnation(mount_id, inc).unwrap();
+            w.commit().unwrap();
+        };
+
+        // Capability gate mirrors every other cache entry point.
+        let disabled = build_service_enabled(
+            "free-scope-gates-off",
+            chooser(vec![worker(1)]),
+            false,
+            Duration::from_secs(3600),
+        );
+        assert!(disabled
+            .remove_free_scope(7, 5, &CacheFreeScope::Mount, None, 4)
+            .is_err());
+        assert!(disabled
+            .remove_free_scope(7, 5, &CacheFreeScope::Key("a".into()), None, 4)
+            .is_err());
+
+        // Shape gates fire BEFORE any binding resolution: an empty
+        // Key/Prefix would smuggle the Mount branch and is rejected; a
+        // Key cursor must be the exact key; a Prefix cursor must be
+        // inside the family.
+        assert!(service
+            .remove_free_scope(7, 5, &CacheFreeScope::Key(String::new()), None, 4)
+            .is_err());
+        assert!(service
+            .remove_free_scope(7, 5, &CacheFreeScope::Prefix(String::new()), None, 4)
+            .is_err());
+        let err = service
+            .remove_free_scope(7, 5, &CacheFreeScope::Key("a".into()), Some("b"), 4)
+            .unwrap_err();
+        assert!(err.to_string().contains("not the exact key"), "{}", err);
+        let err = service
+            .remove_free_scope(7, 5, &CacheFreeScope::Prefix("a".into()), Some("zz"), 4)
+            .unwrap_err();
+        assert!(err.to_string().contains("outside scope"), "{}", err);
+
+        // Binding resolution is fail-closed: no pointer at all is loud,
+        // never an empty no-op free.
+        let err = service
+            .remove_free_scope(7, 5, &CacheFreeScope::Mount, None, 4)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no current incarnation"),
+            "{}",
+            err
+        );
+
+        // Pointer to a REVOKED row is equally loud at resolution.
+        install(&service, 5, 1, true);
+        let err = service
+            .remove_free_scope(7, 5, &CacheFreeScope::Mount, None, 4)
+            .unwrap_err();
+        assert!(err.to_string().contains("is not live"), "{}", err);
+
+        // Live binding, empty namespaces: every typed scope terminates
+        // done with nothing journaled.
+        install(&service, 5, 2, false);
+        for scope in [
+            CacheFreeScope::Mount,
+            CacheFreeScope::Key("a".into()),
+            CacheFreeScope::Prefix("a".into()),
+        ] {
+            let p = service.remove_free_scope(7, 5, &scope, None, 4).unwrap();
+            assert_eq!(
+                p,
+                ScopeRemoveProgress {
+                    done: true,
+                    cursor: None,
+                    processed: 0
+                },
+                "{:?}",
+                scope
+            );
+        }
+
+        // Cross-call re-resolve (gpt56 `fdbe3786`): a binding that moved
+        // BETWEEN calls is not an error at all — the new call resolves and
+        // fixes the NEW incarnation. The unit-test raft barrier fails
+        // closed, so any page proposal would surface as an error here;
+        // empty namespaces keep this at pure resolution semantics.
+        install(&service, 5, 3, false);
+        for scope in [
+            CacheFreeScope::Mount,
+            CacheFreeScope::Key("a".into()),
+            CacheFreeScope::Prefix("a".into()),
+        ] {
+            let p = service.remove_free_scope(7, 5, &scope, None, 4).unwrap();
+            assert!(p.done && p.processed == 0, "{:?} -> {:?}", scope, p);
+        }
+        // The MID-PAGE fence (binding moves DURING pagination → terminal
+        // typed `CacheIncarnationFenced`, never auto re-resolve + continue)
+        // needs a real page proposal and is therefore proven only in the
+        // real-raft phase-3 harness (`real_raft_mount_lifecycle`) via the
+        // post-barrier hook.
     }
 
     /// Review `cbd434bd`: the vacuum driver's external String cursor is
