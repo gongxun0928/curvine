@@ -318,6 +318,53 @@ impl CurvineFileSystem {
         Ok(table)
     }
 
+    /// Task #6 P4-1: the RAW mount-table response, before
+    /// `mount_info_from_pb` drops the response-only `cache_incarnation`
+    /// field. The persisted `MountInfo` model never carries the
+    /// incarnation (gpt56 `88cda9cf` Q1: response-only wrapper); client
+    /// snapshot decode lives in the Unified layer.
+    pub async fn get_mount_table_raw(&self) -> FsResult<Vec<curvine_proto::MountInfoProto>> {
+        let res = self.fs_client.get_mount_table().await?;
+        Ok(res.mount_table)
+    }
+
+    /// Task #6 P4-1 raw cache bindings (see `FsClient` docs). The Unified
+    /// layer composes these with mount/key/incarnation resolution.
+    pub async fn cache_get(
+        &self,
+        incarnation: u64,
+        key: &str,
+        need_locations: bool,
+    ) -> FsResult<curvine_proto::CacheGetResponse> {
+        self.fs_client
+            .cache_get(incarnation, key, need_locations)
+            .await
+    }
+
+    pub async fn cache_invalidate(
+        &self,
+        incarnation: u64,
+        key: &str,
+        expected_generation: u64,
+        expected_object_id: i64,
+    ) -> FsResult<curvine_proto::CacheInvalidateResponse> {
+        self.fs_client
+            .cache_invalidate(incarnation, key, expected_generation, expected_object_id)
+            .await
+    }
+
+    pub async fn cache_remove(
+        &self,
+        incarnation: u64,
+        key: &str,
+        expected_generation: u64,
+        expected_object_id: i64,
+    ) -> FsResult<curvine_proto::CacheRemoveResponse> {
+        self.fs_client
+            .cache_remove(incarnation, key, expected_generation, expected_object_id)
+            .await
+    }
+
     pub async fn mount(&self, ufs_path: &Path, cv_path: &Path, opts: MountOptions) -> FsResult<()> {
         if !opts.update && ufs_path.scheme().is_none() {
             return err_box!("ufs path {} invalid must be start with schema://", ufs_path);

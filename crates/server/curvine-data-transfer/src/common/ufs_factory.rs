@@ -20,7 +20,7 @@ use curvine_net::net::InetAddr;
 use curvine_rpc::client::ClientFactory;
 use curvine_runtime::runtime::Runtime;
 use curvine_runtime::sync::FastSyncCache;
-use curvine_unified_fs::{MountValue, UfsFileSystem};
+use curvine_unified_fs::{MountSnapshot, MountValue, UfsFileSystem};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,7 +52,7 @@ impl UfsFactory {
             return Ok(v);
         };
 
-        let mnt_value = Arc::new(MountValue::new(mnt.clone())?);
+        let mnt_value = Arc::new(MountValue::new(MountSnapshot::from_info(mnt.clone()))?);
         self.ufs_cache.insert(mnt.mount_id, mnt_value.clone());
         Ok(mnt_value)
     }

@@ -46,6 +46,41 @@ use tokio::time;
 
 const TRANSFER_SUBMIT_MAX_ATTEMPTS: usize = 3;
 
+/// Task #6 P4-1 (gpt56 `88cda9cf` point 3): typed public results — a
+/// boolean/unit return would collapse the miss/applied/superseded
+/// distinction the contract needs.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CacheEntryStatus {
+    /// No valid entry under an ACTIVE incarnation (row missing,
+    /// tombstoned, expired, or location-incomplete). The caller may fall
+    /// back to the UFS — unlike a FENCE, which is a loud error.
+    Miss,
+    Hit {
+        object_id: i64,
+        len: i64,
+        block_size: i64,
+        generation: u64,
+        ufs_mtime: i64,
+        expire_at: i64,
+    },
+}
+
+/// Typed outcome of the composite public Invalidate. `Miss` is only ever
+/// returned under an ACTIVE incarnation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CacheInvalidateResult {
+    Miss,
+    Applied,
+    AlreadyApplied,
+    Superseded { current_generation: u64 },
+}
+
+/// Typed FENCE discriminator shared by the P4-1 public entries: branch on
+/// the machine-readable ErrorKind, never on the message string.
+fn is_incarnation_fenced(e: &FsError) -> bool {
+    matches!(e.kind(), curvine_error::ErrorKind::CacheIncarnationFenced)
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 enum CacheValidity {
@@ -356,6 +391,140 @@ impl UnifiedFileSystem {
         // done=true.
         let fut = self.cv.free(path, recursive);
         self.track("Free", path.path(), "", fut).await
+    }
+
+    /// Resolve a CV path to its cache-mode target: the mount's CURRENT
+    /// incarnation (from the response-only `MountSnapshot`) plus the
+    /// derived cache key. Loud on every non-cache-mode shape — these APIs
+    /// are cache-domain only and never fall back to CV inodes.
+    async fn resolve_cache_target(&self, path: &Path) -> FsResult<(Arc<MountValue>, String, u64)> {
+        if !path.is_cv() {
+            return err_box!("cache status path is not curvine path: {}", path);
+        }
+        let Some(mnt) = self.mount_cache.get_mount(self, path).await? else {
+            return err_box!("no mount covers cache path {}", path);
+        };
+        if !mnt.info.is_cache_mode() {
+            return err_box!(
+                "cache APIs target cache-mode mounts only: {} is {:?}",
+                path,
+                mnt.info.write_type
+            );
+        }
+        // Defensive: the snapshot decode already fails closed on a
+        // CacheMode row without a nonzero incarnation.
+        let Some(incarnation) = mnt.cache_incarnation.filter(|i| *i != 0) else {
+            return err_box!(
+                "cache-mode mount {} ({}) snapshot has no cache incarnation",
+                mnt.info.cv_path,
+                mnt.info.mount_id
+            );
+        };
+        let ufs_path = mnt.get_ufs_path(path)?;
+        let key = mnt.info.get_cache_key(&ufs_path)?;
+        Ok((mnt, key, incarnation))
+    }
+
+    /// Task #6 P4-1 (gpt56 `88cda9cf`): public cache-entry status — a
+    /// metadata-only CacheGet (`need_locations=false`).
+    ///
+    /// FENCED ≠ miss: a typed CacheIncarnationFenced from a stale local
+    /// incarnation forces ONE mount-table refresh and re-resolves the
+    /// same path; if the mount vanished, turned non-CacheMode, or the
+    /// refreshed incarnation still fences, the error is loud — a dead
+    /// namespace is never folded into a miss (the caller must not
+    /// silently fall to the UFS under it).
+    pub async fn cache_status(&self, path: &Path) -> FsResult<CacheEntryStatus> {
+        let fut = async {
+            let (_, key, incarnation) = self.resolve_cache_target(path).await?;
+            match self.cv.cache_get(incarnation, &key, false).await {
+                Ok(rep) => Ok(Self::status_from_get(&rep)),
+                Err(e) => {
+                    if !is_incarnation_fenced(&e) {
+                        return Err(e);
+                    }
+                    self.mount_cache.check_update(self, true).await?;
+                    let (_, key, incarnation) = self.resolve_cache_target(path).await?;
+                    let rep = self.cv.cache_get(incarnation, &key, false).await?;
+                    Ok(Self::status_from_get(&rep))
+                }
+            }
+        };
+        self.track("CacheGet", path.path(), "", fut).await
+    }
+
+    fn status_from_get(rep: &curvine_proto::CacheGetResponse) -> CacheEntryStatus {
+        if rep.hit.unwrap_or(false) {
+            CacheEntryStatus::Hit {
+                object_id: rep.object_id.unwrap_or(0),
+                len: rep.file_len.unwrap_or(0),
+                block_size: rep.block_size.unwrap_or(0),
+                generation: rep.generation.unwrap_or(0),
+                ufs_mtime: rep.ufs_mtime.unwrap_or(0),
+                expire_at: rep.expire_at.unwrap_or(0),
+            }
+        } else {
+            CacheEntryStatus::Miss
+        }
+    }
+
+    /// Task #6 P4-1 (gpt56 `88cda9cf` Q2): composite public Invalidate.
+    ///
+    /// Observes the entry with one metadata Get (same one-refresh FENCED
+    /// policy as `cache_status`), then fences exactly the OBSERVED
+    /// `(incarnation, key, generation, object_id)` — the identity CAS
+    /// makes a forged or raced id a loud divergence instead of a silent
+    /// cross-object fence. The mutation phase is TERMINAL on FENCED: it
+    /// must never re-resolve onto a newer incarnation (only a transport
+    /// response-loss may replay the identical request). A miss under an
+    /// ACTIVE incarnation is simply `Miss` — nothing to invalidate.
+    pub async fn invalidate_cache(&self, path: &Path) -> FsResult<CacheInvalidateResult> {
+        let fut = async {
+            let (_, key, incarnation) = self.resolve_cache_target(path).await?;
+            let rep = match self.cv.cache_get(incarnation, &key, false).await {
+                Ok(rep) => rep,
+                Err(e) => {
+                    if !is_incarnation_fenced(&e) {
+                        return Err(e);
+                    }
+                    self.mount_cache.check_update(self, true).await?;
+                    let (_, key, incarnation) = self.resolve_cache_target(path).await?;
+                    self.cv.cache_get(incarnation, &key, false).await?
+                }
+            };
+            if !rep.hit.unwrap_or(false) {
+                return Ok(CacheInvalidateResult::Miss);
+            }
+            let generation = rep.generation.unwrap_or(0);
+            let object_id = rep.object_id.unwrap_or(0);
+            let rep = self
+                .cv
+                .cache_invalidate(incarnation, &key, generation, object_id)
+                .await?;
+            use curvine_proto::CacheOpStatusProto as Status;
+            let status = match rep.status {
+                Some(s) if s == Status::Applied as i32 => Status::Applied,
+                Some(s) if s == Status::AlreadyApplied as i32 => Status::AlreadyApplied,
+                Some(s) if s == Status::Superseded as i32 => Status::Superseded,
+                Some(s) if s == Status::ReplanNeeded as i32 => Status::ReplanNeeded,
+                // Fail closed on a missing/unknown discriminator: inventing
+                // an Applied would mask a wire-level corruption.
+                other => return err_box!("cache invalidate returned unknown status {:?}", other),
+            };
+            Ok(match status {
+                Status::Applied => CacheInvalidateResult::Applied,
+                Status::AlreadyApplied => CacheInvalidateResult::AlreadyApplied,
+                Status::Superseded => CacheInvalidateResult::Superseded {
+                    current_generation: rep.current_generation.unwrap_or(0),
+                },
+                // Commit-only re-planable state is impossible for an
+                // invalidate; loud, never silently treated as applied.
+                Status::ReplanNeeded => {
+                    return err_box!("cache invalidate returned commit-only status ReplanNeeded")
+                }
+            })
+        };
+        self.track("CacheInvalidate", path.path(), "", fut).await
     }
 
     pub async fn symlink(&self, target: &str, link: &Path, force: bool) -> FsResult<()> {

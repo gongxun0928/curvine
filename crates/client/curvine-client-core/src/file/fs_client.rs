@@ -867,6 +867,70 @@ impl FsClient {
         self.rpc(RpcCode::CacheAbort, req).await
     }
 
+    /// Task #6 P4-1: CacheGet over the wire. Pure read — a transport
+    /// response loss may be replayed freely. A revoked/stale incarnation
+    /// is the TYPED `CacheIncarnationFenced` terminal, never a miss: the
+    /// caller must re-resolve the mount, never fall to the UFS under a
+    /// dead namespace.
+    pub async fn cache_get(
+        &self,
+        incarnation: u64,
+        key: &str,
+        need_locations: bool,
+    ) -> FsResult<CacheGetResponse> {
+        let req = CacheGetRequest {
+            incarnation,
+            key: key.to_string(),
+            need_locations: Some(need_locations),
+        };
+        self.rpc(RpcCode::CacheGet, req).await
+    }
+
+    /// Task #6 P4-1: CacheInvalidate over the wire — a generation fence to
+    /// `Tombstoned@expected_generation + 1` targeting the object the caller
+    /// OBSERVED (`expected_object_id` identity CAS). The raw form is for
+    /// callers that already hold a Get observation; the composite public
+    /// form lives in the Unified layer. `incarnation`/identity come from
+    /// that same observation verbatim — a fenced mutation is terminal and
+    /// must never be re-resolved onto a newer incarnation.
+    pub async fn cache_invalidate(
+        &self,
+        incarnation: u64,
+        key: &str,
+        expected_generation: u64,
+        expected_object_id: i64,
+    ) -> FsResult<CacheInvalidateResponse> {
+        let req = CacheInvalidateRequest {
+            incarnation,
+            key: key.to_string(),
+            expected_generation,
+            expected_object_id,
+        };
+        self.rpc(RpcCode::CacheInvalidate, req).await
+    }
+
+    /// Task #6 P4-1: CacheRemove over the wire. Wire-contract completeness
+    /// ONLY: the master handler routes CacheRemove to the very same
+    /// `cache_service::invalidate` (a logical tombstone fence) — this is
+    /// NOT a physical delete. Physical vacuum and any public Remove
+    /// semantics land with the P4-3 purge/vacuum work; do not present this
+    /// as physical removal. User-facing removal is the Free bridge.
+    pub async fn cache_remove(
+        &self,
+        incarnation: u64,
+        key: &str,
+        expected_generation: u64,
+        expected_object_id: i64,
+    ) -> FsResult<CacheRemoveResponse> {
+        let req = CacheRemoveRequest {
+            incarnation,
+            key: key.to_string(),
+            expected_generation,
+            expected_object_id,
+        };
+        self.rpc(RpcCode::CacheRemove, req).await
+    }
+
     pub async fn metrics_report(&self, metrics: Vec<MetricValue>) -> FsResult<()> {
         if metrics.is_empty() {
             return Ok(());

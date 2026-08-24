@@ -63,10 +63,11 @@ High-performance caching layer for filesystem mount information with bidirection
 */
 
 use crate::{UfsFileSystem, UnifiedFileSystem};
-use curvine_core_error::CommonResult;
+use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
-use curvine_model::MountInfo;
+use curvine_model::{MountInfo, ProtoUtils};
+use curvine_proto::MountInfoProto;
 use curvine_runtime::common::{FastHashMap, LocalTime};
 use curvine_runtime::runtime::RpcRuntime;
 use curvine_runtime::sync::AtomicCounter;
@@ -76,20 +77,72 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
 
+/// Task #6 P4-1 (gpt56 `88cda9cf` Q1): client-only mount snapshot.
+///
+/// The current cache incarnation is a RESPONSE-ONLY, master-composed
+/// field (`MountInfoProto.cache_incarnation`); it must never enter the
+/// persisted `MountInfo` bincode model. `MountSnapshot` captures the
+/// mount row and its incarnation in ONE decode of the raw proto, so the
+/// pair is stored and replaced atomically inside `MountValue` — the
+/// incarnation can never drift onto a different mount's row.
+///
+/// Fail-closed rule: a CacheMode mount whose response carries a missing
+/// or zero incarnation is CORRUPTION (every visible cache-mode mount must
+/// have an authoritative current incarnation), and the decode fails
+/// loud. An FsMode mount's `None` is normal.
+#[derive(Debug, Clone)]
+pub struct MountSnapshot {
+    pub info: MountInfo,
+    pub cache_incarnation: Option<u64>,
+}
+
+impl MountSnapshot {
+    /// Non-response construction (e.g. a worker building a data-plane
+    /// `MountValue` from a job-spec `MountInfo`): no incarnation is
+    /// present in that context and none is asserted. The fail-closed
+    /// contract applies to mount-table RESPONSES only (`from_pb`).
+    pub fn from_info(info: MountInfo) -> Self {
+        Self {
+            info,
+            cache_incarnation: None,
+        }
+    }
+
+    pub fn from_pb(pb: MountInfoProto) -> FsResult<Self> {
+        let cache_incarnation = pb.cache_incarnation;
+        let info = ProtoUtils::mount_info_from_pb(pb);
+        if info.is_cache_mode() && cache_incarnation.unwrap_or(0) == 0 {
+            return err_box!(
+                "cache-mode mount {} ({}) has no authoritative cache incarnation in the mount-table response",
+                info.cv_path,
+                info.mount_id
+            );
+        }
+        Ok(Self {
+            info,
+            cache_incarnation,
+        })
+    }
+}
+
 /// Represents a single mount point with its filesystem handler.
 /// Contains mount metadata, UFS handler, and path conversion utilities.
 pub struct MountValue {
     pub info: MountInfo,
+    /// The incarnation observed in the SAME mount-table response as
+    /// `info` (see `MountSnapshot`); `None` for FsMode mounts.
+    pub cache_incarnation: Option<u64>,
     ufs: OnceCell<UfsFileSystem>,
     pub mount_id: String,
 }
 
 impl MountValue {
-    pub fn new(info: MountInfo) -> FsResult<Self> {
-        let mount_id = format!("{}", info.mount_id);
+    pub fn new(snapshot: MountSnapshot) -> FsResult<Self> {
+        let mount_id = format!("{}", snapshot.info.mount_id);
 
         Ok(Self {
-            info,
+            info: snapshot.info,
+            cache_incarnation: snapshot.cache_incarnation,
             ufs: OnceCell::new(),
             mount_id,
         })
@@ -132,8 +185,8 @@ struct InnerMap {
 }
 
 impl InnerMap {
-    pub fn insert(&mut self, info: MountInfo) -> CommonResult<()> {
-        let value = Arc::new(MountValue::new(info)?);
+    pub fn insert(&mut self, snapshot: MountSnapshot) -> CommonResult<()> {
+        let value = Arc::new(MountValue::new(snapshot)?);
         self.cv_map
             .insert(value.info.cv_path.clone(), value.clone());
         self.ufs_map.insert(value.info.ufs_path.clone(), value);
@@ -219,13 +272,19 @@ impl MountCache {
 
     /// Performs the actual full refresh of the mount table from the master.
     /// Guarded by `refresh_lock` so only one refresh runs at a time.
+    ///
+    /// P4-1: refreshes from the RAW mount-table response so each row is
+    /// decoded into a `MountSnapshot` (mount row + current incarnation,
+    /// one decode, atomic replace). `get_mount_table`'s `MountInfo`
+    /// conversion drops the response-only incarnation field and cannot be
+    /// used here.
     async fn do_refresh(&self, fs: &UnifiedFileSystem) -> FsResult<()> {
-        let mounts = fs.get_mount_table().await?;
+        let raw = fs.cv().get_mount_table_raw().await?;
         let mut state = self.mounts.write().unwrap();
 
         state.clear();
-        for item in mounts {
-            state.insert(item)?;
+        for pb in raw {
+            state.insert(MountSnapshot::from_pb(pb)?)?;
         }
 
         debug!("update mounts {:?}", state.len());
@@ -345,7 +404,7 @@ impl MountCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use curvine_model::{AccessMode, MountInfo, Provider, TtlAction, WriteType};
+    use curvine_model::{AccessMode, Provider, TtlAction, WriteType};
     use std::collections::HashMap;
 
     fn opendal_oss_mount() -> MountInfo {
@@ -368,18 +427,25 @@ mod tests {
         }
     }
 
+    fn snapshot_for(info: MountInfo, incarnation: Option<u64>) -> FsResult<MountSnapshot> {
+        let mut pb = ProtoUtils::mount_info_to_pb(info);
+        pb.cache_incarnation = incarnation;
+        MountSnapshot::from_pb(pb)
+    }
+
     #[test]
     fn cache_insert_is_metadata_only_for_unsupported_provider() {
         let mut mounts = InnerMap::default();
 
         mounts
-            .insert(opendal_oss_mount())
+            .insert(snapshot_for(opendal_oss_mount(), Some(3)).unwrap())
             .expect("mount cache refresh should not initialize UFS providers");
 
         assert!(mounts.get(true, "/flink/checkpoints").is_none());
         let mount = mounts
             .get(true, "/oss-mount/data")
             .expect("mounted path should be cached");
+        assert_eq!(mount.cache_incarnation, Some(3));
         assert!(mount.ufs.get().is_none());
     }
 
@@ -387,7 +453,7 @@ mod tests {
     fn unsupported_provider_error_is_lazy_until_mount_use() {
         let mut mounts = InnerMap::default();
         mounts
-            .insert(opendal_oss_mount())
+            .insert(snapshot_for(opendal_oss_mount(), Some(3)).unwrap())
             .expect("mount cache refresh should not initialize UFS providers");
 
         let mount = mounts
@@ -395,5 +461,34 @@ mod tests {
             .expect("mounted path should be cached");
 
         assert!(mount.ufs().is_err());
+    }
+
+    /// P4-1 seam (gpt56 `88cda9cf`): a CacheMode row without a nonzero
+    /// incarnation in the mount-table response is CORRUPTION and the
+    /// snapshot decode fails closed — never a silent zero incarnation.
+    #[test]
+    fn cache_mode_snapshot_without_incarnation_fails_closed() {
+        let err = snapshot_for(opendal_oss_mount(), None).unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("no authoritative cache incarnation"),
+            "missing incarnation must fail loud, got {:?}",
+            err
+        );
+
+        let err = snapshot_for(opendal_oss_mount(), Some(0)).unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("no authoritative cache incarnation"),
+            "zero incarnation must fail loud, got {:?}",
+            err
+        );
+    }
+
+    /// FsMode rows never carry an incarnation; `None` is normal there.
+    #[test]
+    fn fs_mode_snapshot_without_incarnation_is_normal() {
+        let mut info = opendal_oss_mount();
+        info.write_type = WriteType::FsMode;
+        let snapshot = snapshot_for(info, None).unwrap();
+        assert_eq!(snapshot.cache_incarnation, None);
     }
 }

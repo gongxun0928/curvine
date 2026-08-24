@@ -31,7 +31,7 @@ use curvine_ufs_oss_hdfs::*;
 pub mod macros;
 
 mod unified_filesystem;
-pub use self::unified_filesystem::UnifiedFileSystem;
+pub use self::unified_filesystem::{CacheEntryStatus, CacheInvalidateResult, UnifiedFileSystem};
 
 mod mount_cache;
 pub use self::mount_cache::*;

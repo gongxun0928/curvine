@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use bytes::BytesMut;
-use curvine_client::unified::{UfsFileSystem, UnifiedFileSystem, UnifiedReader};
+use curvine_client::unified::{
+    CacheEntryStatus, CacheInvalidateResult, UfsFileSystem, UnifiedFileSystem, UnifiedReader,
+};
 use curvine_fs_api::{FileSystem, Path, Reader, RpcCode, Writer};
 use curvine_io::DataSlice;
 use curvine_model::{AccessMode, MountOptionsBuilder, WriteType};
@@ -596,6 +598,324 @@ fn test_cache_mode_free_child_with_unified_disabled() {
             "root free must remove the sibling index entry"
         );
         assert!(mount.ufs().unwrap().exists(&sibling_ufs).await.unwrap());
+    });
+}
+
+/// P4-1 (gpt56 `88cda9cf`): the public cache_status/invalidate_cache pair
+/// against a live capability-on cluster. Proves the typed public results
+/// (Hit/Miss, Applied/AlreadyApplied/Miss), the composite identity CAS
+/// (invalidate fences exactly the OBSERVED object), and the raw-binding
+/// response-loss contract (an identical re-send classifies AlreadyApplied
+/// and changes nothing).
+#[test]
+fn test_cache_mode_status_and_invalidate() {
+    let (fs, cluster) = get_fs_cache_meta();
+    let master_fs = cluster.get_active_master_fs();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        mount(&fs, WriteType::CacheMode).await;
+
+        let data = Utils::rand_str(2048);
+        let path: Path = format!("/write_cache_{:?}/p41_status.log", WriteType::CacheMode).into();
+        let mut writer = fs.create(&path, true).await.unwrap();
+        writer.write_string(&data).await.unwrap();
+        writer.complete().await.unwrap();
+
+        let (ufs_path, mnt) = fs
+            .get_mount(&path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        fs.async_cache(&ufs_path).unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
+
+        // The status observation must agree with the authoritative index.
+        let key = {
+            let ufs = mnt.info.get_ufs_path(&path).unwrap();
+            mnt.info.get_cache_key(&ufs).unwrap()
+        };
+        let inc = master_fs
+            .cache_service
+            .current_incarnation_for_mount(mnt.info.mount_id)
+            .unwrap()
+            .unwrap();
+        let entry = master_fs
+            .cache_service
+            .get(inc, &key, false)
+            .unwrap()
+            .unwrap();
+
+        let (object_id, observed_len, generation) = match fs.cache_status(&path).await.unwrap() {
+            CacheEntryStatus::Hit {
+                object_id,
+                len,
+                generation,
+                ..
+            } => (object_id, len, generation),
+            other => panic!("expected Hit, got {:?}", other),
+        };
+        assert_eq!(object_id, entry.object_id);
+        assert_eq!(observed_len, entry.len);
+        assert_eq!(generation, entry.generation);
+
+        // Composite invalidate: fences exactly the OBSERVED identity.
+        assert_eq!(
+            fs.invalidate_cache(&path).await.unwrap(),
+            CacheInvalidateResult::Applied
+        );
+        assert!(
+            master_fs
+                .cache_service
+                .get(inc, &key, false)
+                .unwrap()
+                .is_none(),
+            "invalidate must tombstone the index entry"
+        );
+        assert!(
+            mnt.ufs().unwrap().exists(&ufs_path).await.unwrap(),
+            "invalidate is metadata-only; the UFS file survives"
+        );
+
+        // Response-loss contract at the binding level: an IDENTICAL raw
+        // re-send of the applied invalidate classifies AlreadyApplied
+        // (state changed once; the replay is a no-op).
+        let replay = fs
+            .cv()
+            .cache_invalidate(inc, &key, generation, object_id)
+            .await
+            .unwrap();
+        assert_eq!(replay.status, Some(2), "replay must be ALREADY_APPLIED");
+        assert!(
+            master_fs
+                .cache_service
+                .get(inc, &key, false)
+                .unwrap()
+                .is_none(),
+            "replay must not resurrect or change anything"
+        );
+
+        // The raw CacheRemove binding is wire-complete but is the SAME
+        // logical fence (alias of invalidate; physical vacuum is P4-3).
+        let remove_replay = fs
+            .cv()
+            .cache_remove(inc, &key, generation, object_id)
+            .await
+            .unwrap();
+        assert_eq!(remove_replay.status, Some(2));
+
+        // Public second invalidate under the ACTIVE incarnation: the Get
+        // observes a miss, so the composite reports Miss — nothing to do.
+        assert_eq!(
+            fs.invalidate_cache(&path).await.unwrap(),
+            CacheInvalidateResult::Miss
+        );
+        assert_eq!(
+            fs.cache_status(&path).await.unwrap(),
+            CacheEntryStatus::Miss
+        );
+
+        // Content survives end-to-end.
+        let mut reader = fs.open(&path).await.unwrap();
+        assert_eq!(reader.read_as_string().await.unwrap(), data);
+    });
+}
+
+/// P4-1 stale-incarnation seams (gpt56 `88cda9cf`):
+/// - a stale snapshot fences the public Get, which force-refreshes ONCE
+///   and re-resolves the same path (never folds the fence into a miss);
+/// - a mutation carrying a pre-rebuild observation is TERMINAL (typed
+///   CacheIncarnationFenced) and leaves the rebuilt incarnation at zero
+///   changes;
+/// - a vanished mount after the refresh is loud.
+#[test]
+fn test_cache_fence_refresh_and_terminal_invalidate() {
+    let (fs, cluster) = get_fs_cache_meta();
+    let master_fs = cluster.get_active_master_fs();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        mount(&fs, WriteType::CacheMode).await;
+
+        let data = Utils::rand_str(512);
+        let cv_root = Path::from_str("/write_cache_CacheMode").unwrap();
+        let path: Path = format!("/write_cache_{:?}/p41_fence.log", WriteType::CacheMode).into();
+        let mut writer = fs.create(&path, true).await.unwrap();
+        writer.write_string(&data).await.unwrap();
+        writer.complete().await.unwrap();
+
+        let (ufs_path, mnt) = fs
+            .get_mount(&path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        fs.async_cache(&ufs_path).unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
+
+        // Observe under the pre-rebuild incarnation.
+        let key = {
+            let ufs = mnt.info.get_ufs_path(&path).unwrap();
+            mnt.info.get_cache_key(&ufs).unwrap()
+        };
+        let inc1 = master_fs
+            .cache_service
+            .current_incarnation_for_mount(mnt.info.mount_id)
+            .unwrap()
+            .unwrap();
+        let (object_id, generation) = match fs.cache_status(&path).await.unwrap() {
+            CacheEntryStatus::Hit {
+                object_id,
+                generation,
+                ..
+            } => (object_id, generation),
+            other => panic!("expected Hit under inc {}, got {:?}", inc1, other),
+        };
+        let ufs_base = env::var("UFS_TEST_PATH").unwrap();
+        let ufs_mount_path = Path::from_str(format!("{}/write_cache_CacheMode", ufs_base)).unwrap();
+
+        // Rebuild the mount THROUGH THE RAW CLIENT ONLY: the unified
+        // mount cache keeps its stale (inc1) snapshot.
+        fs.cv().umount(&cv_root).await.unwrap();
+        let opts = MountOptionsBuilder::new()
+            .write_type(WriteType::CacheMode)
+            .access_mode(AccessMode::ReadWrite)
+            .build();
+        fs.cv()
+            .mount(&ufs_mount_path, &cv_root, opts)
+            .await
+            .unwrap();
+        let inc2_raw = master_fs
+            .cache_service
+            .current_incarnation_for_mount(mnt.info.mount_id)
+            .unwrap();
+        assert!(
+            inc2_raw.is_none() || inc2_raw.unwrap() != inc1,
+            "the rebuilt mount must not still be on the pre-rebuild incarnation"
+        );
+
+        // Mutation with the PRE-REBUILD observation: terminal typed FENCE,
+        // never a silent success and never a re-resolve.
+        let err = fs
+            .cv()
+            .cache_invalidate(inc1, &key, generation, object_id)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err.kind(), curvine_error::ErrorKind::CacheIncarnationFenced),
+            "stale-inc mutation must be the typed FENCED terminal, got {:?}",
+            err
+        );
+
+        // Public Get on the stale snapshot: fence → ONE forced refresh →
+        // re-resolve → answer under the NEW incarnation (fresh namespace,
+        // so a Miss — proving the retry crossed, not folded the fence).
+        assert_eq!(
+            fs.cache_status(&path).await.unwrap(),
+            CacheEntryStatus::Miss
+        );
+
+        // Re-load under the new incarnation; the old-inc fence must have
+        // changed NOTHING there.
+        let (_, mnt2) = fs
+            .get_mount(&path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        let inc2 = master_fs
+            .cache_service
+            .current_incarnation_for_mount(mnt2.info.mount_id)
+            .unwrap()
+            .unwrap();
+        assert_ne!(inc2, inc1);
+        fs.async_cache(&ufs_path).unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
+        assert!(
+            master_fs
+                .cache_service
+                .get(inc2, &key, false)
+                .unwrap()
+                .is_some(),
+            "the reload must commit into the rebuilt incarnation"
+        );
+        let err = fs
+            .cv()
+            .cache_invalidate(inc1, &key, generation, object_id)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err.kind(), curvine_error::ErrorKind::CacheIncarnationFenced),
+            "old-inc mutation against a populated new incarnation must stay terminal"
+        );
+        assert!(
+            master_fs
+                .cache_service
+                .get(inc2, &key, false)
+                .unwrap()
+                .is_some(),
+            "the terminal old-inc mutation must leave the new incarnation at zero changes"
+        );
+
+        // The composite public invalidate re-resolved fresh (Get under
+        // inc2, mutation with that same observation) — Applied.
+        assert_eq!(
+            fs.invalidate_cache(&path).await.unwrap(),
+            CacheInvalidateResult::Applied
+        );
+
+        // Vanished mount after the refresh: loud, never a miss.
+        fs.cv().umount(&cv_root).await.unwrap();
+        let err = fs.cache_status(&path).await.unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("no mount covers"),
+            "vanished mount must fail loud, got {:?}",
+            err
+        );
+    });
+}
+
+/// P4-1 default-off + non-cache-mode seams (gpt56 `88cda9cf`): the public
+/// entries are cache-domain only — an FsMode mount is loud, an unmounted
+/// path is loud, and the RAW binding against a default (capability-off)
+/// master fails closed with the capability error.
+#[test]
+fn test_cache_apis_default_off_and_fs_mode_loud() {
+    let fs = get_fs();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        mount(&fs, WriteType::FsMode).await;
+
+        let path: Path = format!("/write_cache_{:?}/p41_fs_mode.log", WriteType::FsMode).into();
+        let mut writer = fs.create(&path, true).await.unwrap();
+        writer.write_string("fs mode").await.unwrap();
+        writer.complete().await.unwrap();
+
+        let err = fs.cache_status(&path).await.unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("cache-mode mounts only"),
+            "FsMode path must be loud, got {:?}",
+            err
+        );
+        let err = fs.invalidate_cache(&path).await.unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("cache-mode mounts only"),
+            "FsMode path must be loud, got {:?}",
+            err
+        );
+
+        let unmounted = Path::from_str("/no_such_mount/p41.log").unwrap();
+        let err = fs.cache_status(&unmounted).await.unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("no mount covers"),
+            "unmounted path must be loud, got {:?}",
+            err
+        );
+
+        // Raw binding against the default (capability-off) master: the
+        // service gate fails closed before any lookup.
+        let err = fs.cv().cache_get(1, "k", false).await.unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("cache metadata capability is disabled"),
+            "default-off master must fail closed, got {:?}",
+            err
+        );
     });
 }
 
