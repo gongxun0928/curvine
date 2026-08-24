@@ -48,6 +48,26 @@ use tokio::time;
 
 const TRANSFER_SUBMIT_MAX_ATTEMPTS: usize = 3;
 
+/// gpt56 `89ad4667` two-stage rename seam (cfg(test) ONLY — invisible in
+/// production builds): a closure armed by a test fires between the src
+/// and dst bound purges inside `rename_with_flags`. The closure returns
+/// a future that flips REAL master state (e.g. umount+remount) so the
+/// dst purge hits the REAL typed CacheIncarnationFenced terminal from
+/// the server, not a fabricated error.
+#[cfg(test)]
+type RenamePurgeFault =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn Future<Output = FsResult<()>> + Send>> + Send>;
+
+#[cfg(test)]
+static RENAME_PURGE_FAULT: std::sync::Mutex<Option<RenamePurgeFault>> = std::sync::Mutex::new(None);
+
+/// gpt56 `89ad4667`: counts actual UFS rename calls made by
+/// `rename_with_flags` (cfg(test) ONLY). After the dst purge FENCED, the
+/// count must be 0 — purge-before-UFS means a fenced second stage never
+/// mutates the backend.
+#[cfg(test)]
+static UFS_RENAME_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Task #6 P4-1 (gpt56 `88cda9cf` point 3): typed public results — a
 /// boolean/unit return would collapse the miss/applied/superseded
 /// distinction the contract needs.
@@ -460,12 +480,7 @@ impl UnifiedFileSystem {
             );
         };
         self.cv
-            .free_with_binding(
-                path,
-                recursive,
-                Some(mount.info.mount_id),
-                Some(incarnation),
-            )
+            .free_with_binding(path, recursive, mount.info.mount_id, incarnation)
             .await?;
         Ok(())
     }
@@ -1410,8 +1425,25 @@ impl UnifiedFileSystem {
                     // whole rename is safe to retry. Purge-after-UFS has
                     // no recovery path (src is gone) and is forbidden.
                     self.bound_purge(&mount, src, true).await?;
+
+                    // gpt56 `89ad4667` seam: test-only fault point
+                    // BETWEEN the two purges — the armed closure can flip
+                    // the master state (e.g. umount+remount) so the dst
+                    // purge below hits the REAL typed FENCED terminal
+                    // from the server, not a fabricated error. Production
+                    // builds have no seam at all (cfg(test) only).
+                    #[cfg(test)]
+                    {
+                        let fault = RENAME_PURGE_FAULT.lock().unwrap().take();
+                        if let Some(fault) = fault {
+                            fault().await?;
+                        }
+                    }
+
                     self.bound_purge(&mount, dst, true).await?;
 
+                    #[cfg(test)]
+                    UFS_RENAME_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let res = mount.ufs()?.rename(&src_ufs, &dst_ufs).await?;
 
                     // Legacy inode cleanup stays warn-only (P4-4 retires
@@ -2082,5 +2114,283 @@ mod tests {
         assert!(pending.paths.lock().contains("ufs://bucket/b"));
         drop(second_pending);
         assert!(pending.paths.lock().is_empty());
+    }
+
+    /// In-crate cluster recipe (mirrors curvine-tests `Testing::build` /
+    /// `start_cluster`): cache metadata capability ON, fresh tmp dirs,
+    /// 1 master + 1 worker. `curvine-unified-fs` cannot dev-depend on
+    /// `curvine-tests` (cycle), so the seam test builds `MiniCluster`
+    /// directly via a dev-dep on `curvine-server`.
+    fn rename_seam_cluster() -> (
+        super::UnifiedFileSystem,
+        Arc<curvine_server::test::MiniCluster>,
+        String,
+    ) {
+        use super::UnifiedFileSystem;
+        use curvine_config::ClusterConf;
+        use curvine_runtime::common::Utils;
+        use curvine_runtime::runtime::AsyncRuntime;
+
+        let mut conf = ClusterConf::default();
+        let base = format!(
+            "testing/unified-fs-rename-seam/{}-{}",
+            std::process::id(),
+            Utils::rand_str(6)
+        );
+        conf.master.meta_dir = format!("{base}/meta");
+        conf.journal.journal_dir = format!("{base}/journal");
+        conf.worker.data_dir = vec![format!("{base}/data")];
+        conf.master.min_block_size = 1;
+        conf.journal.raft_tick_interval_ms = 100;
+        conf.master.cache_metadata_enabled = true;
+        let ufs_base = format!("file://{base}/ufs");
+        std::fs::create_dir_all(format!("{base}/ufs")).unwrap();
+
+        let cluster = Arc::new(curvine_server::test::MiniCluster::with_num(&conf, 1, 1));
+        let cluster_conf = cluster.cluster_conf.clone();
+        cluster.start_cluster();
+        let rt = Arc::new(AsyncRuntime::single());
+        // The client MUST bind to the cluster's resolved conf (real held
+        // ports), not the base conf — same as curvine-tests'
+        // `get_active_cluster_conf`.
+        let fs = UnifiedFileSystem::with_rt(cluster_conf, rt).unwrap();
+        (fs, cluster, ufs_base)
+    }
+
+    /// gpt56 `89ad4667` frozen two-stage rename seam: the src Prefix
+    /// purge succeeds, then the armed fault performs a REAL umount +
+    /// remount (same UFS dir) between the two purges, so the dst Prefix
+    /// purge hits the REAL typed CacheIncarnationFenced terminal from
+    /// the master. Asserts: UFS rename call count stays at its baseline
+    /// (0 delta — purge-before-UFS means a fenced second stage never
+    /// mutates the backend), UFS src/dst untouched, src old-inc row
+    /// already cleared, new incarnation at zero rows, src still readable
+    /// via the UFS fallback, and after a cache-domain refresh the RETRY
+    /// rename succeeds. Also proves a pre-seeded dst cache entry is
+    /// cleared by a SUCCESSFUL rename (nothing ever serves OLD).
+    #[test]
+    fn rename_two_stage_purge_fence_leaves_ufs_untouched_and_retry_safe() {
+        use super::{RENAME_PURGE_FAULT, UFS_RENAME_CALLS};
+        use crate::{CacheEntryStatus, UfsFileSystem};
+        use curvine_fs_api::{FileSystem, Path, Reader, RpcCode, Writer};
+        use curvine_model::{AccessMode, MountOptionsBuilder, WriteType};
+        use curvine_runtime::common::Utils;
+        use curvine_runtime::runtime::RpcRuntime;
+
+        let (fs, cluster, ufs_base) = rename_seam_cluster();
+        let master_fs = cluster.get_active_master_fs();
+        let rt = fs.clone_runtime();
+
+        rt.block_on(async move {
+            let opts = MountOptionsBuilder::new()
+                .write_type(WriteType::CacheMode)
+                .access_mode(AccessMode::ReadWrite)
+                .build();
+            let ufs_root = Path::from_str(format!("{}/seam", ufs_base)).unwrap();
+            let cv_root: Path = "/seam".into();
+            let ufs = UfsFileSystem::new(&ufs_root, opts.add_properties.clone(), None).unwrap();
+            ufs.mkdir(&ufs_root, true).await.unwrap();
+            fs.mount(&ufs_root, &cv_root, opts.clone()).await.unwrap();
+
+            let write = |name: &str, data: &str| {
+                let fs = fs.clone();
+                let path: Path = format!("/seam/{}", name).into();
+                let data = data.to_string();
+                async move {
+                    let mut w = fs.create(&path, true).await.unwrap();
+                    w.write_string(&data).await.unwrap();
+                    w.complete().await.unwrap();
+                    path
+                }
+            };
+            let cache = |path: &Path| {
+                let fs = fs.clone();
+                let path = path.clone();
+                async move {
+                    let (ufs_path, _) = fs
+                        .get_mount(&path, RpcCode::GetMountInfo)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    fs.async_cache(&ufs_path).unwrap();
+                    fs.wait_job_complete(&path, false).await.unwrap();
+                }
+            };
+
+            // ---- Part A: a SUCCESSFUL rename clears a pre-seeded dst
+            // cache entry; the stale cached OLD never serves after.
+            let old_dst = Utils::rand_str(2048);
+            let dst_a = write("a_dst.log", &old_dst).await;
+            cache(&dst_a).await;
+            assert!(matches!(
+                fs.cache_status(&dst_a).await.unwrap(),
+                CacheEntryStatus::Hit { .. }
+            ));
+
+            let data_a = Utils::rand_str(3072);
+            let src_a = write("a_src.log", &data_a).await;
+            cache(&src_a).await;
+
+            let (_, mnt) = fs
+                .get_mount(&src_a, RpcCode::GetMountInfo)
+                .await
+                .unwrap()
+                .unwrap();
+            let inc1 = master_fs
+                .cache_service
+                .current_incarnation_for_mount(mnt.info.mount_id)
+                .unwrap()
+                .unwrap();
+            let key = |p: &Path| -> String {
+                let ufs_p = mnt.get_ufs_path(p).unwrap();
+                mnt.info.get_cache_key(&ufs_p).unwrap()
+            };
+
+            assert!(fs.rename(&src_a, &dst_a).await.unwrap());
+            assert_eq!(UFS_RENAME_CALLS.load(Ordering::SeqCst), 1);
+            // Both the src and the PRE-SEEDED dst entries are cleared
+            // under the observed incarnation.
+            assert!(master_fs
+                .cache_service
+                .get(inc1, &key(&src_a), false)
+                .unwrap()
+                .is_none());
+            assert!(
+                master_fs
+                    .cache_service
+                    .get(inc1, &key(&dst_a), false)
+                    .unwrap()
+                    .is_none(),
+                "a successful rename must clear the pre-seeded dst cache entry"
+            );
+            // The renamed dst serves the NEW content via UFS fallback —
+            // never the stale cached OLD.
+            let mut r = fs.open(&dst_a).await.unwrap();
+            assert_eq!(r.read_as_string().await.unwrap(), data_a);
+
+            // ---- Part B: two-stage fence. Src purge succeeds, the fault
+            // flips the master (umount + remount), the dst purge FENCED.
+            let old_dst_b = Utils::rand_str(1024);
+            let dst_b = write("b_dst.log", &old_dst_b).await;
+            cache(&dst_b).await;
+            let data_b = Utils::rand_str(4096);
+            let src_b = write("b_src.log", &data_b).await;
+            cache(&src_b).await;
+
+            let baseline = UFS_RENAME_CALLS.load(Ordering::SeqCst);
+            let cv = fs.cv().clone();
+            let fault_root = cv_root.clone();
+            let fault_ufs = ufs_root.clone();
+            let fault_opts = opts.clone();
+            RENAME_PURGE_FAULT
+                .lock()
+                .unwrap()
+                .replace(Box::new(move || {
+                    Box::pin(async move {
+                        cv.umount(&fault_root).await?;
+                        cv.mount(&fault_ufs, &fault_root, fault_opts).await?;
+                        Ok(())
+                    })
+                }));
+
+            let err = match fs.rename(&src_b, &dst_b).await {
+                Err(e) => e,
+                Ok(_) => panic!("the fenced dst purge must abort the rename, not succeed"),
+            };
+            assert!(
+                matches!(err.kind(), curvine_error::ErrorKind::CacheIncarnationFenced),
+                "the dst purge must be the typed FENCED terminal, got {:?}",
+                err
+            );
+            // The fenced second stage NEVER reached the backend.
+            assert_eq!(
+                UFS_RENAME_CALLS.load(Ordering::SeqCst),
+                baseline,
+                "a fenced dst purge must mean ZERO UFS rename calls"
+            );
+
+            // The remounted mount is a different (mount_id, incarnation).
+            let table = fs.cv().get_mount_table().await.unwrap();
+            let mnt2 = table
+                .iter()
+                .find(|m| m.cv_path == "/seam")
+                .expect("remounted mount must be in the table");
+            let inc2 = master_fs
+                .cache_service
+                .current_incarnation_for_mount(mnt2.mount_id)
+                .unwrap()
+                .unwrap();
+            assert_ne!((mnt2.mount_id, inc2), (mnt.info.mount_id, inc1));
+
+            // The src old-inc row IS cleared (the first purge succeeded
+            // before the fault); the dst old-inc row survives untouched.
+            // Dead-incarnation rows need the raw observability API (the
+            // public `get` is correctly fenced).
+            assert!(
+                !master_fs
+                    .cache_service
+                    .raw_row_valid(inc1, &key(&src_b))
+                    .unwrap(),
+                "the src purge (before the fault) must have cleared the old-inc row"
+            );
+            assert!(
+                master_fs
+                    .cache_service
+                    .raw_row_valid(inc1, &key(&dst_b))
+                    .unwrap(),
+                "the fenced purge must leave the old-inc dst row untouched (no victims)"
+            );
+            // The new incarnation is at ZERO rows for either key.
+            let key2 = |p: &Path| -> String {
+                let ufs_p = mnt2.get_ufs_path(p).unwrap();
+                mnt2.get_cache_key(&ufs_p).unwrap()
+            };
+            for k in [key2(&src_b), key2(&dst_b)] {
+                assert!(
+                    master_fs
+                        .cache_service
+                        .get(inc2, &k, false)
+                        .unwrap()
+                        .is_none(),
+                    "the new incarnation must stay at zero changes"
+                );
+            }
+
+            // The UFS backend is untouched by the fenced rename: src
+            // still has its content, dst still has the pre-seeded OLD.
+            let src_b_ufs = mnt2.get_ufs_path(&src_b).unwrap();
+            let dst_b_ufs = mnt2.get_ufs_path(&dst_b).unwrap();
+            let mut r = ufs.open(&src_b_ufs).await.unwrap();
+            assert_eq!(
+                r.read_as_string().await.unwrap(),
+                data_b,
+                "the fenced rename must leave UFS src untouched"
+            );
+            let mut r = ufs.open(&dst_b_ufs).await.unwrap();
+            assert_eq!(
+                r.read_as_string().await.unwrap(),
+                old_dst_b,
+                "the fenced rename must leave UFS dst untouched"
+            );
+
+            // The unified view still serves src via the UFS fallback.
+            let mut r = fs.open(&src_b).await.unwrap();
+            assert_eq!(r.read_as_string().await.unwrap(), data_b);
+
+            // Refresh through the cache-domain fence-refresh path, then
+            // the RETRY rename succeeds against the new binding.
+            assert_eq!(
+                fs.cache_status(&src_b).await.unwrap(),
+                CacheEntryStatus::Miss
+            );
+            assert!(fs.rename(&src_b, &dst_b).await.unwrap());
+            assert_eq!(UFS_RENAME_CALLS.load(Ordering::SeqCst), baseline + 1);
+            let mut r = fs.open(&dst_b).await.unwrap();
+            assert_eq!(
+                r.read_as_string().await.unwrap(),
+                data_b,
+                "the retried rename must serve the renamed content, never the stale OLD"
+            );
+        });
     }
 }

@@ -1467,6 +1467,102 @@ fn test_cache_p43_remount_bound_purge_fenced() {
     });
 }
 
+/// gpt56 `89ad4667` P0 raw/RPC seam: BOTH partial binding shapes
+/// (`(Some,None)` and `(None,Some)`) on a LIVE cache route are rejected
+/// LOUD before any route resolution, page walk, or journal write — zero
+/// victims (the live row survives every attempt) and the public status
+/// stays Hit. A half binding must never silently degrade to an unbound
+/// free that clears the CURRENT incarnation the caller never observed.
+#[test]
+fn test_cache_p43_partial_binding_shapes_fail_closed() {
+    let (fs, cluster) = get_fs_cache_meta();
+    let master_fs = cluster.get_active_master_fs();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        let ufs_base = env::var("UFS_TEST_PATH").unwrap();
+        let dir = Path::from_str(format!("{}/write_cache_CacheMode_p43half", ufs_base)).unwrap();
+        let root = Path::from_str("/write_cache_p43half").unwrap();
+        let opts = MountOptionsBuilder::new()
+            .write_type(WriteType::CacheMode)
+            .access_mode(AccessMode::ReadWrite)
+            .build();
+        let ufs = UfsFileSystem::new(&dir, opts.add_properties.clone(), None).unwrap();
+        ufs.mkdir(&dir, true).await.unwrap();
+        fs.mount(&dir, &root, opts).await.unwrap();
+
+        // One LIVE cache entry on the route — the would-be victim.
+        let path: Path = "/write_cache_p43half/f.log".into();
+        let data = Utils::rand_str(2048);
+        let mut w = fs.create(&path, true).await.unwrap();
+        w.write_string(&data).await.unwrap();
+        w.complete().await.unwrap();
+        let (ufs_path, mnt) = fs
+            .get_mount(&path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        fs.async_cache(&ufs_path).unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
+        assert!(matches!(
+            fs.cache_status(&path).await.unwrap(),
+            CacheEntryStatus::Hit { .. }
+        ));
+        let inc = master_fs
+            .cache_service
+            .current_incarnation_for_mount(mnt.info.mount_id)
+            .unwrap()
+            .unwrap();
+        let key = {
+            let ufs_p = mnt.get_ufs_path(&path).unwrap();
+            mnt.info.get_cache_key(&ufs_p).unwrap()
+        };
+
+        // Both mixed shapes, sent RAW (the wire shape a buggy/legacy
+        // client could produce) against the live cache route.
+        for (expected_mount_id, expected_cache_incarnation) in
+            [(Some(mnt.info.mount_id), None), (None, Some(inc))]
+        {
+            let rep: Result<curvine_proto::FreeResponse, _> = fs
+                .fs_client()
+                .rpc(
+                    RpcCode::Free,
+                    curvine_proto::FreeRequest {
+                        path: path.encode(),
+                        recursive: false,
+                        cache_cursor: None,
+                        expected_mount_id,
+                        expected_cache_incarnation,
+                    },
+                )
+                .await;
+            let err = match rep {
+                Err(e) => e,
+                Ok(_) => panic!("a partial binding must fail loud, not free"),
+            };
+            assert!(
+                format!("{:?}", err).contains("mixed shapes are rejected"),
+                "the raw partial shape must hit the pairing gate, got {:?}",
+                err
+            );
+            // Zero victims: the live row survives every attempt.
+            assert!(
+                master_fs
+                    .cache_service
+                    .get(inc, &key, false)
+                    .unwrap()
+                    .is_some(),
+                "a rejected partial binding must never purge the live row"
+            );
+        }
+
+        // The public status is STILL Hit — nothing walked, nothing freed.
+        assert!(matches!(
+            fs.cache_status(&path).await.unwrap(),
+            CacheEntryStatus::Hit { .. }
+        ));
+    });
+}
+
 /// P4-3 purge fences, seams 3+4+5 (gpt56 `2a089d5a` #3): the purge runs
 /// BEFORE the UFS mutation. When the UFS rename/delete fails (read-only
 /// UFS parent), the purge has already cleared the cache but the ORIGINAL

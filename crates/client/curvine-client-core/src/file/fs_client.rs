@@ -217,7 +217,7 @@ impl FsClient {
     }
 
     pub async fn free(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
-        self.free_with_binding(path, recursive, None, None).await
+        self.free_with_options(path, recursive, None, None).await
     }
 
     /// P4-3 purge fences (gpt56 `2a089d5a` #2): free carrying the
@@ -228,7 +228,27 @@ impl FsClient {
     /// than the caller observed. Continuation pages keep the
     /// master-minted token binding; expectations only ride the first
     /// request. Absent expectations = public Free, unchanged compat.
+    ///
+    /// gpt56 `89ad4667` P0: the bound API takes a NON-OPTION pair — a
+    /// half binding must never be constructible from the client side
+    /// (mixed shapes are rejected server-side before any routing).
     pub async fn free_with_binding(
+        &self,
+        path: &Path,
+        recursive: bool,
+        expected_mount_id: u32,
+        expected_cache_incarnation: u64,
+    ) -> FsResult<FreeResult> {
+        self.free_with_options(
+            path,
+            recursive,
+            Some(expected_mount_id),
+            Some(expected_cache_incarnation),
+        )
+        .await
+    }
+
+    async fn free_with_options(
         &self,
         path: &Path,
         recursive: bool,

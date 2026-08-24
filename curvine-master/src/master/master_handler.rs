@@ -317,6 +317,18 @@ impl MasterHandler {
         req_id: i64,
         header: FreeRequest,
     ) -> FsResult<(FreeResult, Option<crate::master::cache::FreeScopeProgress>)> {
+        // P4-3 focused fix (gpt56 `89ad4667` P0): the binding fields must
+        // ride the wire as a PAIR, validated BEFORE any route resolution,
+        // page walk, or journal write. Only `(None,None)` (legacy public
+        // Free) and `(Some,Some)` (bound purge) are legal shapes; each
+        // mixed shape is loud fail-closed — a half binding must never
+        // silently degrade to an unbound free that clears the CURRENT
+        // incarnation the caller never observed.
+        let expected = Self::free_expected_binding(
+            header.expected_mount_id,
+            header.expected_cache_incarnation,
+        )?;
+
         // Resolve the route FIRST (pure function below), then dispatch via
         // an exhaustive match: the inode free is only reachable through
         // `FreeRoute::LegacyInode` and NOTHING else.
@@ -340,15 +352,7 @@ impl MasterHandler {
                     info.mount_id,
                     &scope,
                     header.cache_cursor.as_deref(),
-                    match (header.expected_mount_id, header.expected_cache_incarnation) {
-                        (Some(mount_id), Some(incarnation)) => {
-                            Some(crate::master::cache::FreeBinding {
-                                mount_id,
-                                incarnation,
-                            })
-                        }
-                        _ => None,
-                    },
+                    expected,
                     crate::master::cache::MUTATION_MAX_PAGES_PER_CALL,
                 )?;
                 Ok((FreeResult::default(), Some(progress)))
@@ -372,10 +376,9 @@ impl MasterHandler {
                 // caller's observation is stale — the same typed FENCED
                 // terminal as a continuation on a dead route; it never
                 // falls through to inode deletion.
-                if header.expected_mount_id.is_some() || header.expected_cache_incarnation.is_some()
-                {
+                if let Some(binding) = expected {
                     return Err(curvine_error::FsError::cache_incarnation_fenced(
-                        header.expected_cache_incarnation.unwrap_or(0),
+                        binding.incarnation,
                     ));
                 }
                 if self.check_is_retry(req_id)? {
@@ -385,6 +388,33 @@ impl MasterHandler {
                 let res = self.set_req_cache(req_id, res)?;
                 Ok((res, None))
             }
+        }
+    }
+
+    /// P4-3 focused fix (gpt56 `89ad4667` P0): classify the wire binding
+    /// fields BEFORE any route resolution, page walk, or journal write.
+    /// `(None,None)` = legacy public Free (unbound); `(Some,Some)` = a
+    /// bound purge whose resolved route must match EXACTLY; BOTH mixed
+    /// shapes are loud fail-closed — a half binding must never silently
+    /// degrade to an unbound free that clears the CURRENT incarnation
+    /// the caller never observed.
+    fn free_expected_binding(
+        expected_mount_id: Option<u32>,
+        expected_cache_incarnation: Option<u64>,
+    ) -> FsResult<Option<crate::master::cache::FreeBinding>> {
+        match (expected_mount_id, expected_cache_incarnation) {
+            (None, None) => Ok(None),
+            (Some(mount_id), Some(incarnation)) => {
+                Ok(Some(crate::master::cache::FreeBinding {
+                    mount_id,
+                    incarnation,
+                }))
+            }
+            (mount_id, incarnation) => err_box!(
+                "free: expected binding must be a (mount_id, incarnation) pair, got mount_id={:?} incarnation={:?} — mixed shapes are rejected",
+                mount_id,
+                incarnation
+            ),
         }
     }
 
@@ -1767,6 +1797,35 @@ mod tests {
     use std::sync::{Arc, Condvar, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    /// Partial-binding pairing gate (gpt56 `89ad4667` P0): both mixed
+    /// shapes `(Some,None)`/`(None,Some)` are rejected BEFORE any route
+    /// resolution — a half binding must never degrade to an unbound free.
+    #[test]
+    fn cache_free_expected_binding_pairing_shapes() {
+        // (None, None) = legacy public Free (unbound).
+        assert_eq!(
+            MasterHandler::free_expected_binding(None, None).unwrap(),
+            None
+        );
+
+        // (Some, Some) = a bound purge pair, carried verbatim.
+        let binding = MasterHandler::free_expected_binding(Some(7), Some(11))
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.mount_id, 7);
+        assert_eq!(binding.incarnation, 11);
+
+        // Both mixed shapes are loud fail-closed errors.
+        for (mount_id, incarnation) in [(Some(7u32), None), (None, Some(11u64))] {
+            let err = MasterHandler::free_expected_binding(mount_id, incarnation).unwrap_err();
+            assert!(
+                format!("{}", err).contains("mixed shapes are rejected"),
+                "partial binding must fail loud, got: {}",
+                err
+            );
+        }
+    }
 
     /// Free bridge scope derivation (task #6, gpt56 `9f83a317` q1): the
     /// mount root maps to the typed Mount branch; an internal path maps

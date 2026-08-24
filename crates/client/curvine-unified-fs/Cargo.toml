@@ -34,3 +34,9 @@ opendal-hdfs = ["opendal", "curvine-ufs-opendal/opendal-hdfs"]
 opendal-webhdfs = ["opendal", "curvine-ufs-opendal/opendal-webhdfs"]
 opendal-hdfs-native = ["opendal", "curvine-ufs-opendal/opendal-hdfs-native"]
 oss-hdfs = ["dep:curvine-ufs-oss-hdfs", "curvine-ufs-oss-hdfs/oss-hdfs"]
+
+# gpt56 `89ad4667` two-stage rename seam: the in-crate test needs
+# MiniCluster. No cycle — curvine-server depends only on
+# curvine-client-core, not on curvine-unified-fs.
+[dev-dependencies]
+curvine-server = { workspace = true }

@@ -198,8 +198,8 @@ impl CurvineFileSystem {
         &self,
         path: &Path,
         recursive: bool,
-        expected_mount_id: Option<u32>,
-        expected_cache_incarnation: Option<u64>,
+        expected_mount_id: u32,
+        expected_cache_incarnation: u64,
     ) -> FsResult<FreeResult> {
         self.fs_client
             .free_with_binding(

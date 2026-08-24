@@ -1786,6 +1786,24 @@ impl CacheService {
     #[inline(always)]
     fn fire_publish_hook(&self) {}
 
+    /// Raw row observability for seam tests and ops inspection (gpt56
+    /// `89ad4667` two-stage rename seam): does a `Valid` row exist for
+    /// (incarnation, key)? Deliberately bypasses the incarnation gate —
+    /// the public `get` is correctly fenced for production reads, which
+    /// makes DEAD-incarnation rows unobservable exactly where the seam
+    /// assertions need them (after a between-stage remount). Ignores
+    /// expiry (a row past its ttl still counts — passivity belongs to
+    /// the serving path, not to row observability).
+    pub fn raw_row_valid(&self, incarnation: u64, key: &str) -> CommonResult<bool> {
+        let store = self.fs_dir.read();
+        let rocks = store.get_rocks_store();
+        let valid = rocks
+            .cache_get_entry(incarnation, key)
+            .map_err(fs_err)?
+            .is_some_and(|entry| entry.state == CacheEntryState::Valid);
+        Ok(valid)
+    }
+
     /// Whole-object lookup. `hit` requires a `Valid`, unexpired entry AND
     /// (when `need_locations`) a complete volatile location set for the
     /// derived block layout — anything missing is a miss (caller falls
