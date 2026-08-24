@@ -973,6 +973,28 @@ impl FsDir {
         &self.store.store
     }
 
+    /// P4-0 composite mount lifecycle: durable CAS transition, exposed with
+    /// its status so the journal loader can converge the live MountTable in
+    /// the same committed apply event (after the batch, before the ACK).
+    pub(crate) fn apply_mount_lifecycle_entry(
+        &self,
+        e: &crate::master::journal::MountLifecycleV2Entry,
+    ) -> CommonResult<crate::master::meta::cache::MountLifecycleStatus> {
+        let store = self.get_rocks_store();
+        self.cache.apply_mount_lifecycle(
+            store,
+            e.token,
+            e.kind,
+            e.mount_id,
+            e.expected_mount.as_ref(),
+            e.expected_incarnation,
+            e.next_mount.as_ref(),
+            e.old_incarnation,
+            e.new_incarnation,
+            e.ttl_ms,
+        )
+    }
+
     /// Apply a committed cache-mode journal entry to the authoritative store.
     /// This is the ONLY apply path for cache entries and runs identically on
     /// leader and follower (journal replay); it never touches UFS.
@@ -1033,6 +1055,14 @@ impl FsDir {
             JournalEntry::CacheIncarnationRevoke(e) => {
                 self.cache
                     .apply_incarnation_revoke(store, e.mount_id, e.incarnation)
+            }
+            JournalEntry::MountLifecycleV2(e) => {
+                // P4-0 composite lifecycle: durable CAS transition (mount row
+                // + cache namespace) in one batch. The status is dropped here
+                // for the uniform dispatch; the journal loader consumes it
+                // via `apply_mount_lifecycle_entry` to converge the LIVE
+                // MountTable in the same apply event.
+                self.apply_mount_lifecycle_entry(e).map(|_| ())
             }
             JournalEntry::CacheAllocate(e) => self.cache.apply_allocate(
                 store,

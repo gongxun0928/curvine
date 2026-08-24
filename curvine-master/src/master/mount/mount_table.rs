@@ -179,6 +179,21 @@ impl MountTable {
         ufs_path: &str,
         mnt_opt: &MountOptions,
     ) -> FsResult<()> {
+        self.check_new_mount(cv_path, ufs_path)?;
+
+        let info = mnt_opt.clone().to_info(mount_id, cv_path, ufs_path);
+        self.unprotected_add_mount(info.clone())?;
+
+        let mut fs_dir = self.fs_dir.write();
+        fs_dir.store_mount(info, true)?;
+        Ok(())
+    }
+
+    /// Pre-proposal conflict gate for a NEW mount row (task #6 P4-0):
+    /// the composite cache-mode lifecycle path must reject a conflicting
+    /// add BEFORE proposing the journal entry, mirroring the legacy
+    /// `add_mount` checks against the live table.
+    pub fn check_new_mount(&self, cv_path: &str, ufs_path: &str) -> FsResult<()> {
         if self.exists(ufs_path)? {
             return err_box!("{} already exists in mount table", ufs_path);
         }
@@ -187,14 +202,7 @@ impl MountTable {
             return err_box!("{} already exists in mount table", cv_path);
         }
 
-        self.check_conflict(cv_path, ufs_path)?;
-
-        let info = mnt_opt.clone().to_info(mount_id, cv_path, ufs_path);
-        self.unprotected_add_mount(info.clone())?;
-
-        let mut fs_dir = self.fs_dir.write();
-        fs_dir.store_mount(info, true)?;
-        Ok(())
+        self.check_conflict(cv_path, ufs_path)
     }
 
     pub fn update_mount(&self, info: MountInfo) -> FsResult<()> {

@@ -23,6 +23,10 @@ message MountInfoProto {
     optional bool auto_cache = 13 [default = true];
     optional AccessModeProto access_mode = 14 [default = ACCESS_MODE_PROTO_READ_ONLY];
     optional bool write_cache = 15 [default = false];
+    // Task #6 P4-0: current cache incarnation of this mount, composed at
+    // response time from the authoritative RocksDB pointer — NEVER
+    // persisted inside MountInfo (bincode journal compatibility).
+    optional uint64 cache_incarnation = 16;
 }
 
 message MountOptionsProto {
@@ -40,6 +44,11 @@ message MountOptionsProto {
     optional bool auto_cache = 13;
     optional AccessModeProto access_mode = 14;
     optional bool write_cache = 15;
+    // Task #6 P4-0 (gpt56 61a4dddc): additive tri-state for update only —
+    // absent = keep the mount's current write_type; present = switch
+    // (cache-mode enter/leave must route through the composite lifecycle).
+    // The required write_type above stays untouched for Add and old clients.
+    optional WriteTypeProto update_write_type = 16;
 }
 
 enum ProviderProto {
@@ -57,6 +66,11 @@ message MountRequest {
     required string cv_path = 1;
     required string ufs_path = 2;
     required MountOptionsProto mount_options = 3;
+    // Task #6 P4-0: retry-stable op identity for the composite cache-mode
+    // mount lifecycle. Required (non-zero) whenever the operation routes
+    // to the lifecycle entry; absent/zero is fail-closed there.
+    optional uint64 op_client_id = 4;
+    optional uint64 op_seq = 5;
 }
 
 message MountResponse {
@@ -68,6 +82,9 @@ message UnMountOptions {
 
 message UnMountRequest {
     required string cv_path = 1;
+    // Task #6 P4-0: as MountRequest.op_client_id/op_seq.
+    optional uint64 op_client_id = 2;
+    optional uint64 op_seq = 3;
 }
 
 message UnMountResponse {

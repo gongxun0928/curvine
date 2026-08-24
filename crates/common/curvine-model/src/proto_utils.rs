@@ -654,6 +654,10 @@ impl ProtoUtils {
             auto_cache: Some(info.auto_cache),
             access_mode: Some(info.access_mode.into()),
             write_cache: Some(info.write_cache),
+            // Composed by the caller from the authoritative RocksDB
+            // pointer when serving mount-table RPCs; never persisted
+            // inside MountInfo.
+            cache_incarnation: None,
         }
     }
 
@@ -689,6 +693,7 @@ impl ProtoUtils {
             replicas: opts.replicas,
             remove_properties: opts.remove_properties,
             write_type: opts.write_type.into(),
+            update_write_type: opts.update_write_type.map(|v| v.into()),
             provider: opts.provider.map(|v| v.into()),
             auto_cache: opts.auto_cache,
             access_mode: opts.access_mode.map(|v| v.into()),
@@ -708,6 +713,7 @@ impl ProtoUtils {
             replicas: opts.replicas,
             remove_properties: opts.remove_properties,
             write_type: opts.write_type.into(),
+            update_write_type: opts.update_write_type.map(WriteType::from),
             provider: opts.provider.map(Provider::from),
             auto_cache: opts.auto_cache,
             access_mode: opts.access_mode.map(AccessMode::from),

@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use crate::master::meta::cache::{
-    CacheEntry, ExpiryRow, OpToken, OutcomeGcGroup, ScopeRemoveVictim, VacuumVictim,
+    CacheEntry, ExpiryRow, MountLifecycleKind, OpToken, OutcomeGcGroup, ScopeRemoveVictim,
+    VacuumVictim,
 };
 use crate::master::meta::inode::{InodeDir, InodeFile, InodeView};
 use crate::master::meta::BlockMeta;
@@ -447,6 +448,41 @@ pub struct CacheReservedReapEntry {
     pub(crate) lease_expire_at: i64,
 }
 
+/// P4-0 composite mount lifecycle transition (gpt56 `9f83a317`/`a929ae03`):
+/// ONE committed apply atomically moves the persisted mount row and the cache
+/// incarnation namespace (row/policy/current pointer/HW) in a single RocksDB
+/// WriteBatch, and the same apply event updates the live MountTable before
+/// the raft apply ACK. The entry freezes the expected old state (exact
+/// persisted mount row + current pointer) so apply is a CAS, never a blind
+/// overwrite: a raced update/unmount loses deterministically (loud warn,
+/// durable no-op, live table untouched). The non-zero [`OpToken`] binds the
+/// outcome to the full payload; exact replay resolves AlreadyApplied with
+/// zero journal growth.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct MountLifecycleV2Entry {
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
+    pub(crate) token: OpToken,
+    pub(crate) kind: MountLifecycleKind,
+    /// Reusable routing id — the SAME id across add/update/unmount/remount.
+    pub(crate) mount_id: u32,
+    /// Exact persisted mount row the issuer observed (None = absent).
+    pub(crate) expected_mount: Option<MountInfo>,
+    /// Exact current-incarnation pointer the issuer observed (None = none).
+    pub(crate) expected_incarnation: Option<u64>,
+    /// Target mount row: Some = upsert (a cache→fs update keeps the merged
+    /// fs-mode row); None = remove (unmount only).
+    pub(crate) next_mount: Option<MountInfo>,
+    /// Incarnation being left: revoked in the same batch; row stays forever.
+    pub(crate) old_incarnation: Option<u64>,
+    /// Fresh incarnation installed by this transition (None when the target
+    /// state has no cache namespace). Durable HW + 1 at issue time.
+    pub(crate) new_incarnation: Option<u64>,
+    /// Frozen policy snapshot for `new_incarnation` (0 = no TTL). Never read
+    /// when `new_incarnation` is None.
+    pub(crate) ttl_ms: i64,
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum JournalEntry {
     Mkdir(MkdirEntry),
@@ -481,6 +517,7 @@ pub enum JournalEntry {
     CacheOutcomeGc(CacheOutcomeGcEntry),
     CacheAbort(CacheAbortEntry),
     CacheReservedReap(CacheReservedReapEntry),
+    MountLifecycleV2(MountLifecycleV2Entry),
 }
 
 impl JournalEntry {
@@ -517,6 +554,7 @@ impl JournalEntry {
             JournalEntry::CacheOutcomeGc(e) => e.op_id,
             JournalEntry::CacheReservedReap(e) => e.op_id,
             JournalEntry::CacheAbort(e) => e.op_id,
+            JournalEntry::MountLifecycleV2(e) => e.op_id,
         }
     }
 
@@ -553,6 +591,7 @@ impl JournalEntry {
             JournalEntry::CacheOutcomeGc(e) => e.rpc_id,
             JournalEntry::CacheReservedReap(e) => e.rpc_id,
             JournalEntry::CacheAbort(e) => e.rpc_id,
+            JournalEntry::MountLifecycleV2(e) => e.rpc_id,
         }
     }
 
@@ -607,7 +646,8 @@ impl JournalEntry {
             | JournalEntry::CacheTtlSweep(_)
             | JournalEntry::CacheVacuum(_)
             | JournalEntry::CacheOutcomeGc(_)
-            | JournalEntry::CacheReservedReap(_) => Vec::new(),
+            | JournalEntry::CacheReservedReap(_)
+            | JournalEntry::MountLifecycleV2(_) => Vec::new(),
         }
     }
 
@@ -640,6 +680,7 @@ impl JournalEntry {
                 | JournalEntry::CacheVacuum(_)
                 | JournalEntry::CacheOutcomeGc(_)
                 | JournalEntry::CacheReservedReap(_)
+                | JournalEntry::MountLifecycleV2(_)
         )
     }
 }
@@ -1321,6 +1362,23 @@ mod tests {
                     lease_expire_at: 100,
                 }),
                 30,
+            ),
+            // P4-0 append: composite mount lifecycle transition at the tail.
+            (
+                JournalEntry::MountLifecycleV2(MountLifecycleV2Entry {
+                    op_id: 1,
+                    rpc_id: 0,
+                    token: token(),
+                    kind: crate::master::meta::cache::MountLifecycleKind::Add,
+                    mount_id: 5,
+                    expected_mount: None,
+                    expected_incarnation: None,
+                    next_mount: None,
+                    old_incarnation: None,
+                    new_incarnation: Some(1),
+                    ttl_ms: 0,
+                }),
+                31,
             ),
         ];
 

@@ -30,6 +30,22 @@ use prost::Message as PMessage;
 use std::collections::LinkedList;
 use std::sync::Arc;
 
+/// Client id for mount lifecycle op tokens (task #6 P4-0): a fresh
+/// random non-zero u64 per logical mount/umount call (gpt56 a4e3804f:
+/// time-derived ids collide across CLI processes started in the same
+/// millisecond). The op_seq is fixed at 1: each call is one logical op,
+/// and the token rides the request struct verbatim across RPC-layer
+/// retries so a response loss resolves AlreadyApplied instead of
+/// double-applying.
+fn mount_op_client_id() -> u64 {
+    use rand::Rng;
+    let mut id = rand::thread_rng().gen::<u64>();
+    if id == 0 {
+        id = 1;
+    }
+    id
+}
+
 #[derive(Clone)]
 pub struct FsClient {
     context: Arc<FsContext>,
@@ -659,6 +675,8 @@ impl FsClient {
             ufs_path: ufs_path.encode_uri(),
             cv_path: cv_path.encode(),
             mount_options: ProtoUtils::mount_options_to_pb(opts),
+            op_client_id: Some(mount_op_client_id()),
+            op_seq: Some(1),
         };
 
         let rep: MountResponse = self.rpc(RpcCode::Mount, req).await?;
@@ -668,6 +686,8 @@ impl FsClient {
     pub async fn umount(&self, cv_path: &Path) -> FsResult<UnMountResponse> {
         let req = UnMountRequest {
             cv_path: cv_path.encode(),
+            op_client_id: Some(mount_op_client_id()),
+            op_seq: Some(1),
         };
 
         let rep: UnMountResponse = self.rpc(RpcCode::UnMount, req).await?;

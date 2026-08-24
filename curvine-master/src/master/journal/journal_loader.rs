@@ -16,6 +16,7 @@
 
 use crate::master::fs::MasterFilesystem;
 use crate::master::journal::*;
+use crate::master::meta::cache::MountLifecycleStatus;
 use crate::master::meta::inode::InodeView::File;
 use crate::master::meta::inode::{InodePath, InodeView};
 use crate::master::meta::InodeId;
@@ -299,7 +300,22 @@ impl JournalLoader {
                 }
             }
 
-            let res = if op_entry.is_cache_entry() {
+            let res = if let JournalEntry::MountLifecycleV2(e) = &op_entry {
+                // P4-0 composite mount lifecycle: the durable CAS batch
+                // commits first, then the LIVE MountTable converges in the
+                // SAME committed apply event — after the batch, before the
+                // raft apply ACK; a live-table failure is apply-fatal and
+                // must never be ACKed (gpt56 a929ae03). A loser CAS
+                // (Superseded) leaves the live table untouched; an exact
+                // replay (AlreadyApplied) still self-heals the live table
+                // to the entry's target state.
+                let fs_dir = self.fs_dir.read();
+                let status = fs_dir.apply_mount_lifecycle_entry(e)?;
+                if status != MountLifecycleStatus::Superseded {
+                    self.apply_lifecycle_live_table(e)?;
+                }
+                Ok(())
+            } else if op_entry.is_cache_entry() {
                 // Cache-mode entries apply through the single committed
                 // CacheManager path on leader AND follower — never the
                 // leader UFS loader (no pre-apply, no UFS side effects).
@@ -855,6 +871,29 @@ impl JournalLoader {
         Ok(())
     }
 
+    /// P4-0 composite lifecycle: converge the LIVE MountTable to the
+    /// entry's target state. Runs in the same committed apply event as the
+    /// durable batch (leader, follower, restart replay alike) — idempotent,
+    /// because a restart may have restored the table from rows that already
+    /// reflect the transition. Lock order: the durable batch lock was
+    /// released before this runs; this takes only the mount-table write
+    /// lock (same order as `restore`).
+    fn apply_lifecycle_live_table(&self, e: &MountLifecycleV2Entry) -> CommonResult<()> {
+        match &e.next_mount {
+            Some(m) => {
+                self.mnt_mgr.unprotected_add_mount(m.clone())?;
+            }
+            None => {
+                // Self-healing tolerance: after a restart the restored table
+                // may already reflect the removal.
+                if self.mnt_mgr.has_mounted(e.mount_id)? {
+                    self.mnt_mgr.unprotected_umount_by_id(e.mount_id)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn set_attr(&self, entry: SetAttrEntry) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
         let inp = InodePath::resolve(fs_dir.root_ptr(), &entry.path, &fs_dir.store)?;
@@ -1070,8 +1109,10 @@ mod tests {
     use super::*;
     use crate::master::cache::{CacheCommitParams, CacheOpStatus};
     use crate::master::fs::{MasterFilesystem, WorkerManager};
+    use crate::master::meta::cache::store::CacheWrite;
     use crate::master::meta::cache::{
-        state_tags, BlockIdCodec, CacheEntryState, LocalCacheIndexStore, OpOutcome, OpToken,
+        state_tags, BlockIdCodec, CacheEntryState, LocalCacheIndexStore, MountLifecycleKind,
+        MountLifecycleRejectReason, MountLifecycleStatus, OpOutcome, OpToken,
     };
     use crate::master::meta::inode::ttl::TtlBucketList;
     use crate::master::meta::store::RocksInodeStore;
@@ -1999,6 +2040,917 @@ mod tests {
         }
 
         let _ = FileUtils::delete_path(&base, true);
+    }
+
+    /// P4-0 composite mount lifecycle on a REAL single-voter raft node
+    /// (production journal writer + apply worker), driven through the
+    /// routing layer (MountManager) and the direct issuer (CacheService).
+    ///
+    /// Phase 1 —
+    /// 1. composite Add (mkdir + ONE lifecycle entry): durable row,
+    ///    incarnation 1, current pointer, frozen policy, HW, outcome; the
+    ///    LIVE MountTable converges at the apply event.
+    /// 2. RT2: response-loss retry of the Add resolves at routing — the
+    ///    parent asserts the journal grows by NOTHING.
+    /// 3. composite TTL Update (inc 1 revoked, inc 2 installed) + RT2 retry.
+    /// 4. RT3: the same token replayed with a divergent payload is a loud
+    ///    routing error — zero propose.
+    /// 5. q3 legacy property-only update: a plain Mount journal entry; the
+    ///    incarnation namespace untouched (this row drift is exactly the
+    ///    benign Superseded case the replay verify tolerates).
+    /// 6. composite Unmount (row removed, inc 2 revoked, pointer cleared)
+    ///    plus an RT2 retry that must resolve although the mount no longer
+    ///    exists.
+    /// 7. mount-id reuse: re-Add under the SAME id mints a FRESH
+    ///    incarnation 3 — dead identities never alias.
+    /// 8. dual mount-id, same cv path (direct issuer, the racing writer
+    ///    that skipped the live precheck): the durable path-conflict gate
+    ///    makes the racing Add a deterministic loser — Superseded, no row,
+    ///    no incarnation 4, no HW movement, no outcome.
+    /// 9. crafted stale-expected entry: the CAS loss is a deterministic
+    ///    Superseded no-op at apply (no outcome, no state movement).
+    /// 10. RT6 leave-cache update (direct issuer — `merge_with` cannot
+    ///     flip write_type, see the report): fs-mode row + revoked inc 3 +
+    ///     cleared pointer in ONE entry; the live table converges.
+    ///
+    /// Phase 2 — restart replay: the live mount table converges to the
+    /// fs-mode row, all three incarnations are revoked, HW is 3, the
+    /// restore validator passes, and the recorded retries STILL resolve
+    /// with zero proposals (the parent asserts the entry count). RT5: a
+    /// stray current-incarnation pointer is a loud restore violation
+    /// until repaired.
+    ///
+    /// Expected phase-1 data entries (9): mkdir, composite Add, composite
+    /// TTL-Update, legacy Mount, composite Unmount, composite re-Add,
+    /// dual-id Add loser (records a PathConflict rejection), stale-row
+    /// Update loser (records a CasRowLost rejection), leave-cache Update
+    /// via routing (update_write_type). Every same-token replay, the RT3
+    /// divergence, and the watermark Expired seam propose nothing.
+    #[test]
+    fn real_raft_mount_lifecycle() {
+        let leader_mode_env = "CURVINE_TEST_MLC_LEADER";
+        let phase_env = "CURVINE_TEST_MLC_PHASE";
+        let meta_dir_env = "CURVINE_TEST_MLC_META_DIR";
+        let journal_dir_env = "CURVINE_TEST_MLC_JOURNAL_DIR";
+
+        if std::env::var(leader_mode_env).is_ok() {
+            real_raft_mount_lifecycle_leader(meta_dir_env, journal_dir_env, phase_env);
+            return;
+        }
+
+        Master::init_test_metrics();
+        let base = Utils::cur_dir_sub(format!(
+            "../target/testing/real-raft-mlc-{}-{}",
+            std::process::id(),
+            Utils::rand_str(6)
+        ));
+        let meta_dir = format!("{}/meta", base);
+        let journal_dir = format!("{}/journal", base);
+        let _ = FileUtils::delete_path(&base, true);
+
+        let exe = std::env::current_exe().unwrap();
+        let count_data_entries = |journal_dir: &str| -> usize {
+            let mut journal = JournalConf::with_test();
+            journal.enable = true;
+            journal.journal_dir = journal_dir.to_string();
+            let log_store = RocksLogStorage::from_conf(&journal, false);
+            let last = log_store.read().last_index();
+            if last < 1 {
+                return 0;
+            }
+            let entries = log_store.scan_entries(1, last + 1).unwrap();
+            drop(log_store);
+            // Leader-side UfsApplied marker batches are async replay noise
+            // (they coalesce nondeterministically with the fs-path ops);
+            // only entries carrying at least one real op count.
+            entries
+                .into_iter()
+                .filter(|e| e.get_entry_type() == EntryType::EntryNormal && !e.data.is_empty())
+                .filter(|e| match JournalBatch::deserialize_compat(&e.data) {
+                    Ok(batch) => batch
+                        .batch
+                        .iter()
+                        .any(|op| !matches!(op, JournalEntry::UfsApplied(_))),
+                    Err(_) => true,
+                })
+                .count()
+        };
+        for phase in ["1", "2"] {
+            let output = std::process::Command::new(&exe)
+                .arg("--exact")
+                .arg("master::journal::journal_loader::tests::real_raft_mount_lifecycle")
+                .env(leader_mode_env, "1")
+                .env(phase_env, phase)
+                .env(meta_dir_env, &meta_dir)
+                .env(journal_dir_env, &journal_dir)
+                .output()
+                .unwrap_or_else(|e| panic!("spawn mlc-leader phase {} failed: {}", phase, e));
+            assert!(
+                output.status.success(),
+                "mlc-leader phase {} failed\nstdout:\n{}\nstderr:\n{}",
+                phase,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            // Phase 1 must propose EXACTLY the nine expected entries; the
+            // RT2 retries and the RT3 divergence propose nothing. Phase 2
+            // must propose nothing either: its log holds either the same
+            // nine entries (no compaction) or none (startup snapshot
+            // purged the applied prefix); any OTHER count means a new
+            // proposal.
+            let count = count_data_entries(&journal_dir);
+            if phase == "1" {
+                assert_eq!(count, 9, "unexpected journal entry count after phase 1");
+            } else {
+                assert!(
+                    count == 0 || count == 9,
+                    "phase 2 must propose nothing (found {} data entries)",
+                    count
+                );
+            }
+        }
+
+        let _ = FileUtils::delete_path(&base, true);
+    }
+
+    /// The leader lifetime for the mount-lifecycle test above: a REAL
+    /// single-voter raft node with the production writer and apply worker.
+    /// No worker session is needed — the composite lifecycle never plans
+    /// placements.
+    fn real_raft_mount_lifecycle_leader(
+        meta_dir_env: &str,
+        journal_dir_env: &str,
+        phase_env: &str,
+    ) {
+        use curvine_fs_api::Path;
+
+        Master::init_test_metrics();
+        let meta_dir = std::env::var(meta_dir_env).unwrap();
+        let journal_dir = std::env::var(journal_dir_env).unwrap();
+        let phase = std::env::var(phase_env).unwrap();
+
+        let mut journal = JournalConf::with_test();
+        journal.enable = true;
+        journal.journal_dir = journal_dir;
+        let conf = ClusterConf {
+            testing: true,
+            format_master: phase == "1",
+            journal,
+            master: MasterConf {
+                meta_dir,
+                cache_metadata_enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let rt = conf.journal.create_runtime();
+        let log_store = RocksLogStorage::from_conf(&conf.journal, true);
+        let role_monitor = RoleMonitor::new();
+        let master_monitor = MasterMonitor::with_epoch(
+            role_monitor.read_ctl(),
+            StateCtl::new(0),
+            role_monitor.epoch_ctl(),
+        );
+        let client = RaftClient::from_conf(rt.clone(), &conf.journal);
+        let journal_writer = Arc::new(JournalWriter::new(false, client, &conf.journal).unwrap());
+        let ttl_bucket_list =
+            Arc::new(TtlBucketList::new(conf.master.ttl_bucket_interval_ms() as i64).unwrap());
+        let eviction_conf = EvictionConf::from_conf(&conf);
+        let evictor: Arc<dyn Evictor> = Arc::new(LRUEvictor::new(eviction_conf.clone()));
+        let fs_dir = SyncFsDir::new(
+            FsDir::new(&conf, journal_writer.clone(), ttl_bucket_list, evictor).unwrap(),
+        );
+        let fs = MasterFilesystem::new(
+            &conf,
+            fs_dir.clone(),
+            SyncWorkerManager::new(WorkerManager::new(&conf).unwrap()),
+            master_monitor,
+        )
+        .unwrap();
+        let cache = fs.cache_service.clone();
+        let mount_manager = Arc::new(MountManager::new(fs.clone()));
+        let job_manager = Arc::new(JobManager::from_cluster_conf(
+            fs,
+            mount_manager.clone(),
+            rt.clone(),
+            &conf,
+        ));
+        let loader = JournalLoader::new(
+            rt.clone(),
+            fs_dir.clone(),
+            mount_manager.clone(),
+            &conf.journal,
+            job_manager,
+            log_store.clone(),
+            journal_writer.clone(),
+        )
+        .unwrap();
+        let raft = MetaRaftJournal::new(
+            rt.clone(),
+            log_store,
+            loader.clone(),
+            conf.journal.clone(),
+            role_monitor,
+        );
+        let mut listener = rt.block_on(raft.run()).unwrap();
+        rt.block_on(listener.wait_leader()).unwrap();
+
+        let cv = "/p4mlcA";
+        let ufs = "file:///tmp/p4-mlc-a";
+        let mount_info = || {
+            mount_manager
+                .get_mount_info(&Path::from_str(cv).unwrap())
+                .unwrap()
+        };
+        let add_opts = || {
+            MountOptions::builder()
+                .write_type(WriteType::CacheMode)
+                .access_mode(AccessMode::ReadWrite)
+                .ttl_ms(3_600_000)
+                .build()
+        };
+        let upd_opts = || {
+            MountOptions::builder()
+                .update(true)
+                .write_type(WriteType::CacheMode)
+                .access_mode(AccessMode::ReadWrite)
+                .ttl_ms(7_200_000)
+                .build()
+        };
+
+        if phase == "2" {
+            // Production startup rebuilds the live mount table from the
+            // persisted rows (the journal is already at the apply
+            // high-water, so replay skips — same as master_server start).
+            mount_manager.restore().unwrap();
+            // Replay converged the live mount table to the fs-mode row.
+            let live = mount_info().expect("replay converges the live mount table");
+            assert!(!live.is_cache_mode(), "final target is the fs-mode row");
+            let mid = live.mount_id;
+            {
+                let store = fs_dir.read();
+                let rocks = store.get_rocks_store();
+                assert!(!rocks
+                    .cache_mount_point(mid)
+                    .unwrap()
+                    .unwrap()
+                    .is_cache_mode());
+                assert_eq!(rocks.cache_current_incarnation(mid).unwrap(), None);
+                for inc in 1..=3u64 {
+                    let row = rocks
+                        .cache_get_incarnation(inc)
+                        .unwrap()
+                        .unwrap_or_else(|| {
+                            panic!("incarnation {} row missing across the restart", inc)
+                        });
+                    assert!(row.revoked, "inc {} revoked across the restart", inc);
+                }
+                assert_eq!(
+                    rocks
+                        .cache_get_state(state_tags::CACHE_INCARNATION)
+                        .unwrap(),
+                    Some(3)
+                );
+            }
+            cache.validate_mount_lifecycle_restore().unwrap();
+
+            // RT2 across the restart: the recorded retries resolve at
+            // routing with ZERO proposals (parent asserts the count).
+            mount_manager
+                .mount_with_token(
+                    None,
+                    cv,
+                    ufs,
+                    &add_opts(),
+                    Some(OpToken {
+                        client_id: 100,
+                        op_seq: 1,
+                    }),
+                    61,
+                )
+                .unwrap();
+            mount_manager
+                .mount_with_token(
+                    None,
+                    cv,
+                    ufs,
+                    &upd_opts(),
+                    Some(OpToken {
+                        client_id: 100,
+                        op_seq: 2,
+                    }),
+                    62,
+                )
+                .unwrap();
+            mount_manager
+                .umount_with_token(
+                    cv,
+                    Some(OpToken {
+                        client_id: 100,
+                        op_seq: 3,
+                    }),
+                    63,
+                )
+                .unwrap();
+            mount_manager
+                .mount_with_token(
+                    Some(mid),
+                    cv,
+                    ufs,
+                    &add_opts(),
+                    Some(OpToken {
+                        client_id: 100,
+                        op_seq: 4,
+                    }),
+                    64,
+                )
+                .unwrap();
+
+            // RT-blocker-4 watermark seam: a retry whose recorded outcome
+            // is gone (GC) but whose token is at/below the client watermark
+            // is a TERMINAL Expired at routing — before the not-found /
+            // assign / delta checks can misfire, zero proposals.
+            {
+                let store = fs_dir.read();
+                let rocks = store.get_rocks_store();
+                let mut w = rocks.cache_write();
+                w.set_client_watermark(102, 7).unwrap();
+                w.commit().unwrap();
+            }
+            let err = mount_manager
+                .umount_with_token(
+                    cv,
+                    Some(OpToken {
+                        client_id: 102,
+                        op_seq: 3,
+                    }),
+                    65,
+                )
+                .unwrap_err();
+            assert!(
+                format!("{}", err).contains("is expired"),
+                "watermark seam: {}",
+                err
+            );
+            let err = mount_manager
+                .mount_with_token(
+                    None,
+                    "/p4mlc-none",
+                    "file:///tmp/p4-mlc-none",
+                    &add_opts(),
+                    Some(OpToken {
+                        client_id: 102,
+                        op_seq: 5,
+                    }),
+                    66,
+                )
+                .unwrap_err();
+            assert!(
+                format!("{}", err).contains("is expired"),
+                "watermark seam (add): {}",
+                err
+            );
+
+            // RT5: a stray pointer is a loud restore violation until
+            // repaired — the master fails startup rather than minting or
+            // deleting anything.
+            {
+                let store = fs_dir.read();
+                let rocks = store.get_rocks_store();
+                let mut w = rocks.cache_write();
+                w.set_current_incarnation(777, 42).unwrap();
+                w.commit().unwrap();
+            }
+            let err = cache.validate_mount_lifecycle_restore().unwrap_err();
+            assert!(
+                format!("{}", err).contains("restore invariant violated"),
+                "RT5: {}",
+                err
+            );
+            {
+                let store = fs_dir.read();
+                let rocks = store.get_rocks_store();
+                let mut w = rocks.cache_write();
+                w.clear_current_incarnation(777).unwrap();
+                w.commit().unwrap();
+            }
+            cache.validate_mount_lifecycle_restore().unwrap();
+
+            std::process::exit(0);
+        }
+
+        // 1. Composite Add via routing.
+        mount_manager
+            .mount_with_token(
+                None,
+                cv,
+                ufs,
+                &add_opts(),
+                Some(OpToken {
+                    client_id: 100,
+                    op_seq: 1,
+                }),
+                51,
+            )
+            .unwrap();
+        let mid = mount_info()
+            .expect("live table converged at the apply event")
+            .mount_id;
+        {
+            let store = fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let row = rocks.cache_mount_point(mid).unwrap().expect("durable row");
+            assert!(row.is_cache_mode());
+            assert_eq!(row.ttl_ms, 3_600_000);
+            assert_eq!(rocks.cache_current_incarnation(mid).unwrap(), Some(1));
+            assert!(!rocks.cache_get_incarnation(1).unwrap().unwrap().revoked);
+            assert_eq!(
+                rocks
+                    .cache_get_incarnation_policy(1)
+                    .unwrap()
+                    .unwrap()
+                    .ttl_ms,
+                3_600_000
+            );
+            assert_eq!(
+                rocks
+                    .cache_get_state(state_tags::CACHE_INCARNATION)
+                    .unwrap(),
+                Some(1)
+            );
+            match rocks
+                .cache_get_outcome(OpToken {
+                    client_id: 100,
+                    op_seq: 1,
+                })
+                .unwrap()
+                .unwrap()
+            {
+                OpOutcome::MountLifecycle {
+                    kind: MountLifecycleKind::Add,
+                    mount_id: out_mid,
+                    new_incarnation: Some(1),
+                    ..
+                } => assert_eq!(out_mid, mid),
+                other => panic!("t1 outcome: {:?}", other),
+            }
+        }
+
+        // 2. RT2: response-loss retry of the Add.
+        mount_manager
+            .mount_with_token(
+                None,
+                cv,
+                ufs,
+                &add_opts(),
+                Some(OpToken {
+                    client_id: 100,
+                    op_seq: 1,
+                }),
+                51,
+            )
+            .unwrap();
+
+        // 3. Composite TTL Update: incarnation 1 revoked, 2 installed.
+        mount_manager
+            .mount_with_token(
+                None,
+                cv,
+                ufs,
+                &upd_opts(),
+                Some(OpToken {
+                    client_id: 100,
+                    op_seq: 2,
+                }),
+                52,
+            )
+            .unwrap();
+        {
+            let store = fs_dir.read();
+            let rocks = store.get_rocks_store();
+            assert_eq!(
+                rocks.cache_mount_point(mid).unwrap().unwrap().ttl_ms,
+                7_200_000
+            );
+            assert_eq!(rocks.cache_current_incarnation(mid).unwrap(), Some(2));
+            assert!(
+                rocks.cache_get_incarnation(1).unwrap().unwrap().revoked,
+                "the left incarnation is revoked, never deleted"
+            );
+            assert!(!rocks.cache_get_incarnation(2).unwrap().unwrap().revoked);
+            assert_eq!(
+                rocks
+                    .cache_get_incarnation_policy(2)
+                    .unwrap()
+                    .unwrap()
+                    .ttl_ms,
+                7_200_000
+            );
+            assert_eq!(
+                rocks
+                    .cache_get_state(state_tags::CACHE_INCARNATION)
+                    .unwrap(),
+                Some(2)
+            );
+        }
+        assert_eq!(
+            mount_info().unwrap().ttl_ms,
+            7_200_000,
+            "live row carries the new ttl"
+        );
+
+        // 3'. RT2: response-loss retry of the Update.
+        mount_manager
+            .mount_with_token(
+                None,
+                cv,
+                ufs,
+                &upd_opts(),
+                Some(OpToken {
+                    client_id: 100,
+                    op_seq: 2,
+                }),
+                52,
+            )
+            .unwrap();
+
+        // 4. RT3: the same token with a divergent payload is loud.
+        let divergent = MountOptions::builder()
+            .update(true)
+            .write_type(WriteType::CacheMode)
+            .access_mode(AccessMode::ReadWrite)
+            .ttl_ms(9_999_999)
+            .build();
+        let err = mount_manager
+            .mount_with_token(
+                None,
+                cv,
+                ufs,
+                &divergent,
+                Some(OpToken {
+                    client_id: 100,
+                    op_seq: 2,
+                }),
+                52,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("different parameters"),
+            "RT3: {}",
+            err
+        );
+
+        // 5. q3 legacy property-only update: a plain Mount journal entry,
+        // the incarnation namespace untouched.
+        let prop_opts = MountOptions::builder()
+            .update(true)
+            .write_type(WriteType::CacheMode)
+            .access_mode(AccessMode::ReadWrite)
+            .ttl_ms(7_200_000)
+            .add_property("p4k", "p4v")
+            .build();
+        mount_manager
+            .mount_with_token(None, cv, ufs, &prop_opts, None, 53)
+            .unwrap();
+        {
+            let store = fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let row = rocks.cache_mount_point(mid).unwrap().unwrap();
+            assert!(
+                row.properties.contains_key("p4k"),
+                "legacy update rewrote the row"
+            );
+            assert_eq!(
+                rocks.cache_current_incarnation(mid).unwrap(),
+                Some(2),
+                "q3: the incarnation namespace is untouched"
+            );
+            assert!(!rocks.cache_get_incarnation(2).unwrap().unwrap().revoked);
+        }
+
+        // 6. Composite Unmount + RT2 retry past the missing mount.
+        mount_manager
+            .umount_with_token(
+                cv,
+                Some(OpToken {
+                    client_id: 100,
+                    op_seq: 3,
+                }),
+                54,
+            )
+            .unwrap();
+        assert!(
+            mount_info().is_none(),
+            "the live table drops the row at the apply event"
+        );
+        {
+            let store = fs_dir.read();
+            let rocks = store.get_rocks_store();
+            assert!(rocks.cache_mount_point(mid).unwrap().is_none());
+            assert_eq!(rocks.cache_current_incarnation(mid).unwrap(), None);
+            assert!(rocks.cache_get_incarnation(2).unwrap().unwrap().revoked);
+            assert_eq!(
+                rocks
+                    .cache_get_state(state_tags::CACHE_INCARNATION)
+                    .unwrap(),
+                Some(2),
+                "unmount preserves the watermark"
+            );
+        }
+        mount_manager
+            .umount_with_token(
+                cv,
+                Some(OpToken {
+                    client_id: 100,
+                    op_seq: 3,
+                }),
+                54,
+            )
+            .unwrap();
+
+        // 7. Mount-id reuse: re-Add under the SAME id, fresh incarnation 3.
+        mount_manager
+            .mount_with_token(
+                Some(mid),
+                cv,
+                ufs,
+                &add_opts(),
+                Some(OpToken {
+                    client_id: 100,
+                    op_seq: 4,
+                }),
+                55,
+            )
+            .unwrap();
+        {
+            let store = fs_dir.read();
+            let rocks = store.get_rocks_store();
+            assert_eq!(rocks.cache_mount_point(mid).unwrap().unwrap().mount_id, mid);
+            assert_eq!(rocks.cache_current_incarnation(mid).unwrap(), Some(3));
+            assert!(!rocks.cache_get_incarnation(3).unwrap().unwrap().revoked);
+            assert!(rocks.cache_get_incarnation(1).unwrap().unwrap().revoked);
+            assert_eq!(
+                rocks
+                    .cache_get_state(state_tags::CACHE_INCARNATION)
+                    .unwrap(),
+                Some(3)
+            );
+        }
+
+        // 8. Dual mount-id, same cv path (direct issuer): the durable
+        //    path-conflict gate makes the racing Add a loser.
+        let dual = add_opts().to_info(mid + 1, cv, "file:///tmp/p4-mlc-dual");
+        let status = cache
+            .mount_lifecycle(
+                OpToken {
+                    client_id: 101,
+                    op_seq: 1,
+                },
+                56,
+                MountLifecycleKind::Add,
+                mid + 1,
+                Some(dual),
+            )
+            .unwrap();
+        assert_eq!(status, MountLifecycleStatus::Superseded);
+        {
+            let store = fs_dir.read();
+            let rocks = store.get_rocks_store();
+            assert!(
+                rocks.cache_mount_point(mid + 1).unwrap().is_none(),
+                "the loser leaves no row"
+            );
+            assert!(
+                rocks.cache_get_incarnation(4).unwrap().is_none(),
+                "the loser mints no namespace identity"
+            );
+            assert_eq!(
+                rocks
+                    .cache_get_state(state_tags::CACHE_INCARNATION)
+                    .unwrap(),
+                Some(3)
+            );
+            match rocks
+                .cache_get_outcome(OpToken {
+                    client_id: 101,
+                    op_seq: 1,
+                })
+                .unwrap()
+                .unwrap()
+            {
+                OpOutcome::MountLifecycleRejected {
+                    kind: r_kind,
+                    mount_id: r_mid,
+                    reason,
+                    ..
+                } => {
+                    assert_eq!(r_kind, MountLifecycleKind::Add);
+                    assert_eq!(r_mid, mid + 1);
+                    assert_eq!(reason, MountLifecycleRejectReason::PathConflict);
+                }
+                other => panic!("t8 loser outcome: {:?}", other),
+            }
+            assert_eq!(
+                rocks.cache_client_watermark(101).unwrap(),
+                Some(1),
+                "the loser's token is terminal at the client watermark"
+            );
+        }
+
+        // 8'. Same-token replay of the loser: routing reproduces the loss
+        //     loudly (never AlreadyApplied, zero proposals — the parent
+        //     asserts the entry count) and the direct issuer maps the
+        //     recorded rejection to Superseded.
+        let dual_opts = MountOptions::builder()
+            .write_type(WriteType::CacheMode)
+            .access_mode(AccessMode::ReadWrite)
+            .ttl_ms(3_600_000)
+            .build();
+        let err = mount_manager
+            .mount_with_token(
+                None,
+                cv,
+                "file:///tmp/p4-mlc-dual",
+                &dual_opts,
+                Some(OpToken {
+                    client_id: 101,
+                    op_seq: 1,
+                }),
+                56,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("lost the composite lifecycle CAS")
+                && format!("{}", err).contains("PathConflict"),
+            "t8' routing replay: {}",
+            err
+        );
+        let status = cache
+            .mount_lifecycle(
+                OpToken {
+                    client_id: 101,
+                    op_seq: 1,
+                },
+                56,
+                MountLifecycleKind::Add,
+                mid + 1,
+                Some(dual_opts.to_info(mid + 1, cv, "file:///tmp/p4-mlc-dual")),
+            )
+            .unwrap();
+        assert_eq!(status, MountLifecycleStatus::Superseded);
+
+        // 9. Well-shaped STALE Update (CAS row loser): the entry is a
+        //    perfectly formed composite Update for this mount whose frozen
+        //    expected row is stale (ttl 123 vs the persisted 3_600_000) —
+        //    the racing writer won. Apply must record a CasRowLost
+        //    rejection outcome + watermark (zero business state) and leave
+        //    everything untouched.
+        let stale_expected = MountOptions::builder()
+            .write_type(WriteType::CacheMode)
+            .access_mode(AccessMode::ReadWrite)
+            .ttl_ms(123)
+            .build()
+            .to_info(mid, cv, ufs);
+        let race_opts = MountOptions::builder()
+            .update(true)
+            .write_type(WriteType::CacheMode)
+            .access_mode(AccessMode::ReadWrite)
+            .ttl_ms(9_600_000)
+            .build();
+        let raced_next = stale_expected.clone().merge_with(race_opts.clone());
+        journal_writer
+            .sync_propose_cache(JournalEntry::MountLifecycleV2(MountLifecycleV2Entry {
+                op_id: fs_dir.read().next_op_id(),
+                rpc_id: 57,
+                token: OpToken {
+                    client_id: 101,
+                    op_seq: 2,
+                },
+                kind: MountLifecycleKind::Update,
+                mount_id: mid,
+                expected_mount: Some(stale_expected),
+                expected_incarnation: Some(3),
+                next_mount: Some(raced_next),
+                old_incarnation: Some(3),
+                new_incarnation: Some(4),
+                ttl_ms: 9_600_000,
+            }))
+            .unwrap();
+        {
+            let store = fs_dir.read();
+            let rocks = store.get_rocks_store();
+            match rocks
+                .cache_get_outcome(OpToken {
+                    client_id: 101,
+                    op_seq: 2,
+                })
+                .unwrap()
+                .unwrap()
+            {
+                OpOutcome::MountLifecycleRejected {
+                    kind: r_kind,
+                    mount_id: r_mid,
+                    reason,
+                    ..
+                } => {
+                    assert_eq!(r_kind, MountLifecycleKind::Update);
+                    assert_eq!(r_mid, mid);
+                    assert_eq!(reason, MountLifecycleRejectReason::CasRowLost);
+                }
+                other => panic!("t9 loser outcome: {:?}", other),
+            }
+            assert_eq!(
+                rocks.cache_mount_point(mid).unwrap().unwrap().ttl_ms,
+                3_600_000,
+                "the durable row is untouched"
+            );
+            assert_eq!(rocks.cache_current_incarnation(mid).unwrap(), Some(3));
+            assert!(!rocks.cache_get_incarnation(3).unwrap().unwrap().revoked);
+            assert!(
+                rocks.cache_get_incarnation(4).unwrap().is_none(),
+                "the loser mints no namespace identity"
+            );
+            assert_eq!(
+                rocks
+                    .cache_get_state(state_tags::CACHE_INCARNATION)
+                    .unwrap(),
+                Some(3)
+            );
+        }
+
+        // 9'. Same-token replay of the stale Update: routing re-derives the
+        //     request's effect from the recorded rejection and fails loudly
+        //     (zero proposals — the parent asserts the count).
+        let err = mount_manager
+            .mount_with_token(
+                None,
+                cv,
+                ufs,
+                &race_opts,
+                Some(OpToken {
+                    client_id: 101,
+                    op_seq: 2,
+                }),
+                57,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("lost the composite lifecycle CAS")
+                && format!("{}", err).contains("CasRowLost"),
+            "t9' routing replay: {}",
+            err
+        );
+
+        // 10. RT6 leave-cache VIA ROUTING (P4-0 update_write_type): the
+        //     additive tri-state field flips the mode, `merge_with` honors
+        //     it, the q3 fence sees the mode crossing, and the composite
+        //     entry lands fs-mode row + revoked inc 3 + cleared pointer in
+        //     ONE journal entry.
+        let leave_opts = MountOptions::builder()
+            .update(true)
+            .write_type(WriteType::CacheMode)
+            .update_write_type(WriteType::FsMode)
+            .access_mode(AccessMode::ReadWrite)
+            .ttl_ms(3_600_000)
+            .build();
+        mount_manager
+            .mount_with_token(
+                None,
+                cv,
+                ufs,
+                &leave_opts,
+                Some(OpToken {
+                    client_id: 100,
+                    op_seq: 5,
+                }),
+                58,
+            )
+            .unwrap();
+        {
+            let store = fs_dir.read();
+            let rocks = store.get_rocks_store();
+            assert!(!rocks
+                .cache_mount_point(mid)
+                .unwrap()
+                .unwrap()
+                .is_cache_mode());
+            assert_eq!(rocks.cache_current_incarnation(mid).unwrap(), None);
+            assert!(rocks.cache_get_incarnation(3).unwrap().unwrap().revoked);
+            assert_eq!(
+                rocks
+                    .cache_get_state(state_tags::CACHE_INCARNATION)
+                    .unwrap(),
+                Some(3)
+            );
+        }
+        assert!(
+            !mount_info().unwrap().is_cache_mode(),
+            "live table carries the fs-mode row"
+        );
+
+        std::process::exit(0);
     }
 
     /// The leader lifetime for the barrier tests: a REAL single-voter

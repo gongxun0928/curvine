@@ -234,6 +234,11 @@ impl Master {
 
     pub async fn start(&mut self) -> CommonResult<ServerStateListener> {
         // step 1: Start journal_system, raft server and raft node will be started internally
+        let fs = self
+            .journal_system
+            .as_ref()
+            .map(|js| js.fs())
+            .expect("master journal system is not initialized");
         let journal_system = match self.journal_system.take() {
             Some(journal_system) => journal_system,
             None => return err_box!("master journal system is not initialized"),
@@ -264,6 +269,12 @@ impl Master {
 
         // reload mount info
         self.mount_manager.restore_best_effort();
+
+        // Task #6 P4-0 (q2 fail-closed): the composite mount lifecycle
+        // invariant is NOT best-effort — a mount table / cache namespace
+        // disagreement is corrupted state and must stop the master loudly
+        // before any lifecycle op can mint or delete an identity.
+        fs.cache_service.validate_mount_lifecycle_restore()?;
 
         // step5: Start job manager
         self.job_manager.start()?;

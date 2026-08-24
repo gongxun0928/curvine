@@ -67,11 +67,11 @@ use crate::master::journal::{
     CacheAbortEntry, CacheAllocateEntry, CacheCommitEntry, CacheIdReserveEntry,
     CacheIncarnationAllocateV2Entry, CacheIncarnationRevokeEntry, CacheOutcomeGcEntry,
     CacheRemoveEntry, CacheReservedReapEntry, CacheScopeRemoveEntry, CacheTtlSweepEntry,
-    CacheVacuumEntry, JournalEntry, JournalWriter,
+    CacheVacuumEntry, JournalEntry, JournalWriter, MountLifecycleV2Entry,
 };
 use crate::master::meta::cache::entry::{
-    CacheEntry, CacheEntryState, ExpiryCursor, ExpiryRow, OpOutcome, OpToken, OutcomeGcGroup,
-    ScopeRemoveVictim, VacuumVictim,
+    CacheEntry, CacheEntryState, ExpiryCursor, ExpiryRow, MountLifecycleKind, MountLifecycleStatus,
+    OpOutcome, OpToken, OutcomeGcGroup, ScopeRemoveVictim, VacuumVictim,
 };
 use crate::master::meta::cache::state_tags;
 use crate::master::meta::cache::LocalCacheIndexStore;
@@ -80,7 +80,7 @@ use crate::master::meta::cache::MUTATION_PAGE_CAP;
 use crate::master::meta::{BlockIdCodec, CacheBlockLayout};
 use crate::master::{MasterMonitor, SyncFsDir};
 use curvine_core_error::{err_box, err_msg, CommonError, CommonResult};
-use curvine_model::{BlockReportInfo, BlockReportStatus, StorageType, WorkerAddress};
+use curvine_model::{BlockReportInfo, BlockReportStatus, MountInfo, StorageType, WorkerAddress};
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::sync::ArcRwLock;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -5125,6 +5125,355 @@ impl CacheService {
                 other
             ),
         }
+    }
+
+    /// P4-0 composite mount lifecycle (task #6, gpt56 a929ae03 LGTM
+    /// contract): one committed entry atomically moves the persisted mount
+    /// row (CF_COMMON) and the cache namespace (old incarnation revoked /
+    /// new incarnation + policy + pointer installed / HW advanced) in a
+    /// single RocksDB batch, and the journal apply converges the LIVE
+    /// MountTable before the Raft ACK.
+    ///
+    /// The issuer freezes the CAS expectations from the PERSISTED rows
+    /// under the issue lock — never from the caller's in-memory view: a
+    /// concurrent writer (legacy mount path or a racing lifecycle under a
+    /// different token) that moved the rows first makes this entry a
+    /// deterministic loser (`Superseded`, warn, zero durable movement),
+    /// and the caller must surface that loudly for a retry.
+    ///
+    /// Outcome-first mirrors `allocate_incarnation`: an exact recorded
+    /// retry resolves `AlreadyApplied` without re-proposing; a divergent
+    /// payload under the same token is a loud error (zero propose); a
+    /// watermark-expired token is terminal.
+    pub fn mount_lifecycle(
+        &self,
+        token: OpToken,
+        rpc_id: i64,
+        kind: MountLifecycleKind,
+        mount_id: u32,
+        next_mount: Option<MountInfo>,
+    ) -> CommonResult<MountLifecycleStatus> {
+        self.require_enabled()?;
+        self.require_leader()?;
+        validate_client_token(token)?;
+        if matches!(kind, MountLifecycleKind::Unmount) && next_mount.is_some() {
+            return err_box!("mount lifecycle unmount must not carry a next mount row");
+        }
+        if !matches!(kind, MountLifecycleKind::Unmount) && next_mount.is_none() {
+            return err_box!("mount lifecycle {:?} requires a next mount row", kind);
+        }
+        if let Some(next) = &next_mount {
+            if next.mount_id != mount_id {
+                return err_box!(
+                    "mount lifecycle {:?} mount id {} disagrees with the next row id {}",
+                    kind,
+                    mount_id,
+                    next.mount_id
+                );
+            }
+        }
+        let _guard = self.issue_lock.lock().unwrap();
+
+        // Outcome-first (idempotency): the outcome binds the request's
+        // immutable parameters — kind, mount id, and the exact next row.
+        // `expected_incarnation` is deliberately NOT compared: a later
+        // lifecycle may legitimately have moved the pointer onward.
+        {
+            let store = self.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            match rocks.cache_get_outcome(token).map_err(fs_err)? {
+                Some(OpOutcome::MountLifecycle {
+                    kind: out_kind,
+                    mount_id: out_mount,
+                    next_mount: out_next,
+                    ..
+                }) => {
+                    if out_kind != kind
+                        || out_mount != mount_id
+                        || out_next.as_ref() != next_mount.as_ref()
+                    {
+                        return err_box!(
+                            "mount lifecycle token {:?} replayed with different parameters: committed {:?}/{}, request {:?}/{}",
+                            token,
+                            out_kind,
+                            out_mount,
+                            kind,
+                            mount_id
+                        );
+                    }
+                    return Ok(MountLifecycleStatus::AlreadyApplied);
+                }
+                // A recorded loser verdict reproduces the Superseded
+                // failure (gpt56 0ab763bb blocker 1): the caller surfaces
+                // it loudly and retries with a fresh view; a divergent
+                // payload under the same token is loud divergence.
+                Some(OpOutcome::MountLifecycleRejected {
+                    kind: r_kind,
+                    mount_id: r_mount,
+                    next_mount: r_next,
+                    ..
+                }) => {
+                    if r_kind != kind
+                        || r_mount != mount_id
+                        || r_next.as_ref() != next_mount.as_ref()
+                    {
+                        return err_box!(
+                            "mount lifecycle token {:?} replayed with different parameters: committed rejection {:?}/{}, request {:?}/{}",
+                            token,
+                            r_kind,
+                            r_mount,
+                            kind,
+                            mount_id
+                        );
+                    }
+                    return Ok(MountLifecycleStatus::Superseded);
+                }
+                Some(other) => {
+                    return err_box!(
+                        "mount lifecycle token {:?} has a non-lifecycle committed outcome: {:?}",
+                        token,
+                        other
+                    )
+                }
+                None => {
+                    let watermark = rocks
+                        .cache_client_watermark(token.client_id)
+                        .map_err(fs_err)?;
+                    if let Some(hw) = watermark {
+                        if token.op_seq <= hw {
+                            return err_box!(
+                                "mount lifecycle token {:?} is expired (client watermark {}): terminal, re-issue with a fresh token",
+                                token,
+                                hw
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Freeze the CAS expectations + mint the new incarnation under the
+        // same lock (single-writer against every other lifecycle issuer).
+        let (expected_mount, expected_incarnation, new_incarnation, ttl_ms) = {
+            let store = self.fs_dir.read();
+            let rocks = store.get_rocks_store();
+            let expected_mount = rocks.cache_mount_point(mount_id).map_err(fs_err)?;
+            let expected_incarnation = rocks.cache_current_incarnation(mount_id).map_err(fs_err)?;
+
+            match kind {
+                MountLifecycleKind::Add => {
+                    if expected_mount.is_some() {
+                        return err_box!(
+                            "mount lifecycle add: mount {} already exists in the persisted table",
+                            mount_id
+                        );
+                    }
+                    if expected_incarnation.is_some() {
+                        return err_box!(
+                            "mount lifecycle add: mount {} has a current incarnation {} without a mount row",
+                            mount_id,
+                            expected_incarnation.unwrap_or_default()
+                        );
+                    }
+                }
+                MountLifecycleKind::Update => {
+                    if expected_mount.is_none() {
+                        return err_box!(
+                            "mount lifecycle update: mount {} not found in the persisted table",
+                            mount_id
+                        );
+                    }
+                }
+                MountLifecycleKind::Unmount => {
+                    if expected_mount.is_none() {
+                        return err_box!(
+                            "mount lifecycle unmount: mount {} not found in the persisted table",
+                            mount_id
+                        );
+                    }
+                }
+            }
+
+            let wants_cache = next_mount
+                .as_ref()
+                .map(|m| m.is_cache_mode())
+                .unwrap_or(false);
+            if wants_cache {
+                let hw = rocks
+                    .cache_get_state(state_tags::CACHE_INCARNATION)
+                    .map_err(fs_err)?
+                    .map(|h| h as u64)
+                    .unwrap_or(0);
+                let new_inc = hw
+                    .checked_add(1)
+                    .filter(|&i| i <= MAX_ISSUABLE_INCARNATION)
+                    .ok_or_else(|| {
+                        cm_err("cache incarnation space exhausted (i64 watermark bound)")
+                    })?;
+                (
+                    expected_mount,
+                    expected_incarnation,
+                    Some(new_inc),
+                    next_mount.as_ref().unwrap().ttl_ms,
+                )
+            } else {
+                (expected_mount, expected_incarnation, None, 0)
+            }
+        };
+
+        let op_id = self.fs_dir.read().next_op_id();
+        let requested_next = next_mount.clone();
+        let entry = JournalEntry::MountLifecycleV2(MountLifecycleV2Entry {
+            op_id,
+            rpc_id,
+            token,
+            kind,
+            mount_id,
+            expected_mount,
+            expected_incarnation,
+            next_mount,
+            old_incarnation: expected_incarnation,
+            new_incarnation,
+            ttl_ms,
+        });
+        self.journal_writer
+            .sync_propose_cache(entry)
+            .map_err(fs_err)?;
+
+        // Resolve from the committed outcome only. The apply records a
+        // `MountLifecycle` outcome IFF it executed; a fresh-token loser
+        // (racing writer moved the persisted rows first, or the durable
+        // path gate fired) records a `MountLifecycleRejected` outcome —
+        // both are terminal for this token, and the loser is surfaced
+        // loudly so the caller retries with a fresh view.
+        let outcome = {
+            let store = self.fs_dir.read();
+            store
+                .get_rocks_store()
+                .cache_get_outcome(token)
+                .map_err(fs_err)?
+        };
+        match outcome {
+            Some(OpOutcome::MountLifecycle {
+                kind: out_kind,
+                mount_id: out_mount,
+                new_incarnation: out_new,
+                next_mount: out_next,
+                ..
+            }) if out_kind == kind
+                && out_mount == mount_id
+                && out_new == new_incarnation
+                && out_next.as_ref() == requested_next.as_ref() =>
+            {
+                Ok(MountLifecycleStatus::Executed)
+            }
+            Some(OpOutcome::MountLifecycle { .. }) => err_box!(
+                "mount lifecycle barrier readback failed for mount {} kind {:?}",
+                mount_id, kind
+            ),
+            // The apply lost the CAS / durable path gate and recorded its
+            // rejection: terminal Superseded for THIS request (the routing
+            // layer surfaces it loudly; a same-token retry reproduces it
+            // from the recorded outcome above with zero proposals).
+            Some(OpOutcome::MountLifecycleRejected {
+                kind: r_kind,
+                mount_id: r_mount,
+                next_mount: r_next,
+                ..
+            }) if r_kind == kind
+                && r_mount == mount_id
+                && r_next.as_ref() == requested_next.as_ref() =>
+            {
+                Ok(MountLifecycleStatus::Superseded)
+            }
+            Some(OpOutcome::MountLifecycleRejected { .. }) => err_box!(
+                "mount lifecycle barrier readback failed for mount {} kind {:?} (recorded rejection diverges from the request)",
+                mount_id, kind
+            ),
+            Some(other) => err_box!(
+                "mount lifecycle barrier readback for mount {} found a foreign outcome: {:?}",
+                mount_id, other
+            ),
+            None => Ok(MountLifecycleStatus::Superseded),
+        }
+    }
+
+    /// P4-0 restore invariant (q2 fail-closed, gpt56 9f83a317): after
+    /// journal replay the persisted mount table and the cache namespace
+    /// must agree — every visible cache-mode mount has a live current
+    /// incarnation whose frozen policy TTL matches the persisted row, no
+    /// fs-mode mount carries a pointer, and no pointer names an unmounted
+    /// id. A violation is corrupted composite state: the master fails
+    /// startup LOUDLY rather than minting or deleting anything.
+    pub fn validate_mount_lifecycle_restore(&self) -> CommonResult<()> {
+        let store = self.fs_dir.read();
+        let rocks = store.get_rocks_store();
+        let mounts = store.get_mount_table()?;
+        let mut pointed: std::collections::HashSet<u32> = Default::default();
+
+        for m in &mounts {
+            let pointer = rocks
+                .cache_current_incarnation(m.mount_id)
+                .map_err(fs_err)?;
+            if m.is_cache_mode() {
+                let Some(inc) = pointer else {
+                    return err_box!(
+                        "restore invariant violated: cache-mode mount {} ({}) has no current incarnation",
+                        m.mount_id,
+                        m.cv_path
+                    );
+                };
+                let row = rocks.cache_get_incarnation(inc).map_err(fs_err)?;
+                match row {
+                    Some(r) if r.mount_id == m.mount_id && !r.revoked => {}
+                    other => {
+                        return err_box!(
+                        "restore invariant violated: mount {} current incarnation {} row is {:?}",
+                        m.mount_id,
+                        inc,
+                        other
+                    )
+                    }
+                }
+                let frozen_ttl = rocks
+                    .cache_get_incarnation_policy(inc)
+                    .map_err(fs_err)?
+                    .map(|p| p.ttl_ms)
+                    .unwrap_or(0);
+                if frozen_ttl != m.ttl_ms {
+                    return err_box!(
+                        "restore invariant violated: mount {} current incarnation {} frozen ttl {} disagrees with the persisted mount ttl {}",
+                        m.mount_id,
+                        inc,
+                        frozen_ttl,
+                        m.ttl_ms
+                    );
+                }
+                pointed.insert(m.mount_id);
+            } else if pointer.is_some() {
+                return err_box!(
+                    "restore invariant violated: fs-mode mount {} ({}) still carries a current incarnation {:?}",
+                    m.mount_id,
+                    m.cv_path,
+                    pointer
+                );
+            }
+        }
+
+        // No pointer may outlive its mount row (composite unmount clears
+        // both in one batch; a survivor is corruption). `pointed` holds
+        // exactly the cache-mode mounts validated above; any other
+        // pointer names a deleted or fs-mode mount.
+        for (mount_id, inc) in rocks.cache_scan_current_incarnations().map_err(fs_err)? {
+            if !pointed.contains(&mount_id) {
+                return err_box!(
+                    "restore invariant violated: current incarnation {} names unmounted id {}",
+                    inc,
+                    mount_id
+                );
+            }
+        }
+        Ok(())
     }
 
     /// 4b: revoke a mount incarnation (unmount fence). The row is kept

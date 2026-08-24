@@ -29,6 +29,7 @@ use crate::master::meta::cache::BlockIdCodec;
 use crate::master::meta::store::RocksInodeStore;
 use curvine_core_error::{err_msg, CommonError};
 use curvine_error::FsResult;
+use curvine_model::MountInfo;
 use curvine_rocksdb::{RocksUtils, WriteBatchWithTransaction};
 use curvine_runtime::common::SerdeUtils as Serde;
 use std::collections::HashMap;
@@ -383,6 +384,20 @@ impl CacheWrite for RocksCacheWrite<'_> {
         )
     }
 
+    fn put_mountpoint(&mut self, mount_id: u32, info: &MountInfo) -> FsResult<()> {
+        // P4-0 composite lifecycle: staged into the SAME atomic batch as the
+        // cache namespace rows; encoding identical to the legacy
+        // `add_mountpoint` write so both paths read the same bytes.
+        let key = RocksUtils::u8_u32_to_bytes(RocksInodeStore::PREFIX_MOUNT, mount_id);
+        let value = Serde::serialize(info)?;
+        self.put_cf(RocksInodeStore::CF_COMMON, key, value)
+    }
+
+    fn remove_mountpoint(&mut self, mount_id: u32) -> FsResult<()> {
+        let key = RocksUtils::u8_u32_to_bytes(RocksInodeStore::PREFIX_MOUNT, mount_id);
+        self.delete_cf(RocksInodeStore::CF_COMMON, key)
+    }
+
     fn commit(self) -> FsResult<()> {
         // Cache identity writes span multiple CFs (state/entry/reverse/
         // outcome/client watermark) in one batch, and the barrier ACK
@@ -645,6 +660,50 @@ impl LocalCacheIndexStore for RocksInodeStore {
             None => Ok(None),
             Some(bytes) => Ok(Some(Serde::deserialize(&bytes)?)),
         }
+    }
+
+    fn cache_scan_current_incarnations(&self) -> FsResult<Vec<(u32, u64)>> {
+        let start = Self::current_incarnation_key(u32::MIN);
+        // Exclusive upper bound one byte past the last current-pointer key.
+        let mut end = Self::current_incarnation_key(u32::MAX).to_vec();
+        end.push(0);
+        let iter = self
+            .db
+            .range_scan(Self::CF_CACHE_MOUNT, start.to_vec(), end)?;
+        let mut rows = Vec::new();
+        for item in iter {
+            let (key, value) = item.map_err(rocks_err)?;
+            if key.len() != 5 {
+                return Err(FsError::from(CommonError::from(err_msg!(
+                    "corrupt current-incarnation key length: {}",
+                    key.len()
+                ))));
+            }
+            let mount_id = u32::from_be_bytes([key[1], key[2], key[3], key[4]]);
+            let incarnation: u64 = Serde::deserialize(&value)?;
+            rows.push((mount_id, incarnation));
+        }
+        Ok(rows)
+    }
+
+    fn cache_mount_point(&self, mount_id: u32) -> FsResult<Option<MountInfo>> {
+        let key = RocksUtils::u8_u32_to_bytes(Self::PREFIX_MOUNT, mount_id);
+        match self.db.get_cf(Self::CF_COMMON, key)? {
+            None => Ok(None),
+            Some(bytes) => MountInfo::decode_persisted(&bytes)
+                .map(Some)
+                .map_err(FsError::from),
+        }
+    }
+
+    fn cache_list_mount_points(&self) -> FsResult<Vec<MountInfo>> {
+        let iter = self.db.prefix_scan(Self::CF_COMMON, [Self::PREFIX_MOUNT])?;
+        let mut rows = Vec::new();
+        for item in iter {
+            let (_, bytes) = item.map_err(rocks_err)?;
+            rows.push(MountInfo::decode_persisted(&bytes).map_err(FsError::from)?);
+        }
+        Ok(rows)
     }
 
     fn cache_get_incarnation_policy(

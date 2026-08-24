@@ -68,6 +68,7 @@
 
 use crate::master::meta::cache::BlockIdCodec;
 use curvine_core_error::{err_box, err_msg, CommonError, CommonResult};
+use curvine_model::MountInfo;
 use serde::{Deserialize, Serialize};
 
 /// Lifecycle state of a cache entry version.
@@ -229,6 +230,10 @@ pub struct OpToken {
 /// Persisted outcomes for identity-producing and load-commit operations.
 /// Purely conditional mutations (remove/invalidate) never persist
 /// outcomes; they are derived from entry state via their CAS fences.
+// The lifecycle variants deliberately carry the full frozen rows (exact
+// retry re-derivation, gpt56 0ab763bb blocker 1) — the size spread is the
+// accepted cost of a self-describing outcome.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OpOutcome {
     /// Global cache-object-id segment reservation `[start, end)`.
@@ -290,12 +295,86 @@ pub enum OpOutcome {
         object_id: i64,
         load_token: OpToken,
     },
+    /// P4-0 composite mount lifecycle transition (gpt56 `7bfc322a`/`a929ae03`):
+    /// one committed apply atomically moves the persisted mount row and the
+    /// cache incarnation namespace. The outcome binds the operation kind, the
+    /// expected old state (mount row identity + current pointer), and the full
+    /// next payload, so a token replayed with any different parameter is
+    /// divergence, never AlreadyApplied. Appended at the enum tail so earlier
+    /// outcome bytes keep decoding.
+    MountLifecycle {
+        kind: MountLifecycleKind,
+        mount_id: u32,
+        expected_mount: Option<MountInfo>,
+        expected_incarnation: Option<u64>,
+        old_incarnation: Option<u64>,
+        new_incarnation: Option<u64>,
+        ttl_ms: i64,
+        next_mount: Option<MountInfo>,
+    },
+    /// P4-0 loser verdict (gpt56 `0ab763bb` blocker 1): a fresh-token
+    /// lifecycle that lost the expected-state CAS or the durable
+    /// path-conflict gate records its rejection atomically (own batch:
+    /// outcome + client watermark, ZERO business state), so a
+    /// response-loss retry of the SAME token reproduces the Superseded /
+    /// path-conflict failure instead of re-proposing forever. The payload
+    /// binds the full immutable request exactly like `MountLifecycle`.
+    /// Appended at the enum tail so earlier outcome bytes keep decoding.
+    MountLifecycleRejected {
+        kind: MountLifecycleKind,
+        mount_id: u32,
+        expected_mount: Option<MountInfo>,
+        expected_incarnation: Option<u64>,
+        next_mount: Option<MountInfo>,
+        reason: MountLifecycleRejectReason,
+    },
+}
+
+/// Why a composite mount lifecycle lost (recorded in
+/// [`OpOutcome::MountLifecycleRejected`]). Derived deterministically from
+/// the durable state at apply time, so an entry replay re-derives the
+/// same category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MountLifecycleRejectReason {
+    /// The persisted mount row is not the entry's expected old row.
+    CasRowLost,
+    /// The persisted current-incarnation pointer is not the entry's
+    /// expected pointer.
+    CasPointerLost,
+    /// The durable path-conflict gate found a committed conflicting
+    /// cv/ufs overlap under a different mount id.
+    PathConflict,
+}
+
+/// Which mount-lifecycle operation a [`OpOutcome::MountLifecycle`] records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MountLifecycleKind {
+    /// Persist a new cache-mode mount together with its first incarnation.
+    Add,
+    /// Move an existing mount between lifecycle states (policy-delta fence,
+    /// enter/leave cache mode); may replace the current incarnation.
+    Update,
+    /// Remove a cache-mode mount and revoke its current incarnation.
+    Unmount,
+}
+
+/// Result of applying a composite mount-lifecycle entry (P4-0). Only
+/// `Executed` and `AlreadyApplied` converged the durable state to the
+/// entry's target; the live MountTable must follow in the same apply event.
+/// `Superseded` (loser CAS / expired token) is a durable no-op — the live
+/// table must NOT move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountLifecycleStatus {
+    Executed,
+    AlreadyApplied,
+    Superseded,
 }
 
 /// Terminal result of a token-indexed idempotent operation. `Expired` is
 /// terminal: the outcome window has evicted the record and the token is
 /// below the client high-watermark, so the original identity cannot be
 /// recovered and must never be re-allocated.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenOutcome {
     Executed(OpOutcome),

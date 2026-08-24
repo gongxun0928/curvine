@@ -36,6 +36,7 @@ use crate::master::meta::cache::entry::{
 };
 use curvine_core_error::{err_msg, CommonError};
 use curvine_error::{FsError, FsResult};
+use curvine_model::MountInfo;
 
 /// Hard upper bound for any single bounded scan page (4c.1). Every scan
 /// validates `1..=SCAN_HARD_CAP` at the boundary: a caller can never ask
@@ -152,6 +153,15 @@ pub trait CacheWrite {
     /// writing a value <= the persisted one is a no-op.
     fn set_state(&mut self, tag: &str, value: i64) -> FsResult<()>;
 
+    /// P4-0 composite lifecycle: stage the persisted mount row upsert into
+    /// the SAME atomic batch as the cache namespace rows. The encoding is
+    /// byte-identical to the legacy mountpoint write.
+    fn put_mountpoint(&mut self, mount_id: u32, info: &MountInfo) -> FsResult<()>;
+
+    /// P4-0 composite lifecycle: stage the persisted mount row removal into
+    /// the same atomic batch.
+    fn remove_mountpoint(&mut self, mount_id: u32) -> FsResult<()>;
+
     fn commit(self) -> FsResult<()>;
 }
 
@@ -216,8 +226,22 @@ pub trait LocalCacheIndexStore {
 
     fn cache_get_incarnation(&self, incarnation: u64) -> FsResult<Option<IncarnationRow>>;
 
+    /// P4-0 composite lifecycle: point-read the persisted mount row (the
+    /// same row the legacy mount table reads), for expected-state CAS.
+    fn cache_mount_point(&self, mount_id: u32) -> FsResult<Option<MountInfo>>;
+
+    /// P4-0 durable path-conflict gate (gpt56 a4e3804f blocker 4): every
+    /// persisted mount row, for authoritative cv/ufs exact+prefix conflict
+    /// checks at apply time — the live precheck is an optimization only.
+    fn cache_list_mount_points(&self) -> FsResult<Vec<MountInfo>>;
+
     /// The mount's current incarnation, if mounted and not revoked.
     fn cache_current_incarnation(&self, mount_id: u32) -> FsResult<Option<u64>>;
+
+    /// P4-0 restore validation (q2 fail-closed): every current-incarnation
+    /// pointer row, so a pointer left behind for an unmounted/deleted
+    /// mount_id is detectable at startup.
+    fn cache_scan_current_incarnations(&self) -> FsResult<Vec<(u32, u64)>>;
 
     /// The incarnation's frozen policy snapshot (4b option A). Pre-4b
     /// allocations have no policy row; implementations synthesize

@@ -23,7 +23,8 @@ pub mod store;
 
 pub use self::entry::{
     key_in_scope, CacheEntry, CacheEntryState, CasOutcome, ExpiryCursor, ExpiryRow, IncarnationRow,
-    ObjectRow, OpOutcome, OpToken, OutcomeGcGroup, ScopeRemoveVictim, TokenOutcome, VacuumVictim,
+    MountLifecycleKind, MountLifecycleRejectReason, MountLifecycleStatus, ObjectRow, OpOutcome,
+    OpToken, OutcomeGcGroup, ScopeRemoveVictim, TokenOutcome, VacuumVictim,
 };
 pub use self::manager::{CacheManager, MAX_ISSUABLE_INCARNATION};
 pub use self::store::{

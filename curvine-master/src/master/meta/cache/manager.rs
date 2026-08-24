@@ -31,13 +31,16 @@
 use crate::master::meta::block_id::{BlockIdCodec, CacheObjectId};
 use crate::master::meta::cache::entry::{
     key_in_scope, validate_expiry_row, validate_incarnation, CacheEntry, CacheEntryState,
-    ExpiryRow, IncarnationPolicyRow, IncarnationRow, ObjectRow, OpOutcome, OpToken, OutcomeGcGroup,
-    ScopeRemoveVictim, VacuumVictim, MAX_CACHE_KEY_BYTES,
+    ExpiryRow, IncarnationPolicyRow, IncarnationRow, MountLifecycleKind,
+    MountLifecycleRejectReason, MountLifecycleStatus, ObjectRow, OpOutcome, OpToken,
+    OutcomeGcGroup, ScopeRemoveVictim, VacuumVictim, MAX_CACHE_KEY_BYTES,
 };
 use crate::master::meta::cache::store::{
     state_tags, validate_page_len, CacheWrite, LocalCacheIndexStore,
 };
 use curvine_core_error::{err_box, err_msg, CommonError, CommonResult};
+use curvine_fs_api::Path;
+use curvine_model::MountInfo;
 use curvine_runtime::sync::AtomicLong;
 
 /// Highest incarnation the in-process allocator may issue. Kept at
@@ -505,6 +508,579 @@ impl CacheManager {
         }
         w.commit().map_err(cv)?;
         Ok(())
+    }
+
+    /// P4-0 composite mount lifecycle (gpt56 `9f83a317`/`a929ae03`): ONE
+    /// committed apply atomically moves the persisted mount row AND the
+    /// cache incarnation namespace (row/policy/current pointer/HW) in one
+    /// RocksDB WriteBatch. Identity is resolved through the token's outcome
+    /// FIRST (exact replay → AlreadyApplied, zero writes); execution is an
+    /// expected-state CAS against the persisted mount row and current
+    /// pointer — a raced update/unmount loses deterministically
+    /// (`Superseded`, loud warn, durable no-op), never a blind overwrite.
+    /// Incarnation rows are durable history: leaving an incarnation marks
+    /// it revoked in the same batch and never deletes the row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_mount_lifecycle<S: LocalCacheIndexStore>(
+        &self,
+        store: &S,
+        token: OpToken,
+        kind: MountLifecycleKind,
+        mount_id: u32,
+        expected_mount: Option<&MountInfo>,
+        expected_incarnation: Option<u64>,
+        next_mount: Option<&MountInfo>,
+        old_incarnation: Option<u64>,
+        new_incarnation: Option<u64>,
+        ttl_ms: i64,
+    ) -> CommonResult<MountLifecycleStatus> {
+        Self::check_token(token)?;
+        if let Some(inc) = new_incarnation {
+            if inc == 0 || inc > MAX_ISSUABLE_INCARNATION {
+                return err_box!(
+                    "lifecycle incarnation outside issuable range [1, {}]: {}",
+                    MAX_ISSUABLE_INCARNATION,
+                    inc
+                );
+            }
+            if ttl_ms < 0 {
+                return err_box!("mount ttl_ms must be non-negative: {}", ttl_ms);
+            }
+        }
+        if matches!(kind, MountLifecycleKind::Unmount) && next_mount.is_some() {
+            return err_box!("lifecycle unmount must not carry a next mount row");
+        }
+        if matches!(kind, MountLifecycleKind::Add) && next_mount.is_none() {
+            return err_box!("lifecycle add must carry a next mount row");
+        }
+        // Entry shape (gpt56 a4e3804f blocker 5 + 0ab763bb blocker 3): the
+        // per-kind matrix is FSM-fatal — a forged entry must never slip a
+        // transition the issuer would not have built.
+        if old_incarnation != expected_incarnation {
+            return err_box!(
+                "lifecycle entry shape: old incarnation {:?} must equal the expected pointer {:?}",
+                old_incarnation,
+                expected_incarnation
+            );
+        }
+        let next_is_cache = next_mount
+            .as_ref()
+            .map(|m| m.is_cache_mode())
+            .unwrap_or(false);
+        if next_is_cache != new_incarnation.is_some() {
+            return err_box!(
+                "lifecycle entry shape: a cache-mode next row requires a new incarnation (next cache {}, new {:?})",
+                next_is_cache,
+                new_incarnation
+            );
+        }
+        match kind {
+            MountLifecycleKind::Add => {
+                let Some(next) = next_mount else {
+                    unreachable!("add next row checked above");
+                };
+                if expected_mount.is_some() {
+                    return err_box!(
+                        "lifecycle entry shape: add must not expect an existing mount row"
+                    );
+                }
+                if expected_incarnation.is_some() {
+                    return err_box!(
+                        "lifecycle entry shape: add must not expect an existing incarnation {:?}",
+                        expected_incarnation
+                    );
+                }
+                if next.mount_id != mount_id {
+                    return err_box!(
+                        "lifecycle entry shape: add next row id {} disagrees with the entry id {}",
+                        next.mount_id,
+                        mount_id
+                    );
+                }
+                if !next_is_cache {
+                    return err_box!(
+                        "lifecycle entry shape: add requires a cache-mode next row (fs-mode adds take the legacy path)"
+                    );
+                }
+            }
+            MountLifecycleKind::Update => {
+                let (Some(expected), Some(next)) = (expected_mount, next_mount) else {
+                    return err_box!(
+                        "lifecycle entry shape: update requires both the expected and next mount rows"
+                    );
+                };
+                if expected.mount_id != mount_id || next.mount_id != mount_id {
+                    return err_box!(
+                        "lifecycle entry shape: update rows must carry the entry mount id {} (expected {}, next {})",
+                        mount_id,
+                        expected.mount_id,
+                        next.mount_id
+                    );
+                }
+                if expected.cv_path != next.cv_path || expected.ufs_path != next.ufs_path {
+                    return err_box!(
+                        "lifecycle entry shape: mount path is immutable ({} -> {} / {} -> {})",
+                        expected.cv_path,
+                        next.cv_path,
+                        expected.ufs_path,
+                        next.ufs_path
+                    );
+                }
+                // The composite Update exists ONLY for the frozen-policy
+                // delta (enter/leave cache mode or TTL change); an entry
+                // without one is malformed (property updates take the
+                // legacy path).
+                let mode_crosses = expected.is_cache_mode() != next.is_cache_mode();
+                let ttl_changes = expected.is_cache_mode()
+                    && next.is_cache_mode()
+                    && expected.ttl_ms != next.ttl_ms;
+                if !mode_crosses && !ttl_changes {
+                    return err_box!(
+                        "lifecycle entry shape: update without a frozen-policy delta (modes {:?}/{:?}, ttl {}/{})",
+                        expected.write_type,
+                        next.write_type,
+                        expected.ttl_ms,
+                        next.ttl_ms
+                    );
+                }
+                if expected.is_cache_mode() != expected_incarnation.is_some() {
+                    return err_box!(
+                        "lifecycle entry shape: the expected row mode and the old incarnation disagree (cache {}, old {:?})",
+                        expected.is_cache_mode(),
+                        expected_incarnation
+                    );
+                }
+            }
+            MountLifecycleKind::Unmount => {
+                let Some(expected) = expected_mount else {
+                    return err_box!(
+                        "lifecycle entry shape: unmount requires the expected mount row"
+                    );
+                };
+                if expected.mount_id != mount_id {
+                    return err_box!(
+                        "lifecycle entry shape: unmount expected row id {} disagrees with the entry id {}",
+                        expected.mount_id, mount_id
+                    );
+                }
+                if !expected.is_cache_mode() {
+                    return err_box!(
+                        "lifecycle entry shape: unmount requires a cache-mode expected row (fs-mode unmounts take the legacy path)"
+                    );
+                }
+                if expected_incarnation.is_none() {
+                    return err_box!(
+                        "lifecycle entry shape: unmount of a cache-mode row requires its current incarnation"
+                    );
+                }
+            }
+        }
+
+        let outcome = OpOutcome::MountLifecycle {
+            kind,
+            mount_id,
+            expected_mount: expected_mount.cloned(),
+            expected_incarnation,
+            old_incarnation,
+            new_incarnation,
+            ttl_ms,
+            next_mount: next_mount.cloned(),
+        };
+        // A recorded loser verdict for this token is a strict replay no-op
+        // (gpt56 0ab763bb blocker 1): the rejection outcome stands, zero
+        // state, zero re-record. A divergent payload under the same token
+        // is loud divergence.
+        if let Some(OpOutcome::MountLifecycleRejected {
+            kind: r_kind,
+            mount_id: r_mount,
+            expected_mount: r_expected,
+            expected_incarnation: r_inc,
+            next_mount: r_next,
+            ..
+        }) = store.cache_get_outcome(token).map_err(cv)?
+        {
+            if r_kind == kind
+                && r_mount == mount_id
+                && r_expected.as_ref() == expected_mount
+                && r_inc == expected_incarnation
+                && r_next.as_ref() == next_mount
+            {
+                return Ok(MountLifecycleStatus::Superseded);
+            }
+            return err_box!(
+                "mount lifecycle replay divergence for token {:?}: recorded rejection (kind {:?} mount {}) disagrees with the entry (kind {:?} mount {})",
+                token,
+                r_kind,
+                r_mount,
+                kind,
+                mount_id
+            );
+        }
+        let gate = Self::classify_token(store, token, &outcome)?;
+        match gate {
+            // Exact recorded history: self-heal ONLY if the durable state
+            // is still exactly this entry's target — a later lifecycle
+            // having moved on makes this replay a live-table no-op, and a
+            // neither-exact-nor-advanced state is corruption (loud).
+            TokenGate::AlreadyApplied => {
+                return Self::verify_lifecycle_target(
+                    store,
+                    mount_id,
+                    next_mount,
+                    old_incarnation,
+                    new_incarnation,
+                    ttl_ms,
+                )
+            }
+            // Terminal, strict no-op: this entry's identity is not trusted
+            // history; neither durable state nor the live table may move.
+            TokenGate::Expired => return Ok(MountLifecycleStatus::Superseded),
+            TokenGate::Execute => (),
+        }
+
+        // Expected-state CAS against the committed rows (single-writer
+        // precondition: no other writer mutates the mount row / pointer).
+        // A fresh-token loser records its rejection outcome atomically
+        // (gpt56 0ab763bb blocker 1): the SAME token retrying after a lost
+        // response reproduces this failure instead of re-proposing.
+        let persisted_mount = store.cache_mount_point(mount_id).map_err(cv)?;
+        if persisted_mount.as_ref() != expected_mount {
+            log::warn!(
+                "mount lifecycle {:?} for mount {} lost the CAS: persisted mount row {:?}, entry expected {:?}",
+                kind,
+                mount_id,
+                persisted_mount.map(|m| m.cv_path.clone()),
+                expected_mount.map(|m| m.cv_path.clone()),
+            );
+            self.record_lifecycle_rejection(
+                store,
+                token,
+                kind,
+                mount_id,
+                expected_mount,
+                expected_incarnation,
+                next_mount,
+                MountLifecycleRejectReason::CasRowLost,
+            )?;
+            return Ok(MountLifecycleStatus::Superseded);
+        }
+        let persisted_pointer = store.cache_current_incarnation(mount_id).map_err(cv)?;
+        if persisted_pointer != expected_incarnation {
+            log::warn!(
+                "mount lifecycle {:?} for mount {} lost the CAS: current incarnation {:?}, entry expected {:?}",
+                kind,
+                mount_id,
+                persisted_pointer,
+                expected_incarnation
+            );
+            self.record_lifecycle_rejection(
+                store,
+                token,
+                kind,
+                mount_id,
+                expected_mount,
+                expected_incarnation,
+                next_mount,
+                MountLifecycleRejectReason::CasPointerLost,
+            )?;
+            return Ok(MountLifecycleStatus::Superseded);
+        }
+
+        // Durable path-conflict gate (gpt56 a4e3804f blocker 4): the live
+        // precheck is an optimization; apply is the authority. A racing Add
+        // under a different mount_id that already committed a row with the
+        // same cv/ufs (exact or prefix overlap) makes THIS entry a
+        // deterministic loser — no row, no namespace identity, live table
+        // untouched.
+        if matches!(kind, MountLifecycleKind::Add) {
+            if let Some(next) = next_mount {
+                for other in store.cache_list_mount_points().map_err(cv)? {
+                    if other.mount_id == mount_id {
+                        return err_box!(
+                            "lifecycle add for mount {} lost the CAS but the persisted table still has this id ({})",
+                            mount_id,
+                            other.cv_path
+                        );
+                    }
+                    if Self::mount_paths_conflict(&other.cv_path, &other.ufs_path, next) {
+                        log::warn!(
+                            "mount lifecycle add for mount {} lost the durable path gate: {} conflicts with mount {} ({})",
+                            mount_id,
+                            next.cv_path,
+                            other.mount_id,
+                            other.cv_path
+                        );
+                        self.record_lifecycle_rejection(
+                            store,
+                            token,
+                            kind,
+                            mount_id,
+                            expected_mount,
+                            expected_incarnation,
+                            next_mount,
+                            MountLifecycleRejectReason::PathConflict,
+                        )?;
+                        return Ok(MountLifecycleStatus::Superseded);
+                    }
+                }
+            }
+        }
+
+        // Execute: the new incarnation must be genuinely new (aliasing a
+        // dead identity is never allowed) and strictly above the durable HW.
+        if let Some(inc) = new_incarnation {
+            if let Some(row) = store.cache_get_incarnation(inc).map_err(cv)? {
+                return err_box!(
+                    "lifecycle incarnation {} already exists (mount {}, revoked {}) under a different token",
+                    inc,
+                    row.mount_id,
+                    row.revoked
+                );
+            }
+            if let Some(hw) = store
+                .cache_get_state(state_tags::CACHE_INCARNATION)
+                .map_err(cv)?
+            {
+                if inc <= hw as u64 {
+                    return err_box!(
+                        "lifecycle incarnation {} is not above the durable watermark {}",
+                        inc,
+                        hw
+                    );
+                }
+            }
+        }
+
+        // One batch: mount row + revoked old row + new row/policy/pointer +
+        // HW + outcome + client watermark — all-or-nothing (durable commit).
+        if let Some(inc) = new_incarnation {
+            self.advance_incarnation(inc);
+        }
+        let mut w = store.cache_write();
+        match next_mount {
+            Some(m) => w.put_mountpoint(mount_id, m).map_err(cv)?,
+            None => w.remove_mountpoint(mount_id).map_err(cv)?,
+        }
+        if let Some(old) = old_incarnation {
+            // Revoke the row being left (gpt56 a4e3804f blocker 5): the
+            // expected-pointer CAS above proves the pointer still names
+            // `old`, so a missing or already-revoked row is durable
+            // corruption — loud, never a silent skip.
+            match store.cache_get_incarnation(old).map_err(cv)? {
+                Some(row) if row.mount_id != mount_id => {
+                    return err_box!(
+                        "lifecycle incarnation {} belongs to mount {}, entry says mount {}",
+                        old,
+                        row.mount_id,
+                        mount_id
+                    );
+                }
+                Some(row) if !row.revoked => {
+                    w.put_incarnation(
+                        old,
+                        IncarnationRow {
+                            mount_id,
+                            revoked: true,
+                        },
+                    )
+                    .map_err(cv)?;
+                }
+                other => {
+                    return err_box!(
+                        "lifecycle incarnation {} for mount {} is not a live current row: {:?}",
+                        old,
+                        mount_id,
+                        other
+                    )
+                }
+            }
+        }
+        if let Some(inc) = new_incarnation {
+            w.put_incarnation(
+                inc,
+                IncarnationRow {
+                    mount_id,
+                    revoked: false,
+                },
+            )
+            .map_err(cv)?;
+            w.put_incarnation_policy(inc, IncarnationPolicyRow { ttl_ms })
+                .map_err(cv)?;
+            w.set_current_incarnation(mount_id, inc).map_err(cv)?;
+            w.set_state(state_tags::CACHE_INCARNATION, inc as i64)
+                .map_err(cv)?;
+        } else if old_incarnation.is_some() {
+            // Leaving the cache namespace without installing a replacement:
+            // the expected-pointer CAS guarantees the pointer names
+            // `old_incarnation`, so the clear is exact.
+            w.clear_current_incarnation(mount_id).map_err(cv)?;
+        }
+        w.put_outcome(token, &outcome).map_err(cv)?;
+        w.set_client_watermark(token.client_id, token.op_seq)
+            .map_err(cv)?;
+        w.commit().map_err(cv)?;
+        Ok(MountLifecycleStatus::Executed)
+    }
+
+    /// Record a loser verdict for a fresh-token lifecycle (gpt56
+    /// `0ab763bb` blocker 1): an independent atomic batch writes the
+    /// rejection outcome + client watermark with ZERO business state, so a
+    /// response-loss retry of the same token reproduces the failure
+    /// instead of re-proposing. The reason category is re-derived
+    /// identically on replay.
+    #[allow(clippy::too_many_arguments)]
+    fn record_lifecycle_rejection<S: LocalCacheIndexStore>(
+        &self,
+        store: &S,
+        token: OpToken,
+        kind: MountLifecycleKind,
+        mount_id: u32,
+        expected_mount: Option<&MountInfo>,
+        expected_incarnation: Option<u64>,
+        next_mount: Option<&MountInfo>,
+        reason: MountLifecycleRejectReason,
+    ) -> CommonResult<()> {
+        let mut w = store.cache_write();
+        w.put_outcome(
+            token,
+            &OpOutcome::MountLifecycleRejected {
+                kind,
+                mount_id,
+                expected_mount: expected_mount.cloned(),
+                expected_incarnation,
+                next_mount: next_mount.cloned(),
+                reason,
+            },
+        )
+        .map_err(cv)?;
+        w.set_client_watermark(token.client_id, token.op_seq)
+            .map_err(cv)?;
+        w.commit().map_err(cv)
+    }
+
+    /// cv/ufs exact + prefix overlap between two mount rows, mirroring the
+    /// live `MountTable::check_conflict` rules (any overlap, either
+    /// direction, is a conflict).
+    fn mount_paths_conflict(a_cv: &str, a_ufs: &str, b: &MountInfo) -> bool {
+        Path::has_prefix(a_cv, &b.cv_path)
+            || Path::has_prefix(&b.cv_path, a_cv)
+            || Path::has_prefix(a_ufs, &b.ufs_path)
+            || Path::has_prefix(&b.ufs_path, a_ufs)
+    }
+
+    /// AlreadyApplied target-state verification (gpt56 a4e3804f blocker 3,
+    /// 0ab763bb blocker 2): an exact recorded replay self-heals the live
+    /// table only while the durable state is STILL this entry's exact
+    /// target. Superseded requires DIRECT evidence about THIS mount —
+    /// never the global incarnation watermark, which an unrelated mount
+    /// can push at will:
+    ///
+    /// - the incarnation this entry minted was later revoked (a follow-up
+    ///   Update/Unmount/leave-cache on this mount), or
+    /// - this mount's namespace target is still exactly installed
+    ///   (pointer + revoked old + alive new) and the mount ROW drifted
+    ///   only in non-frozen fields of the SAME identity (a benign q3
+    ///   legacy property update; paths/mode/ttl are frozen), or
+    /// - the entry removed the row/pointer (Unmount / leave-cache) and a
+    ///   later lifecycle re-installed state (a new pointer, or a row
+    ///   where the target was absence).
+    ///
+    /// Anything else is corruption — loud, apply-fatal.
+    fn verify_lifecycle_target<S: LocalCacheIndexStore>(
+        store: &S,
+        mount_id: u32,
+        next_mount: Option<&MountInfo>,
+        old_incarnation: Option<u64>,
+        new_incarnation: Option<u64>,
+        ttl_ms: i64,
+    ) -> CommonResult<MountLifecycleStatus> {
+        let row = store.cache_mount_point(mount_id).map_err(cv)?;
+        let pointer = store.cache_current_incarnation(mount_id).map_err(cv)?;
+
+        let row_exact = row.as_ref() == next_mount && pointer == new_incarnation;
+        let old_revoked = match old_incarnation {
+            Some(old) => matches!(
+                store.cache_get_incarnation(old).map_err(cv)?,
+                Some(r) if r.revoked
+            ),
+            None => true,
+        };
+        let new_alive = match new_incarnation {
+            Some(inc) => {
+                matches!(
+                    store.cache_get_incarnation(inc).map_err(cv)?,
+                    Some(r) if !r.revoked && r.mount_id == mount_id
+                ) && store
+                    .cache_get_incarnation_policy(inc)
+                    .map_err(cv)?
+                    .map(|p| p.ttl_ms)
+                    == Some(ttl_ms)
+            }
+            None => true,
+        };
+
+        if row_exact && old_revoked && new_alive {
+            return Ok(MountLifecycleStatus::AlreadyApplied);
+        }
+
+        // Direct evidence 1: this entry's own minted incarnation was
+        // revoked by a later lifecycle on THIS mount.
+        let minted_revoked = match new_incarnation {
+            Some(inc) => {
+                matches!(
+                    store.cache_get_incarnation(inc).map_err(cv)?,
+                    Some(r) if r.revoked
+                )
+            }
+            None => false,
+        };
+
+        // Direct evidence 2: benign q3 row drift — this mount's namespace
+        // target is still exactly installed and the row is the SAME mount
+        // identity (id/cv/ufs) with the SAME frozen policy (mode + ttl),
+        // differing only in non-frozen fields (properties, auto_cache,
+        // read_verify_ufs, access_mode, ...).
+        let benign_row_drift = pointer == new_incarnation
+            && old_revoked
+            && new_alive
+            && match (row.as_ref(), next_mount) {
+                (Some(r), Some(n)) => {
+                    r.mount_id == n.mount_id
+                        && r.cv_path == n.cv_path
+                        && r.ufs_path == n.ufs_path
+                        && r.write_type == n.write_type
+                        && r.ttl_ms == n.ttl_ms
+                }
+                _ => false,
+            };
+
+        // Direct evidence 3: the entry's target was namespace/row absence
+        // (Unmount, leave-cache) and a later lifecycle re-installed state
+        // for this mount (a new pointer, or a row where none was wanted).
+        let re_installed = new_incarnation.is_none()
+            && (pointer.is_some() || (next_mount.is_none() && row.is_some()));
+
+        if minted_revoked || benign_row_drift || re_installed {
+            log::warn!(
+                "mount lifecycle replay for mount {} already superseded by later state (row {:?}, pointer {:?}, minted revoked {}, benign drift {}, re-installed {})",
+                mount_id,
+                row.as_ref().map(|m| m.cv_path.clone()),
+                pointer,
+                minted_revoked,
+                benign_row_drift,
+                re_installed
+            );
+            return Ok(MountLifecycleStatus::Superseded);
+        }
+
+        err_box!(
+            "lifecycle replay for mount {} is neither the exact target nor provably superseded: durable row {:?}, pointer {:?}, old revoked {}, new alive {}",
+            mount_id,
+            row.as_ref().map(|m| m.cv_path.clone()),
+            pointer,
+            old_revoked,
+            new_alive
+        )
     }
 
     /// Apply-time incarnation fence (4b contract): a cache write may only
@@ -3992,5 +4568,311 @@ mod tests {
         assert!(mgr
             .apply_vacuum(&store, 1, 5, &[vacuum_victim(&key_over_cap, 1, OBJ, 0)])
             .is_err());
+    }
+
+    /// P4-0 unit helpers: a cache-mode MountInfo built like the issuer
+    /// builds it.
+    fn cache_row(mount_id: u32, cv: &str, ttl_ms: i64) -> MountInfo {
+        cache_row_ufs(mount_id, cv, ttl_ms, "file:///tmp/p4-unit-ufs")
+    }
+
+    fn cache_row_ufs(mount_id: u32, cv: &str, ttl_ms: i64, ufs: &str) -> MountInfo {
+        use curvine_model::{AccessMode, MountOptions, WriteType};
+        MountOptions::builder()
+            .write_type(WriteType::CacheMode)
+            .access_mode(AccessMode::ReadWrite)
+            .ttl_ms(ttl_ms)
+            .build()
+            .to_info(mount_id, cv, ufs)
+    }
+
+    /// gpt56 0ab763bb blocker 3: forged entry shapes are FSM-fatal and
+    /// leave ZERO durable state — a forged Update(expected=None,...) or
+    /// Unmount(expected=None) must never slip a transition the issuer
+    /// would not have built, and must not even record an outcome.
+    #[test]
+    fn lifecycle_forged_shapes_are_loud_and_zero_state() {
+        let store = new_store("mlc-forged");
+        let mgr = CacheManager::new();
+
+        // Forged Update without the expected row.
+        let next = cache_row(7, "/f-upd", 1_000);
+        let err = mgr
+            .apply_mount_lifecycle(
+                &store,
+                token(3, 1),
+                MountLifecycleKind::Update,
+                7,
+                None,
+                None,
+                Some(&next),
+                None,
+                Some(4),
+                1_000,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("entry shape"),
+            "forged update: {}",
+            err
+        );
+        assert!(store.cache_get_outcome(token(3, 1)).unwrap().is_none());
+        assert!(store.cache_mount_point(7).unwrap().is_none());
+        assert!(store.cache_get_incarnation(4).unwrap().is_none());
+
+        // Forged Unmount without the expected row.
+        let err = mgr
+            .apply_mount_lifecycle(
+                &store,
+                token(3, 2),
+                MountLifecycleKind::Unmount,
+                7,
+                None,
+                None,
+                None,
+                None,
+                None,
+                1_000,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("entry shape"),
+            "forged unmount: {}",
+            err
+        );
+        assert!(store.cache_get_outcome(token(3, 2)).unwrap().is_none());
+
+        // Forged Add WITH an expected row (the Add-only path-conflict
+        // bypass) is equally fatal.
+        let expected = cache_row(7, "/f-add", 1_000);
+        let err = mgr
+            .apply_mount_lifecycle(
+                &store,
+                token(3, 3),
+                MountLifecycleKind::Add,
+                7,
+                Some(&expected),
+                Some(1),
+                Some(&expected),
+                Some(1),
+                Some(2),
+                1_000,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("entry shape"),
+            "forged add: {}",
+            err
+        );
+        assert!(store.cache_get_outcome(token(3, 3)).unwrap().is_none());
+    }
+
+    /// gpt56 0ab763bb blocker 2: an UNRELATED mount pushing the global
+    /// incarnation watermark must never mask corruption of THIS mount.
+    /// A corrupted replay (pointer cleared) is loud even with the global
+    /// HW far past the entry's incarnation; once repaired, the exact
+    /// replay resolves AlreadyApplied regardless of the global HW.
+    #[test]
+    fn lifecycle_replay_unrelated_hw_does_not_mask_corruption() {
+        let store = new_store("mlc-unrelated-hw");
+        let mgr = CacheManager::new();
+
+        // Mount A (id 7): a real composite Add, incarnation 1.
+        let row_a = cache_row(7, "/u-a", 1_000);
+        let status = mgr
+            .apply_mount_lifecycle(
+                &store,
+                token(2, 1),
+                MountLifecycleKind::Add,
+                7,
+                None,
+                None,
+                Some(&row_a),
+                None,
+                Some(1),
+                1_000,
+            )
+            .unwrap();
+        assert_eq!(status, MountLifecycleStatus::Executed);
+
+        // An UNRELATED mount B (id 8, distinct cv/ufs) mints incarnation 2:
+        // the global HW now sits past mount A's incarnation.
+        let row_b = cache_row_ufs(8, "/u-b", 1_000, "file:///tmp/p4-unit-ufs-b");
+        mgr.apply_mount_lifecycle(
+            &store,
+            token(2, 2),
+            MountLifecycleKind::Add,
+            8,
+            None,
+            None,
+            Some(&row_b),
+            None,
+            Some(2),
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .cache_get_state(state_tags::CACHE_INCARNATION)
+                .unwrap(),
+            Some(2),
+            "the unrelated mount pushed the global HW"
+        );
+
+        // Corrupt mount A: its current pointer disappears. The recorded
+        // Add replay is NEITHER the exact target NOR provably superseded —
+        // the global HW must not turn this into a Superseded.
+        {
+            let mut w = store.cache_write();
+            w.clear_current_incarnation(7).unwrap();
+            w.commit().unwrap();
+        }
+        let err = mgr
+            .apply_mount_lifecycle(
+                &store,
+                token(2, 1),
+                MountLifecycleKind::Add,
+                7,
+                None,
+                None,
+                Some(&row_a),
+                None,
+                Some(1),
+                1_000,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("neither the exact target nor provably superseded"),
+            "corrupted replay with unrelated HW: {}",
+            err
+        );
+
+        // Repair the pointer: the exact replay now self-heals to
+        // AlreadyApplied — the global HW is still 2 and irrelevant.
+        {
+            let mut w = store.cache_write();
+            w.set_current_incarnation(7, 1).unwrap();
+            w.commit().unwrap();
+        }
+        let status = mgr
+            .apply_mount_lifecycle(
+                &store,
+                token(2, 1),
+                MountLifecycleKind::Add,
+                7,
+                None,
+                None,
+                Some(&row_a),
+                None,
+                Some(1),
+                1_000,
+            )
+            .unwrap();
+        assert_eq!(status, MountLifecycleStatus::AlreadyApplied);
+    }
+
+    /// gpt56 0ab763bb blocker 1 (apply half): a fresh-token CAS loser
+    /// records its rejection outcome + watermark in an independent batch
+    /// with ZERO business state; the same-token replay is a strict no-op
+    /// Superseded; a divergent payload under the same token is loud.
+    #[test]
+    fn lifecycle_cas_loser_rejection_replay() {
+        let store = new_store("mlc-reject");
+        let mgr = CacheManager::new();
+
+        // Mount 9 lives at ttl 1_000, incarnation 1.
+        let row = cache_row(9, "/r-a", 1_000);
+        mgr.apply_mount_lifecycle(
+            &store,
+            token(4, 1),
+            MountLifecycleKind::Add,
+            9,
+            None,
+            None,
+            Some(&row),
+            None,
+            Some(1),
+            1_000,
+        )
+        .unwrap();
+
+        // A stale-expected Update loses the row CAS: rejection recorded,
+        // zero business state.
+        let stale = cache_row(9, "/r-a", 123);
+        let raced = cache_row(9, "/r-a", 9_000);
+        let status = mgr
+            .apply_mount_lifecycle(
+                &store,
+                token(4, 2),
+                MountLifecycleKind::Update,
+                9,
+                Some(&stale),
+                Some(1),
+                Some(&raced),
+                Some(1),
+                Some(2),
+                9_000,
+            )
+            .unwrap();
+        assert_eq!(status, MountLifecycleStatus::Superseded);
+        match store.cache_get_outcome(token(4, 2)).unwrap().unwrap() {
+            OpOutcome::MountLifecycleRejected {
+                kind,
+                mount_id,
+                reason,
+                ..
+            } => {
+                assert_eq!(kind, MountLifecycleKind::Update);
+                assert_eq!(mount_id, 9);
+                assert_eq!(reason, MountLifecycleRejectReason::CasRowLost);
+            }
+            other => panic!("loser outcome: {:?}", other),
+        }
+        assert_eq!(store.cache_client_watermark(4).unwrap(), Some(2));
+        assert_eq!(
+            store.cache_mount_point(9).unwrap().unwrap().ttl_ms,
+            1_000,
+            "the loser left the durable row untouched"
+        );
+        assert!(store.cache_get_incarnation(2).unwrap().is_none());
+
+        // Same-token replay of the loser entry: strict no-op Superseded.
+        let status = mgr
+            .apply_mount_lifecycle(
+                &store,
+                token(4, 2),
+                MountLifecycleKind::Update,
+                9,
+                Some(&stale),
+                Some(1),
+                Some(&raced),
+                Some(1),
+                Some(2),
+                9_000,
+            )
+            .unwrap();
+        assert_eq!(status, MountLifecycleStatus::Superseded);
+
+        // A divergent payload under the rejected token: loud divergence.
+        let other_next = cache_row(9, "/r-a", 8_000);
+        let err = mgr
+            .apply_mount_lifecycle(
+                &store,
+                token(4, 2),
+                MountLifecycleKind::Update,
+                9,
+                Some(&stale),
+                Some(1),
+                Some(&other_next),
+                Some(1),
+                Some(3),
+                8_000,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("replay divergence"),
+            "divergent rejected replay: {}",
+            err
+        );
     }
 }

@@ -367,7 +367,11 @@ impl MountInfo {
             storage_type: mnt_opt.storage_type.or(self.storage_type),
             block_size: mnt_opt.block_size.or(self.block_size),
             replicas: mnt_opt.replicas.or(self.replicas),
-            write_type: self.write_type,
+            // P4-0 (gpt56 61a4dddc): update-only tri-state. Absent keeps
+            // the mount's current write_type (old clients always send the
+            // required field but never this one); present switches mode,
+            // which routes the update through the composite lifecycle.
+            write_type: mnt_opt.update_write_type.unwrap_or(self.write_type),
             provider: mnt_opt.provider.or(self.provider),
             auto_cache: mnt_opt.auto_cache.unwrap_or(self.auto_cache),
             access_mode: mnt_opt.access_mode.unwrap_or(self.access_mode),
@@ -388,6 +392,10 @@ pub struct MountOptions {
     pub replicas: Option<i32>,
     pub remove_properties: Vec<String>,
     pub write_type: WriteType,
+    /// P4-0 (gpt56 61a4dddc): update-only tri-state. `None` = keep the
+    /// mount's current write_type; `Some` = switch (cache-mode enter/leave).
+    /// Add ignores this field and uses `write_type`.
+    pub update_write_type: Option<WriteType>,
     pub provider: Option<Provider>,
     pub auto_cache: Option<bool>,
     pub access_mode: Option<AccessMode>,
@@ -438,6 +446,7 @@ pub struct MountOptionsBuilder {
     replicas: Option<i32>,
     remove_properties: Vec<String>,
     write_type: WriteType,
+    update_write_type: Option<WriteType>,
     provider: Option<Provider>,
     auto_cache: Option<bool>,
     access_mode: Option<AccessMode>,
@@ -521,6 +530,13 @@ impl MountOptionsBuilder {
         self
     }
 
+    /// Update-only tri-state: present switches the mount's write_type
+    /// (cache-mode enter/leave via the composite lifecycle); absent keeps it.
+    pub fn update_write_type(mut self, write_type: WriteType) -> Self {
+        self.update_write_type = Some(write_type);
+        self
+    }
+
     pub fn provider(mut self, provider: Provider) -> Self {
         self.provider = Some(provider);
         self
@@ -563,6 +579,7 @@ impl MountOptionsBuilder {
             replicas: self.replicas,
             remove_properties: self.remove_properties,
             write_type: self.write_type,
+            update_write_type: self.update_write_type,
             provider: self.provider,
             auto_cache: self.auto_cache,
             access_mode: self.access_mode,
@@ -610,6 +627,7 @@ impl TryFrom<&str> for WriteType {
 
 #[cfg(test)]
 mod tests {
+    use crate::proto_utils::ProtoUtils;
     use crate::state::{AccessMode, MountInfo, MountOptions, WriteType};
     use crate::CurvinePath;
     use curvine_fs_api::Path;
@@ -691,6 +709,53 @@ mod tests {
         assert!(!updated.auto_cache);
         assert_eq!(updated.access_mode, AccessMode::ReadWrite);
         assert!(updated.write_cache);
+    }
+
+    /// P4-0 (gpt56 61a4dddc compat gate): `update_write_type` is an
+    /// update-only tri-state — absent keeps the mount's current
+    /// write_type (old clients never send it), present switches it; the
+    /// proto round-trip preserves the tri-state.
+    #[test]
+    fn test_update_write_type_tri_state() {
+        let cache_info = MountInfo {
+            cv_path: "/mnt".to_string(),
+            ufs_path: "s3://b".to_string(),
+            write_type: WriteType::CacheMode,
+            ..Default::default()
+        };
+
+        // Absent (an old client's plain update): mode is immutable.
+        let kept = cache_info
+            .clone()
+            .merge_with(MountOptions::builder().update(true).build());
+        assert_eq!(kept.write_type, WriteType::CacheMode);
+
+        // Present: the mode switches.
+        let switched = cache_info.merge_with(
+            MountOptions::builder()
+                .update(true)
+                .update_write_type(WriteType::FsMode)
+                .build(),
+        );
+        assert_eq!(switched.write_type, WriteType::FsMode);
+
+        // Proto round-trip preserves the tri-state in both directions.
+        let explicit = MountOptions::builder()
+            .update_write_type(WriteType::FsMode)
+            .build();
+        let pb = ProtoUtils::mount_options_to_pb(explicit.clone());
+        assert_eq!(pb.update_write_type, Some(WriteType::FsMode as i32));
+        assert_eq!(
+            ProtoUtils::mount_options_from_pb(pb).update_write_type,
+            Some(WriteType::FsMode)
+        );
+        let absent = MountOptions::builder().build();
+        let pb = ProtoUtils::mount_options_to_pb(absent.clone());
+        assert_eq!(pb.update_write_type, None);
+        assert_eq!(
+            ProtoUtils::mount_options_from_pb(pb).update_write_type,
+            None
+        );
     }
 
     #[test]

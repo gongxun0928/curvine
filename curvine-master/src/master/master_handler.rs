@@ -14,6 +14,8 @@
 
 use crate::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use crate::master::job::JobHandler;
+use crate::master::meta::cache::LocalCacheIndexStore;
+use crate::master::meta::cache::OpToken;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::MountManager;
@@ -868,6 +870,50 @@ impl MasterHandler {
         self.fs.clone()
     }
 
+    /// Task #6 P4-0: the wire op token for composite mount lifecycle
+    /// ops. Both halves must be present and non-zero together, or absent
+    /// together — a half token is a malformed request, never a silent
+    /// legacy fallback for a cache-mode mount.
+    fn mount_op_token(client_id: Option<u64>, op_seq: Option<u64>) -> FsResult<Option<OpToken>> {
+        match (client_id, op_seq) {
+            (None, None) => Ok(None),
+            (Some(cid), Some(seq)) if cid != 0 && seq != 0 => Ok(Some(OpToken {
+                client_id: cid,
+                op_seq: seq,
+            })),
+            _ => err_box!(
+                "mount op token must carry both op_client_id and op_seq (non-zero), or neither"
+            ),
+        }
+    }
+
+    /// Task #6 P4-0: compose the wire mount row with the mount's CURRENT
+    /// cache incarnation, read from the authoritative RocksDB pointer —
+    /// never stored inside the persisted MountInfo (bincode journal
+    /// compatibility). Only cache-mode mounts may carry a pointer.
+    fn mount_info_with_incarnation(&self, m: curvine_model::MountInfo) -> FsResult<MountInfoProto> {
+        let mut pb = ProtoUtils::mount_info_to_pb(m.clone());
+        if m.is_cache_mode() {
+            let inc = {
+                let fs_dir = self.fs.fs_dir.read();
+                fs_dir
+                    .get_rocks_store()
+                    .cache_current_incarnation(m.mount_id)?
+            };
+            // Fail-closed (a4e3804f): a visible cache-mode mount without a
+            // current pointer violates the composite restore invariant;
+            // serving the row with an empty incarnation would hand the
+            // client corrupted state.
+            pb.cache_incarnation = Some(inc.ok_or_else(|| {
+                FsError::common(format!(
+                    "cache-mode mount {} ({}) has no current incarnation",
+                    m.mount_id, m.cv_path
+                ))
+            })?);
+        }
+        Ok(pb)
+    }
+
     fn mount(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let request: MountRequest = ctx.parse_header()?;
         let mnt_opt = ProtoUtils::mount_options_from_pb(request.mount_options);
@@ -877,8 +923,15 @@ impl MasterHandler {
             Some(request.ufs_path.to_string()),
         );
 
-        self.mount_manager
-            .mount(None, &request.cv_path, &request.ufs_path, &mnt_opt)?;
+        let token = Self::mount_op_token(request.op_client_id, request.op_seq)?;
+        self.mount_manager.mount_with_token(
+            None,
+            &request.cv_path,
+            &request.ufs_path,
+            &mnt_opt,
+            token,
+            ctx.msg.req_id(),
+        )?;
         let rep_header = MountResponse::default();
         ctx.response(rep_header)
     }
@@ -887,7 +940,9 @@ impl MasterHandler {
         let request: UnMountRequest = ctx.parse_header()?;
         ctx.set_audit(Some(request.cv_path.to_string()), None);
 
-        self.mount_manager.umount(&request.cv_path)?;
+        let token = Self::mount_op_token(request.op_client_id, request.op_seq)?;
+        self.mount_manager
+            .umount_with_token(&request.cv_path, token, ctx.msg.req_id())?;
         let rep_header = UnMountResponse::default();
         ctx.response(rep_header)
     }
@@ -898,9 +953,11 @@ impl MasterHandler {
 
         let path = Path::from_str(request.path)?;
         let ret = self.mount_manager.get_mount_info(&path)?;
-        let rep_header = GetMountInfoResponse {
-            mount_info: ret.map(ProtoUtils::mount_info_to_pb),
+        let mount_info = match ret {
+            Some(m) => Some(self.mount_info_with_incarnation(m)?),
+            None => None,
         };
+        let rep_header = GetMountInfoResponse { mount_info };
         ctx.response(rep_header)
     }
 
@@ -1126,8 +1183,8 @@ impl MasterHandler {
 
         let mount_table: Vec<MountInfoProto> = table
             .into_iter()
-            .map(ProtoUtils::mount_info_to_pb)
-            .collect();
+            .map(|m| self.mount_info_with_incarnation(m))
+            .collect::<FsResult<_>>()?;
         let rep_header = GetMountTableResponse { mount_table };
         ctx.response(rep_header)
     }
