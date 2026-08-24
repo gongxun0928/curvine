@@ -992,7 +992,7 @@ impl FsDir {
                 // policy snapshot frozen in the entry must match the
                 // PERSISTED mount table at apply time (leader and follower
                 // replay the same log, so this is deterministic). A mount
-                // that vanished, lost write-cache capability, or changed
+                // that vanished, stopped being cache-mode, or changed
                 // TTL between issuance and apply makes the entry a
                 // DETERMINISTIC NO-OP — never an error: a cache apply
                 // error is fatal to the authoritative FSM (journal replay
@@ -1000,16 +1000,16 @@ impl FsDir {
                 // by the issuer's post-barrier recheck. No outcome, no
                 // watermark, no pointer are written.
                 //
-                // The check requires the entry to actually claim
-                // write-cache (`cache_write == true`) AND the persisted
-                // mount to be write-cache-enabled with the frozen TTL —
+                // The check requires the entry to actually claim cache
+                // capability (`cache_write == true`) AND the persisted
+                // mount to be cache-mode with the frozen TTL —
                 // `false == false` (a non-cache entry against a non-cache
                 // mount) must NOT slip through as a match.
                 let mounts = self.get_mount_table()?;
                 let persisted = mounts
                     .iter()
                     .find(|m| m.mount_id == e.mount_id)
-                    .map(|m| (m.write_cache_enabled(), m.ttl_ms));
+                    .map(|m| (m.is_cache_mode(), m.ttl_ms));
                 let matches =
                     e.cache_write && matches!(persisted, Some((true, ttl)) if ttl == e.ttl_ms);
                 if !matches {

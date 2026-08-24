@@ -265,7 +265,7 @@ impl LoadJobRunner {
         // Phase 3: cache-mode mounts have no inode — "already loaded" is
         // a cache-index hit whose recorded (len, ufs_mtime) still matches
         // the live UFS source.
-        if mnt.info.write_cache_enabled() {
+        if mnt.info.is_cache_mode() {
             let source_status = mnt.ufs()?.get_status(source_path).await?;
             let key = mnt.info.get_cache_key(source_path)?;
             let incarnation = match self
@@ -713,14 +713,14 @@ impl LoadJobRunner {
 
         let block_size = job.block_size;
 
-        // Phase 3 (dual-mode metadata split): on write-cache-enabled
+        // Phase 3 (dual-mode metadata split): on cache-mode
         // mounts the whole job runs in cache mode — each task carries a
         // master-minted CacheLoadSpec (authoritative incarnation +
         // mount-relative key + retry-stable dual op tokens) and the
         // worker executes CacheAllocate → planned writes → CacheCommit
         // against the cache index only. The incarnation is resolved once
         // per job and fails closed when absent.
-        let cache_incarnation = if mnt.write_cache_enabled() {
+        let cache_incarnation = if mnt.is_cache_mode() {
             Some(self.require_current_incarnation(mnt)?)
         } else {
             None

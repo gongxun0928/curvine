@@ -5044,9 +5044,9 @@ impl CacheService {
                         mount_id
                     ))
                 })?;
-            if !m.write_cache_enabled() {
+            if !m.is_cache_mode() {
                 return err_box!(
-                    "cache incarnation allocation: mount {} is not write-cache-enabled (cache mode + read-write access required)",
+                    "cache incarnation allocation: mount {} is not a cache-mode mount",
                     mount_id
                 );
             }
@@ -5083,7 +5083,7 @@ impl CacheService {
             .map_err(fs_err)?;
 
         // Post-barrier capability recheck (gate 4): the mount must still be
-        // write-cache-enabled with the same frozen TTL. A mount update that
+        // cache-mode with the same frozen TTL. A mount update that
         // raced the barrier is reported loudly; the allocated incarnation
         // stays durable (revoked) history — commits under it derive their
         // deadline from the frozen policy row, never from the mutable
@@ -5093,12 +5093,12 @@ impl CacheService {
             let fs = self.fs_dir.read();
             let mounts = fs.get_mount_table()?;
             match mounts.iter().find(|m| m.mount_id == mount_id) {
-                Some(m) if m.write_cache_enabled() && m.ttl_ms == ttl_ms => {}
+                Some(m) if m.is_cache_mode() && m.ttl_ms == ttl_ms => {}
                 other => {
                     return err_box!(
                         "cache incarnation allocation for mount {} raced a mount table change (post-barrier state {:?}): the incarnation is durable but its policy snapshot no longer matches the persisted mount",
                         mount_id,
-                        other.map(|m| (m.write_cache_enabled(), m.ttl_ms))
+                        other.map(|m| (m.is_cache_mode(), m.ttl_ms))
                     )
                 }
             }
@@ -8485,8 +8485,9 @@ mod tests {
         assert!(format!("{}", err).contains("not found"), "{}", err);
 
         // Persist mounts: 5 = write-cache enabled (1h ttl), 6 = cache mode
-        // but read-only, 7 = fs mode. Written straight to rocks (no
-        // journaling) — this is the persisted table the issuer must trust.
+        // but read-only (P4-0: now a VALID capability target), 7 = fs mode.
+        // Written straight to rocks (no journaling) — this is the persisted
+        // table the issuer must trust.
         let write_cache_mount = MountOptions::builder()
             .write_type(WriteType::CacheMode)
             .access_mode(AccessMode::ReadWrite)
@@ -8526,17 +8527,21 @@ mod tests {
         let err = service.allocate_incarnation(issue, 7, 99).unwrap_err();
         assert!(format!("{}", err).contains("not found"), "{}", err);
 
-        // Capability gates: read-only cache mode and fs mode are rejected
-        // before any token or id is minted.
+        // Capability gates (P4-0): fs mode is rejected before any token or
+        // id is minted; read-only cache mode (mount 6) is now a VALID
+        // target (is_cache_mode, gpt56 92883fff) — it passes the gate and
+        // reaches the fail-closed raft barrier.
         let err = service.allocate_incarnation(issue, 7, 6).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("raft"), "{}", msg);
         assert!(
-            format!("{}", err).contains("not write-cache-enabled"),
-            "{}",
-            err
+            !msg.contains("not a cache-mode mount"),
+            "read-only cache mount must pass the capability gate: {}",
+            msg
         );
         let err = service.allocate_incarnation(issue, 7, 7).unwrap_err();
         assert!(
-            format!("{}", err).contains("not write-cache-enabled"),
+            format!("{}", err).contains("not a cache-mode mount"),
             "{}",
             err
         );
@@ -8573,7 +8578,7 @@ mod tests {
         let msg = format!("{}", err);
         assert!(msg.contains("raft"), "{}", msg);
         assert!(
-            !msg.contains("not found") && !msg.contains("write-cache-enabled"),
+            !msg.contains("not found") && !msg.contains("not a cache-mode mount"),
             "{}",
             msg
         );

@@ -59,9 +59,12 @@ impl MountManager {
     }
 
     fn normalize_mount_config(mount: &mut MountInfo) -> FsResult<()> {
-        if mount.write_cache && !mount.write_cache_enabled() {
+        // D7 fail-closed (task #6 / gpt56 92883fff option C): write-through
+        // client cache mirroring is retired; `write_cache=true` is rejected
+        // for ALL mounts, including cache-mode read-write.
+        if mount.write_cache {
             return err_box!(
-                "write_cache requires cache_mode with read_write access_mode for mount {}",
+                "write_cache is not supported (fail-closed): mount {}",
                 mount.cv_path
             );
         }
@@ -194,10 +197,11 @@ mod tests {
     }
 
     #[test]
-    fn normalize_mount_config_accepts_write_cache_for_cache_mode_read_write() {
+    fn normalize_mount_config_rejects_write_cache_for_cache_mode_read_write() {
         let mut info = mount_info(WriteType::CacheMode, AccessMode::ReadWrite, true);
 
-        MountManager::normalize_mount_config(&mut info).unwrap();
+        let err = MountManager::normalize_mount_config(&mut info).unwrap_err();
+        assert!(err.to_string().contains("write_cache is not supported"));
     }
 
     #[test]
@@ -205,9 +209,7 @@ mod tests {
         let mut info = mount_info(WriteType::CacheMode, AccessMode::ReadOnly, true);
 
         let err = MountManager::normalize_mount_config(&mut info).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("write_cache requires cache_mode with read_write"));
+        assert!(err.to_string().contains("write_cache is not supported"));
     }
 
     #[test]
@@ -215,9 +217,7 @@ mod tests {
         let mut info = mount_info(WriteType::FsMode, AccessMode::ReadWrite, true);
 
         let err = MountManager::normalize_mount_config(&mut info).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("write_cache requires cache_mode with read_write"));
+        assert!(err.to_string().contains("write_cache is not supported"));
     }
 
     #[test]
