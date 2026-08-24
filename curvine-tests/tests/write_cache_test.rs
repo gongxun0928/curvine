@@ -883,6 +883,151 @@ fn test_cache_fence_refresh_and_terminal_invalidate() {
     });
 }
 
+/// P4-2 D5 read path (gpt56 `c1d51e75`): a cache-mode STRICT INTERIOR read
+/// routes CacheGet(need_locations=true) and, on a fully valid hit, serves
+/// the object from cache blocks via a CACHE-ONLY reader — never a
+/// per-read UFS fallback. RED seam: with the UFS source deleted after the
+/// load, open/get_status must still serve the cached content and entry
+/// metadata (today both fall back to UFS and fail FileNotFound).
+#[test]
+fn test_cache_read_d5_strict_interior_cache_only() {
+    let (fs, cluster) = get_fs_cache_meta();
+    let master_fs = cluster.get_active_master_fs();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        mount(&fs, WriteType::CacheMode).await;
+
+        let data = Utils::rand_str(8192);
+        let path: Path = format!("/write_cache_{:?}/p42_read.log", WriteType::CacheMode).into();
+        let mut writer = fs.create(&path, true).await.unwrap();
+        writer.write_string(&data).await.unwrap();
+        writer.complete().await.unwrap();
+
+        let (ufs_path, mnt) = fs
+            .get_mount(&path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        fs.async_cache(&ufs_path).unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
+
+        let key = {
+            let ufs = mnt.info.get_ufs_path(&path).unwrap();
+            mnt.info.get_cache_key(&ufs).unwrap()
+        };
+        let inc = master_fs
+            .cache_service
+            .current_incarnation_for_mount(mnt.info.mount_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            master_fs
+                .cache_service
+                .get(inc, &key, true)
+                .unwrap()
+                .is_some(),
+            "the load must commit a complete location set"
+        );
+
+        // Remove the UFS source: any UFS fallback now fails. The read and
+        // status must come from the cache index/blocks alone.
+        mnt.ufs().unwrap().delete(&ufs_path, false).await.unwrap();
+        assert!(!mnt.ufs().unwrap().exists(&ufs_path).await.unwrap());
+
+        let mut reader = fs.open(&path).await.unwrap();
+        assert_eq!(
+            reader.read_as_string().await.unwrap(),
+            data,
+            "strict-interior read must serve the whole object from cache blocks"
+        );
+
+        let status = fs.get_status(&path).await.unwrap();
+        assert_eq!(status.len, data.len() as i64);
+        assert!(!status.is_dir);
+    });
+}
+
+/// P4-2 D5 fence seams (gpt56 `c1d51e75`): the read-path Get obeys the
+/// one-refresh FENCED policy —
+/// - a STALE snapshot (raw umount+remount, snapshot still on the dead
+///   incarnation) fences the Get, refreshes once, re-resolves onto the
+///   new incarnation, and the miss falls back to the UFS read;
+/// - a VANISHED mount (raw umount after the refresh) makes open loud
+///   ("no mount covers"), never a silent UFS fallback under a dead
+///   namespace; the same holds for get_status after re-arming the
+///   snapshot via a unified remount.
+#[test]
+fn test_cache_read_d5_fence_refresh_and_vanished_loud() {
+    let (fs, cluster) = get_fs_cache_meta();
+    let _master_fs = cluster.get_active_master_fs();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        mount(&fs, WriteType::CacheMode).await;
+
+        let data = Utils::rand_str(2048);
+        let cv_root = Path::from_str("/write_cache_CacheMode").unwrap();
+        let path: Path = format!("/write_cache_{:?}/p42_fence.log", WriteType::CacheMode).into();
+        let mut writer = fs.create(&path, true).await.unwrap();
+        writer.write_string(&data).await.unwrap();
+        writer.complete().await.unwrap();
+
+        let (ufs_path, _mnt) = fs
+            .get_mount(&path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        fs.async_cache(&ufs_path).unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
+
+        let ufs_base = env::var("UFS_TEST_PATH").unwrap();
+        let ufs_mount_path = Path::from_str(format!("{}/write_cache_CacheMode", ufs_base)).unwrap();
+        let opts = MountOptionsBuilder::new()
+            .write_type(WriteType::CacheMode)
+            .access_mode(AccessMode::ReadWrite)
+            .build();
+
+        // STALE snapshot: raw umount + remount leaves the client on the
+        // dead incarnation (no unified call refreshes it in between).
+        fs.cv().umount(&cv_root).await.unwrap();
+        fs.cv()
+            .mount(&ufs_mount_path, &cv_root, opts.clone())
+            .await
+            .unwrap();
+        // The Get fences once, refreshes, re-resolves onto the NEW
+        // incarnation, observes a miss, and the UFS read proceeds.
+        let mut reader = fs.open(&path).await.unwrap();
+        assert_eq!(reader.read_as_string().await.unwrap(), data);
+
+        // VANISHED mount: the snapshot (refreshed above to the rebuilt
+        // mount) goes stale again via a raw umount; open must refresh
+        // once and then fail LOUD — never a silent UFS fallback.
+        fs.cv().umount(&cv_root).await.unwrap();
+        let err = match fs.open(&path).await {
+            Err(e) => e,
+            Ok(_) => panic!("vanished mount after the one refresh must fail loud"),
+        };
+        assert!(
+            format!("{:?}", err).contains("no mount covers"),
+            "vanished mount after the one refresh must fail loud, got {:?}",
+            err
+        );
+
+        // Re-arm the snapshot (unified remount force-refreshes the client
+        // table), then vanish it again: get_status must be loud too.
+        fs.mount(&ufs_mount_path, &cv_root, opts).await.unwrap();
+        fs.cv().umount(&cv_root).await.unwrap();
+        let err = match fs.get_status(&path).await {
+            Err(e) => e,
+            Ok(_) => panic!("vanished mount must gate get_status loud"),
+        };
+        assert!(
+            format!("{:?}", err).contains("no mount covers"),
+            "vanished mount must gate get_status loud, got {:?}",
+            err
+        );
+    });
+}
+
 /// P4-1 default-off + non-cache-mode seams (gpt56 `88cda9cf`): the public
 /// entries are cache-domain only — an FsMode mount is loud, an unmounted
 /// path is loud, and the RAW binding against a default (capability-off)

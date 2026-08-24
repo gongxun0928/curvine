@@ -27,10 +27,12 @@ use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, FsKind, ListStream, Path, Reader, RpcCode, Writer};
 use curvine_job_client::{JobMasterClient, TransferClient};
 use curvine_model::{
-    CreateFileOpts, DeleteResult, FileAllocOpts, FileLock, FileStatus, FilesystemInfo, FreeResult,
-    JobStatus, ListOptions, LoadJobCommand, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions,
-    OpenFlags, RenameFlags, SetAttrOpts, TransferCommand, TransferKind, TransferState,
+    CreateFileOpts, DeleteResult, ExtendedBlock, FileAllocOpts, FileBlocks, FileLock, FileStatus,
+    FileType, FilesystemInfo, FreeResult, JobStatus, ListOptions, LoadJobCommand, LocatedBlock,
+    MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, ProtoUtils, RenameFlags,
+    SetAttrOpts, StorageType, TransferCommand, TransferKind, TransferState,
 };
+use curvine_runtime::common::LocalTime;
 use curvine_runtime::common::TimeSpent;
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
@@ -450,9 +452,10 @@ impl UnifiedFileSystem {
     async fn cache_get_observed(
         &self,
         path: &Path,
+        need_locations: bool,
     ) -> FsResult<(curvine_proto::CacheGetResponse, String, u64)> {
         let (_, key, incarnation) = self.resolve_cache_target(path).await?;
-        match self.cv.cache_get(incarnation, &key, false).await {
+        match self.cv.cache_get(incarnation, &key, need_locations).await {
             Ok(rep) => Ok((rep, key, incarnation)),
             Err(e) => {
                 if !is_incarnation_fenced(&e) {
@@ -460,17 +463,223 @@ impl UnifiedFileSystem {
                 }
                 self.mount_cache.check_update(self, true).await?;
                 let (_, key, incarnation) = self.resolve_cache_target(path).await?;
-                let rep = self.cv.cache_get(incarnation, &key, false).await?;
+                let rep = self.cv.cache_get(incarnation, &key, need_locations).await?;
                 Ok((rep, key, incarnation))
             }
         }
+    }
+
+    /// P4-2 D5 validity matrix (gpt56 `c1d51e75`): expiry is ALWAYS
+    /// checked client-side (the server filtered at Get time; this is the
+    /// defense-in-depth re-check); when the mount demands UFS
+    /// verification, len and ufs_mtime are compared against ONE
+    /// authoritative UFS stat observation fetched here — the comparison
+    /// never mixes two different stat calls. An entry that fails any D5
+    /// check is a whole-object miss, never a partial read.
+    async fn d5_verify(
+        &self,
+        len: i64,
+        ufs_mtime: i64,
+        expire_at: i64,
+        ufs_path: &Path,
+        mount: &MountValue,
+    ) -> FsResult<bool> {
+        if expire_at != 0 && LocalTime::mills() as i64 >= expire_at {
+            return Ok(false);
+        }
+        if mount.info.read_verify_ufs {
+            let ufs_status = mount.ufs()?.get_status(ufs_path).await?;
+            if len != ufs_status.len || ufs_mtime != ufs_status.mtime {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// P4-2 strict cache-block decode (gpt56 `c1d51e75` #2): the location
+    /// set must be a COMPLETE, well-formed object layout — block ids
+    /// unique and in stable (+1 monotone) order, per-block lengths
+    /// exactly matching the geometry implied by `(len, block_size)`
+    /// (non-last blocks == block_size, last block the remainder), the
+    /// checked-overflow accumulation exactly equal to `len`, and every
+    /// block carrying at least one worker. `len == 0` must carry an
+    /// empty location set. ANY anomaly is a whole-object miss (None) —
+    /// cache/UFS stitched reads are forbidden. The codec bits are NOT
+    /// re-derived client-side; only ordering properties are checked.
+    fn cache_blocks_from_get(
+        rep: &curvine_proto::CacheGetResponse,
+        len: i64,
+        block_size: i64,
+    ) -> Option<Vec<LocatedBlock>> {
+        if block_size <= 0 || len < 0 {
+            return None;
+        }
+        if len == 0 {
+            return if rep.blocks.is_empty() {
+                Some(Vec::new())
+            } else {
+                None
+            };
+        }
+        if rep.blocks.is_empty() {
+            return None;
+        }
+
+        let n = rep.blocks.len() as i64;
+        let expected_count = len / block_size + i64::from(len % block_size != 0);
+        if n != expected_count {
+            return None;
+        }
+        let last_len = len.checked_sub((n - 1).checked_mul(block_size)?)?;
+        if last_len <= 0 || last_len > block_size {
+            return None;
+        }
+
+        let mut total: i64 = 0;
+        let mut prev_id: Option<i64> = None;
+        let mut block_locs = Vec::with_capacity(rep.blocks.len());
+        for (index, block) in rep.blocks.iter().enumerate() {
+            let expected_len = if index as i64 == n - 1 {
+                last_len
+            } else {
+                block_size
+            };
+            if block.block_len != expected_len {
+                return None;
+            }
+            total = total.checked_add(block.block_len)?;
+            match prev_id {
+                Some(prev) if block.block_id != prev + 1 => return None,
+                _ => {}
+            }
+            prev_id = Some(block.block_id);
+            if block.workers.is_empty() {
+                return None;
+            }
+            let locs: Vec<_> = block
+                .workers
+                .iter()
+                .map(ProtoUtils::worker_address_from_pb)
+                .collect();
+            block_locs.push(LocatedBlock {
+                block: ExtendedBlock::new(
+                    block.block_id,
+                    block.block_len,
+                    StorageType::Disk,
+                    FileType::File,
+                ),
+                locs,
+                has_spdk: false,
+            });
+        }
+        if total != len {
+            return None;
+        }
+        Some(block_locs)
+    }
+
+    /// Synthesizes the inode-free `FileStatus` for a cache-mode interior
+    /// file from ONE strict hit observation (P4-2: strict-interior reads
+    /// issue zero inode RPCs — no field is ever read from the inode tree).
+    fn cache_entry_file_status(
+        path: &Path,
+        object_id: i64,
+        len: i64,
+        block_size: i64,
+        ufs_mtime: i64,
+    ) -> FileStatus {
+        let mut status = FileStatus::with_name(object_id, path.name().to_string(), false);
+        status.path = path.path().to_string();
+        status.len = len;
+        status.block_size = block_size;
+        status.mtime = ufs_mtime;
+        status.is_complete = true;
+        status
+    }
+
+    /// P4-2 D5 read route for a cache-mode STRICT INTERIOR path: ONE
+    /// locations-bearing CacheGet, strict metadata decode, D5 validity,
+    /// and full geometry validation. A fully valid hit yields a
+    /// CACHE-ONLY reader (gpt56 `c1d51e75` P0: the hit reader is never
+    /// wrapped in `FallbackFsReader` — a mid-read worker failure is a
+    /// loud error, not a per-read UFS stitch). Anything else is a miss
+    /// (None) and the caller falls back to the UFS as a whole.
+    async fn get_cache_d5_reader(
+        &self,
+        path: &Path,
+        ufs_path: &Path,
+        mount: &MountValue,
+    ) -> FsResult<Option<FsReader>> {
+        let (rep, _, _) = self.cache_get_observed(path, true).await?;
+        let (object_id, len, block_size, ufs_mtime, expire_at) = match Self::status_from_get(&rep)?
+        {
+            CacheEntryStatus::Hit {
+                object_id,
+                len,
+                block_size,
+                ufs_mtime,
+                expire_at,
+                ..
+            } => (object_id, len, block_size, ufs_mtime, expire_at),
+            CacheEntryStatus::Miss => return Ok(None),
+        };
+        if !self
+            .d5_verify(len, ufs_mtime, expire_at, ufs_path, mount)
+            .await?
+        {
+            return Ok(None);
+        }
+        let Some(block_locs) = Self::cache_blocks_from_get(&rep, len, block_size) else {
+            return Ok(None);
+        };
+        let status = Self::cache_entry_file_status(path, object_id, len, block_size, ufs_mtime);
+        let reader = FsReader::new(
+            path.clone(),
+            self.cv.fs_context(),
+            FileBlocks::new(status, block_locs),
+        )?;
+        Ok(Some(reader))
+    }
+
+    /// P4-2 D5 status route for a cache-mode STRICT INTERIOR path: ONE
+    /// metadata-only CacheGet with the same strict decode and D5 matrix.
+    /// A valid hit synthesizes the entry status; anything else is a miss
+    /// (None) and the caller takes the UFS status.
+    async fn cache_d5_status(
+        &self,
+        path: &Path,
+        ufs_path: &Path,
+        mount: &MountValue,
+    ) -> FsResult<Option<FileStatus>> {
+        let (rep, _, _) = self.cache_get_observed(path, false).await?;
+        let (object_id, len, block_size, ufs_mtime, expire_at) = match Self::status_from_get(&rep)?
+        {
+            CacheEntryStatus::Hit {
+                object_id,
+                len,
+                block_size,
+                ufs_mtime,
+                expire_at,
+                ..
+            } => (object_id, len, block_size, ufs_mtime, expire_at),
+            CacheEntryStatus::Miss => return Ok(None),
+        };
+        if !self
+            .d5_verify(len, ufs_mtime, expire_at, ufs_path, mount)
+            .await?
+        {
+            return Ok(None);
+        }
+        Ok(Some(Self::cache_entry_file_status(
+            path, object_id, len, block_size, ufs_mtime,
+        )))
     }
 
     /// Task #6 P4-1 (gpt56 `88cda9cf`): public cache-entry status — a
     /// metadata-only CacheGet (`need_locations=false`).
     pub async fn cache_status(&self, path: &Path) -> FsResult<CacheEntryStatus> {
         let fut = async {
-            let (rep, _, _) = self.cache_get_observed(path).await?;
+            let (rep, _, _) = self.cache_get_observed(path, false).await?;
             Self::status_from_get(&rep)
         };
         self.track("CacheGet", path.path(), "", fut).await
@@ -540,7 +749,7 @@ impl UnifiedFileSystem {
             // Get succeeded first try or after the one forced refresh
             // (gpt56 `694593c1` P0 — never mix a refreshed Get with the
             // stale outer resolution).
-            let (rep, key, incarnation) = self.cache_get_observed(path).await?;
+            let (rep, key, incarnation) = self.cache_get_observed(path, false).await?;
             // Same STRICT decoder as the public status (gpt56 `2e74f4ac`
             // #3): the mutation identity (generation, object_id) is only
             // ever taken from a well-formed hit observation — never
@@ -1307,7 +1516,24 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
                 Some(v) => v,
             };
 
-            if let Some(reader) = self.get_cv_reader(path, &ufs_path, &mount).await? {
+            if let Some(reader) = if mount.info.is_cache_mode() && path.path() != mount.info.cv_path
+            {
+                // P4-2 D5 strict interior (gpt56 `c1d51e75`): ONE
+                // locations-bearing CacheGet with strict decode, D5
+                // validity, and full geometry validation. The hit reader
+                // is CACHE-ONLY — never `FallbackFsReader` (no per-read
+                // UFS stitching); zero inode RPCs on this route.
+                self.get_cache_d5_reader(path, &ufs_path, &mount)
+                    .await?
+                    .map(UnifiedReader::Cv)
+            } else {
+                // FsMode interior or a cache mount ROOT: the legacy
+                // inode-mirror route (the root is the mount-point
+                // directory, outside the CacheGet file domain).
+                self.get_cv_reader(path, &ufs_path, &mount)
+                    .await?
+                    .map(UnifiedReader::Fallback)
+            } {
                 debug!(
                     "read from Curvine(cache), ufs path {}, cv path: {}",
                     ufs_path, path
@@ -1318,7 +1544,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
                     .with_label_values(&[mount.mount_id()])
                     .inc();
 
-                Ok(UnifiedReader::Fallback(reader))
+                Ok(reader)
             } else {
                 self.metrics
                     .mount_cache_misses
@@ -1396,6 +1622,18 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
                 None => self.cv.get_status(path).await,
 
                 Some((_, mnt)) if mnt.info.is_fs_mode() => self.cv.get_status(path).await,
+
+                Some((ufs_path, mnt))
+                    if mnt.info.is_cache_mode() && path.path() != mnt.info.cv_path =>
+                {
+                    // P4-2 D5 strict interior: CacheGet + D5; a valid hit
+                    // synthesizes the entry status with ZERO inode RPCs,
+                    // anything else is a miss onto the UFS status.
+                    match self.cache_d5_status(path, &ufs_path, &mnt).await? {
+                        Some(status) => Ok(status),
+                        None => mnt.ufs()?.get_status(&ufs_path).await,
+                    }
+                }
 
                 Some((ufs_path, mnt)) => match self.cv.get_status(path).await {
                     Ok(mut v) => match self.check_cache_validity(&v, &ufs_path, &mnt).await? {
@@ -1561,6 +1799,74 @@ mod tests {
                 err
             );
         }
+    }
+
+    /// P4-2 seams (gpt56 `c1d51e75` #2): the strict block decoder accepts
+    /// only a COMPLETE, geometrically exact location set — any anomaly is
+    /// a whole-object miss (None).
+    #[test]
+    fn cache_block_locations_strict_geometry() {
+        use super::UnifiedFileSystem;
+        use curvine_proto::{CacheBlockLocationProto, CacheGetResponse, WorkerAddressProto};
+
+        fn block(id: i64, len: i64, workers: usize) -> CacheBlockLocationProto {
+            CacheBlockLocationProto {
+                block_id: id,
+                block_len: len,
+                workers: vec![WorkerAddressProto::default(); workers],
+            }
+        }
+        fn rep(blocks: Vec<CacheBlockLocationProto>) -> CacheGetResponse {
+            CacheGetResponse {
+                hit: Some(true),
+                blocks,
+                ..Default::default()
+            }
+        }
+        let bs = 100i64;
+
+        // Exact single- and multi-block layouts decode.
+        let one = rep(vec![block(1 << 24 | 1, 100, 1)]);
+        assert!(UnifiedFileSystem::cache_blocks_from_get(&one, 100, bs).is_some());
+        let two = rep(vec![block(1 << 24 | 1, 100, 2), block(1 << 24 | 2, 50, 1)]);
+        assert!(UnifiedFileSystem::cache_blocks_from_get(&two, 150, bs).is_some());
+        // len == 0 requires an empty location set.
+        assert!(UnifiedFileSystem::cache_blocks_from_get(&rep(vec![]), 0, bs).is_some());
+
+        // Wrong block count / geometry / total.
+        let mismatched = rep(vec![block(1 << 24 | 1, 250, 1)]);
+        assert!(UnifiedFileSystem::cache_blocks_from_get(&mismatched, 150, bs).is_none()); // count != ceil
+        let short = rep(vec![block(1 << 24 | 1, 50, 1)]);
+        assert!(UnifiedFileSystem::cache_blocks_from_get(&short, 150, bs).is_none()); // count != ceil
+        let bad_last = rep(vec![block(1 << 24 | 1, 100, 1), block(1 << 24 | 2, 100, 1)]);
+        assert!(UnifiedFileSystem::cache_blocks_from_get(&bad_last, 150, bs).is_none()); // last != remainder
+        let bad_mid = rep(vec![block(1 << 24 | 1, 90, 1), block(1 << 24 | 2, 60, 1)]);
+        assert!(UnifiedFileSystem::cache_blocks_from_get(&bad_mid, 150, bs).is_none()); // non-last != block_size
+
+        // Block ids must be unique and monotone (+1): duplicates,
+        // decreasing order, and gaps are all whole-object misses.
+        let dup = rep(vec![block(5, 100, 1), block(5, 50, 1)]);
+        assert!(UnifiedFileSystem::cache_blocks_from_get(&dup, 150, bs).is_none());
+        let unordered = rep(vec![block(9, 100, 1), block(8, 50, 1)]);
+        assert!(UnifiedFileSystem::cache_blocks_from_get(&unordered, 150, bs).is_none());
+        let gap = rep(vec![block(4, 100, 1), block(6, 50, 1)]);
+        assert!(UnifiedFileSystem::cache_blocks_from_get(&gap, 150, bs).is_none());
+
+        // Every block needs at least one worker; empty blocks with len>0
+        // or blocks with len==0 are misses; non-positive block_size too.
+        let no_worker = rep(vec![block(1 << 24 | 1, 250, 0)]);
+        assert!(UnifiedFileSystem::cache_blocks_from_get(&no_worker, 250, bs).is_none());
+        let zero_len_block = rep(vec![block(1 << 24 | 1, 0, 1)]);
+        assert!(UnifiedFileSystem::cache_blocks_from_get(&zero_len_block, 0, bs).is_none());
+        let empty_nonzero = rep(vec![]);
+        assert!(UnifiedFileSystem::cache_blocks_from_get(&empty_nonzero, 250, bs).is_none());
+        assert!(UnifiedFileSystem::cache_blocks_from_get(&one, 250, 0).is_none());
+
+        // Degenerate shapes are rejected without panicking (the decoder
+        // uses checked arithmetic throughout).
+        assert!(UnifiedFileSystem::cache_blocks_from_get(&one, -2, bs).is_none());
+        let absurd = rep(vec![block(1, i64::MAX, 1), block(2, i64::MAX, 1)]);
+        assert!(UnifiedFileSystem::cache_blocks_from_get(&absurd, -2, bs).is_none());
     }
 
     #[test]
