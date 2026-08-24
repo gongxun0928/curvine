@@ -30,7 +30,7 @@ use curvine_model::{
     CreateFileOpts, DeleteResult, ExtendedBlock, FileAllocOpts, FileBlocks, FileLock, FileStatus,
     FileType, FilesystemInfo, FreeResult, JobStatus, ListOptions, LoadJobCommand, LocatedBlock,
     MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, ProtoUtils, RenameFlags,
-    SetAttrOpts, StorageType, TransferCommand, TransferKind, TransferState,
+    SetAttrOpts, StorageType, TransferCommand, TransferKind, TransferState, UFS_INODE_ID,
 };
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::common::TimeSpent;
@@ -445,26 +445,34 @@ impl UnifiedFileSystem {
     /// non-CacheMode, or the refreshed incarnation still fences, the error
     /// is loud — a dead namespace is never folded into a miss.
     ///
-    /// The returned `(response, key, incarnation)` always comes from the
-    /// SAME successful call (gpt56 `694593c1` P0: a re-resolved Get must
-    /// never be paired with the stale outer resolution — the consumer,
-    /// especially the invalidate mutation, uses exactly this triple).
+    /// The returned `(response, key, incarnation, mount)` always comes
+    /// from the SAME successful call (gpt56 `694593c1` P0: a re-resolved
+    /// Get must never be paired with the stale outer resolution; gpt56
+    /// `e53671d1` P0: the refreshed MOUNT travels with the observation —
+    /// every consumer of a hit or miss (D5 verify, UFS fallback,
+    /// auto_cache, metrics) uses this mount and the ufs path derived
+    /// from it, never the caller's pre-refresh resolution).
     async fn cache_get_observed(
         &self,
         path: &Path,
         need_locations: bool,
-    ) -> FsResult<(curvine_proto::CacheGetResponse, String, u64)> {
-        let (_, key, incarnation) = self.resolve_cache_target(path).await?;
+    ) -> FsResult<(
+        curvine_proto::CacheGetResponse,
+        String,
+        u64,
+        Arc<MountValue>,
+    )> {
+        let (mount, key, incarnation) = self.resolve_cache_target(path).await?;
         match self.cv.cache_get(incarnation, &key, need_locations).await {
-            Ok(rep) => Ok((rep, key, incarnation)),
+            Ok(rep) => Ok((rep, key, incarnation, mount)),
             Err(e) => {
                 if !is_incarnation_fenced(&e) {
                     return Err(e);
                 }
                 self.mount_cache.check_update(self, true).await?;
-                let (_, key, incarnation) = self.resolve_cache_target(path).await?;
+                let (mount, key, incarnation) = self.resolve_cache_target(path).await?;
                 let rep = self.cv.cache_get(incarnation, &key, need_locations).await?;
-                Ok((rep, key, incarnation))
+                Ok((rep, key, incarnation, mount))
             }
         }
     }
@@ -549,7 +557,10 @@ impl UnifiedFileSystem {
             }
             total = total.checked_add(block.block_len)?;
             match prev_id {
-                Some(prev) if block.block_id != prev + 1 => return None,
+                // checked: a hostile/corrupt id at i64::MAX must be a
+                // whole-object miss, never an overflow panic (gpt56
+                // `e53671d1`).
+                Some(prev) if block.block_id != prev.checked_add(1)? => return None,
                 _ => {}
             }
             prev_id = Some(block.block_id);
@@ -580,20 +591,26 @@ impl UnifiedFileSystem {
 
     /// Synthesizes the inode-free `FileStatus` for a cache-mode interior
     /// file from ONE strict hit observation (P4-2: strict-interior reads
-    /// issue zero inode RPCs — no field is ever read from the inode tree).
+    /// issue zero inode RPCs — no field is ever read from the inode
+    /// tree). The status must be a usable UFS-like namespace stat
+    /// (gpt56 `fd02f578` #2): the internal cache object id NEVER enters
+    /// the namespace id (UFS_INODE_ID, the existing UFS-backed
+    /// convention), and mode follows the UFS-layer regular-file default
+    /// (`0o777`, as every synthesized UFS status already uses) so a
+    /// FUSE permission check on a hit cannot see 000/EACCES.
     fn cache_entry_file_status(
         path: &Path,
-        object_id: i64,
         len: i64,
         block_size: i64,
         ufs_mtime: i64,
     ) -> FileStatus {
-        let mut status = FileStatus::with_name(object_id, path.name().to_string(), false);
+        let mut status = FileStatus::with_name(UFS_INODE_ID, path.name().to_string(), false);
         status.path = path.path().to_string();
         status.len = len;
         status.block_size = block_size;
         status.mtime = ufs_mtime;
         status.is_complete = true;
+        status.mode = 0o777;
         status
     }
 
@@ -603,83 +620,86 @@ impl UnifiedFileSystem {
     /// CACHE-ONLY reader (gpt56 `c1d51e75` P0: the hit reader is never
     /// wrapped in `FallbackFsReader` — a mid-read worker failure is a
     /// loud error, not a per-read UFS stitch). Anything else is a miss
-    /// (None) and the caller falls back to the UFS as a whole.
+    /// (None). The SAME-OBSERVATION `(mount, ufs_path)` travels with the
+    /// result (gpt56 `e53671d1` P0): the caller's D5/fallback/auto_cache
+    /// path uses the mount the Get actually resolved against — if a
+    /// fence refresh re-resolved onto a remounted target, that NEW mount
+    /// is what the miss falls back to, never the stale outer one.
     async fn get_cache_d5_reader(
         &self,
         path: &Path,
-        ufs_path: &Path,
-        mount: &MountValue,
-    ) -> FsResult<Option<FsReader>> {
-        let (rep, _, _) = self.cache_get_observed(path, true).await?;
-        let (object_id, len, block_size, ufs_mtime, expire_at) = match Self::status_from_get(&rep)?
-        {
+    ) -> FsResult<(Option<FsReader>, Arc<MountValue>, Path)> {
+        let (rep, _, _, mount) = self.cache_get_observed(path, true).await?;
+        let ufs_path = mount.get_ufs_path(path)?;
+        let (len, block_size, ufs_mtime, expire_at) = match Self::status_from_get(&rep)? {
             CacheEntryStatus::Hit {
-                object_id,
                 len,
                 block_size,
                 ufs_mtime,
                 expire_at,
                 ..
-            } => (object_id, len, block_size, ufs_mtime, expire_at),
-            CacheEntryStatus::Miss => return Ok(None),
+            } => (len, block_size, ufs_mtime, expire_at),
+            CacheEntryStatus::Miss => return Ok((None, mount, ufs_path)),
         };
         if !self
-            .d5_verify(len, ufs_mtime, expire_at, ufs_path, mount)
+            .d5_verify(len, ufs_mtime, expire_at, &ufs_path, &mount)
             .await?
         {
-            return Ok(None);
+            return Ok((None, mount, ufs_path));
         }
         let Some(block_locs) = Self::cache_blocks_from_get(&rep, len, block_size) else {
-            return Ok(None);
+            return Ok((None, mount, ufs_path));
         };
-        let status = Self::cache_entry_file_status(path, object_id, len, block_size, ufs_mtime);
+        let status = Self::cache_entry_file_status(path, len, block_size, ufs_mtime);
         let reader = FsReader::new(
             path.clone(),
             self.cv.fs_context(),
             FileBlocks::new(status, block_locs),
         )?;
-        Ok(Some(reader))
+        Ok((Some(reader), mount, ufs_path))
     }
 
     /// P4-2 D5 status route for a cache-mode STRICT INTERIOR path: ONE
     /// metadata-only CacheGet with the same strict decode and D5 matrix.
     /// A valid hit synthesizes the entry status; anything else is a miss
-    /// (None) and the caller takes the UFS status.
+    /// (None). Returns the SAME-OBSERVATION `(mount, ufs_path)` for the
+    /// caller's UFS status fallback (gpt56 `e53671d1` P0).
     async fn cache_d5_status(
         &self,
         path: &Path,
-        ufs_path: &Path,
-        mount: &MountValue,
-    ) -> FsResult<Option<FileStatus>> {
-        let (rep, _, _) = self.cache_get_observed(path, false).await?;
-        let (object_id, len, block_size, ufs_mtime, expire_at) = match Self::status_from_get(&rep)?
-        {
+    ) -> FsResult<(Option<FileStatus>, Arc<MountValue>, Path)> {
+        let (rep, _, _, mount) = self.cache_get_observed(path, false).await?;
+        let ufs_path = mount.get_ufs_path(path)?;
+        let (len, block_size, ufs_mtime, expire_at) = match Self::status_from_get(&rep)? {
             CacheEntryStatus::Hit {
-                object_id,
                 len,
                 block_size,
                 ufs_mtime,
                 expire_at,
                 ..
-            } => (object_id, len, block_size, ufs_mtime, expire_at),
-            CacheEntryStatus::Miss => return Ok(None),
+            } => (len, block_size, ufs_mtime, expire_at),
+            CacheEntryStatus::Miss => return Ok((None, mount, ufs_path)),
         };
         if !self
-            .d5_verify(len, ufs_mtime, expire_at, ufs_path, mount)
+            .d5_verify(len, ufs_mtime, expire_at, &ufs_path, &mount)
             .await?
         {
-            return Ok(None);
+            return Ok((None, mount, ufs_path));
         }
-        Ok(Some(Self::cache_entry_file_status(
-            path, object_id, len, block_size, ufs_mtime,
-        )))
+        Ok((
+            Some(Self::cache_entry_file_status(
+                path, len, block_size, ufs_mtime,
+            )),
+            mount,
+            ufs_path,
+        ))
     }
 
     /// Task #6 P4-1 (gpt56 `88cda9cf`): public cache-entry status — a
     /// metadata-only CacheGet (`need_locations=false`).
     pub async fn cache_status(&self, path: &Path) -> FsResult<CacheEntryStatus> {
         let fut = async {
-            let (rep, _, _) = self.cache_get_observed(path, false).await?;
+            let (rep, _, _, _) = self.cache_get_observed(path, false).await?;
             Self::status_from_get(&rep)
         };
         self.track("CacheGet", path.path(), "", fut).await
@@ -749,7 +769,7 @@ impl UnifiedFileSystem {
             // Get succeeded first try or after the one forced refresh
             // (gpt56 `694593c1` P0 — never mix a refreshed Get with the
             // stale outer resolution).
-            let (rep, key, incarnation) = self.cache_get_observed(path, false).await?;
+            let (rep, key, incarnation, _) = self.cache_get_observed(path, false).await?;
             // Same STRICT decoder as the public status (gpt56 `2e74f4ac`
             // #3): the mutation identity (generation, object_id) is only
             // ever taken from a well-formed hit observation — never
@@ -1516,24 +1536,33 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
                 Some(v) => v,
             };
 
-            if let Some(reader) = if mount.info.is_cache_mode() && path.path() != mount.info.cv_path
-            {
-                // P4-2 D5 strict interior (gpt56 `c1d51e75`): ONE
-                // locations-bearing CacheGet with strict decode, D5
-                // validity, and full geometry validation. The hit reader
-                // is CACHE-ONLY — never `FallbackFsReader` (no per-read
-                // UFS stitching); zero inode RPCs on this route.
-                self.get_cache_d5_reader(path, &ufs_path, &mount)
-                    .await?
-                    .map(UnifiedReader::Cv)
-            } else {
-                // FsMode interior or a cache mount ROOT: the legacy
-                // inode-mirror route (the root is the mount-point
-                // directory, outside the CacheGet file domain).
-                self.get_cv_reader(path, &ufs_path, &mount)
-                    .await?
-                    .map(UnifiedReader::Fallback)
-            } {
+            // The D5 route (cache-mode strict interior) carries its
+            // SAME-OBSERVATION mount/ufs_path out of the Get: a fence
+            // refresh may have re-resolved the path onto a remounted
+            // target, and the hit metrics, auto_cache, and miss→UFS
+            // fallback below must all use that observed mount, never
+            // the stale outer resolution (gpt56 `e53671d1` P0).
+            let (reader, mount, ufs_path) =
+                if mount.info.is_cache_mode() && path.path() != mount.info.cv_path {
+                    // P4-2 D5 strict interior (gpt56 `c1d51e75`): ONE
+                    // locations-bearing CacheGet with strict decode, D5
+                    // validity, and full geometry validation. The hit
+                    // reader is CACHE-ONLY — never `FallbackFsReader`
+                    // (no per-read UFS stitching); zero inode RPCs on
+                    // this route.
+                    let (reader, mount, ufs_path) = self.get_cache_d5_reader(path).await?;
+                    (reader.map(UnifiedReader::Cv), mount, ufs_path)
+                } else {
+                    // FsMode interior or a cache mount ROOT: the legacy
+                    // inode-mirror route (the root is the mount-point
+                    // directory, outside the CacheGet file domain).
+                    let reader = self
+                        .get_cv_reader(path, &ufs_path, &mount)
+                        .await?
+                        .map(UnifiedReader::Fallback);
+                    (reader, mount, ufs_path)
+                };
+            if let Some(reader) = reader {
                 debug!(
                     "read from Curvine(cache), ufs path {}, cv path: {}",
                     ufs_path, path
@@ -1623,13 +1652,16 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
 
                 Some((_, mnt)) if mnt.info.is_fs_mode() => self.cv.get_status(path).await,
 
-                Some((ufs_path, mnt))
-                    if mnt.info.is_cache_mode() && path.path() != mnt.info.cv_path =>
-                {
+                Some((_, mnt)) if mnt.info.is_cache_mode() && path.path() != mnt.info.cv_path => {
                     // P4-2 D5 strict interior: CacheGet + D5; a valid hit
                     // synthesizes the entry status with ZERO inode RPCs,
-                    // anything else is a miss onto the UFS status.
-                    match self.cache_d5_status(path, &ufs_path, &mnt).await? {
+                    // anything else is a miss onto the UFS status — taken
+                    // from the SAME-OBSERVATION mount (gpt56 `e53671d1`
+                    // P0: a fence refresh may have re-resolved onto a
+                    // remounted target; the fallback status reads the
+                    // mount the Get actually resolved against).
+                    let (status, mnt, ufs_path) = self.cache_d5_status(path).await?;
+                    match status {
                         Some(status) => Ok(status),
                         None => mnt.ufs()?.get_status(&ufs_path).await,
                     }
@@ -1867,6 +1899,13 @@ mod tests {
         assert!(UnifiedFileSystem::cache_blocks_from_get(&one, -2, bs).is_none());
         let absurd = rep(vec![block(1, i64::MAX, 1), block(2, i64::MAX, 1)]);
         assert!(UnifiedFileSystem::cache_blocks_from_get(&absurd, -2, bs).is_none());
+
+        // An id at i64::MAX must be a whole-object miss, never an
+        // overflow panic in the +1 monotone check (gpt56 `e53671d1`).
+        let max_first = rep(vec![block(i64::MAX, 100, 1), block(i64::MAX - 1, 50, 1)]);
+        assert!(UnifiedFileSystem::cache_blocks_from_get(&max_first, 150, bs).is_none());
+        let max_last = rep(vec![block(i64::MAX - 1, 100, 1), block(i64::MAX, 50, 1)]);
+        assert!(UnifiedFileSystem::cache_blocks_from_get(&max_last, 150, bs).is_some());
     }
 
     #[test]

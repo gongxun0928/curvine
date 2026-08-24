@@ -18,7 +18,7 @@ use curvine_client::unified::{
 };
 use curvine_fs_api::{FileSystem, Path, Reader, RpcCode, Writer};
 use curvine_io::DataSlice;
-use curvine_model::{AccessMode, MountOptionsBuilder, WriteType};
+use curvine_model::{AccessMode, MountInfo, MountOptionsBuilder, WriteType, UFS_INODE_ID};
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
 use curvine_tests::Testing;
@@ -1028,6 +1028,226 @@ fn test_cache_read_d5_fence_refresh_and_vanished_loud() {
     });
 }
 
+/// P4-2 same-observation mount seam (gpt56 `e53671d1` P0): a raw remount
+/// that swaps the UFS TARGET while the client snapshot still holds the
+/// dead incarnation must fence, refresh, and — on the resulting miss —
+/// fall back to the NEW mount's UFS. Pairing the refreshed Get with the
+/// stale outer resolution (the old UFS) is exactly the bug class this
+/// test forbids.
+#[test]
+fn test_cache_read_d5_remount_swap_miss_falls_to_new_ufs() {
+    let (fs, _cluster) = get_fs_cache_meta();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        mount(&fs, WriteType::CacheMode).await;
+        let opts = MountOptionsBuilder::new()
+            .write_type(WriteType::CacheMode)
+            .access_mode(AccessMode::ReadWrite)
+            .build();
+
+        let old_data = Utils::rand_str(2048);
+        let cv_root = Path::from_str("/write_cache_CacheMode").unwrap();
+        let path: Path = format!("/write_cache_{:?}/p42_swap.log", WriteType::CacheMode).into();
+        let mut writer = fs.create(&path, true).await.unwrap();
+        writer.write_string(&old_data).await.unwrap();
+        writer.complete().await.unwrap();
+
+        // Stage a SECOND UFS target via its own mount: same-named file,
+        // different content (and length, so status also discriminates).
+        let new_data = "swapped-target".to_string();
+        let ufs_base = env::var("UFS_TEST_PATH").unwrap();
+        let swap_dir = Path::from_str(format!("{}/write_cache_CacheMode_swap", ufs_base)).unwrap();
+        let swap_cv = Path::from_str("/write_cache_CacheMode_swap").unwrap();
+        let ufs = UfsFileSystem::new(&swap_dir, opts.add_properties.clone(), None).unwrap();
+        ufs.mkdir(&swap_dir, true).await.unwrap();
+        fs.mount(&swap_dir, &swap_cv, opts.clone()).await.unwrap();
+        let swap_file: Path = "/write_cache_CacheMode_swap/p42_swap.log".into();
+        let mut writer = fs.create(&swap_file, true).await.unwrap();
+        writer.write_string(&new_data).await.unwrap();
+        writer.complete().await.unwrap();
+
+        // Raw umount + remount of the ORIGINAL cv root onto the SWAP
+        // target (the staging mount gives the UFS up first — one UFS
+        // cannot sit at two cv roots): the client snapshot stays on the
+        // dead incarnation, the next Get fences.
+        fs.cv().umount(&cv_root).await.unwrap();
+        fs.cv().umount(&swap_cv).await.unwrap();
+        fs.cv().mount(&swap_dir, &cv_root, opts).await.unwrap();
+
+        // Fence → one refresh → re-resolve onto the swap mount → miss →
+        // the fallback MUST read the swap target's file, never the stale
+        // outer resolution's.
+        let mut reader = fs.open(&path).await.unwrap();
+        assert_eq!(
+            reader.read_as_string().await.unwrap(),
+            new_data,
+            "the miss must fall back to the SAME-OBSERVATION (refreshed) mount's UFS"
+        );
+
+        let status = fs.get_status(&path).await.unwrap();
+        assert_eq!(
+            status.len,
+            new_data.len() as i64,
+            "the status miss must take the refreshed mount's UFS too"
+        );
+    });
+}
+
+/// P4-2 D5 core matrix (gpt56 `fd02f578`): with `read_verify_ufs=true`
+/// the ONE UFS stat observation binds len + mtime — a length drift or an
+/// mtime drift demotes the hit to a whole-object miss and the read
+/// serves the CURRENT UFS content; the ttl expiry boundary demotes the
+/// same way (and without verification only expiry is consulted); a
+/// valid hit's synthesized public status is a usable UFS-like namespace
+/// stat (id = UFS_INODE_ID, readable regular-file mode), never the
+/// internal cache object id with mode 0.
+#[test]
+fn test_cache_read_d5_verify_matrix() {
+    let (fs, _cluster) = get_fs_cache_meta();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        let ufs_base = env::var("UFS_TEST_PATH").unwrap();
+
+        // Main matrix mount: verification ON, long TTL.
+        let d5_dir = Path::from_str(format!("{}/write_cache_CacheMode_d5", ufs_base)).unwrap();
+        let d5_root = Path::from_str("/write_cache_CacheMode_d5").unwrap();
+        let d5_opts = MountOptionsBuilder::new()
+            .write_type(WriteType::CacheMode)
+            .access_mode(AccessMode::ReadWrite)
+            .read_verify_ufs(true)
+            .ttl_ms(600_000)
+            .build();
+        let ufs = UfsFileSystem::new(&d5_dir, d5_opts.add_properties.clone(), None).unwrap();
+        ufs.mkdir(&d5_dir, true).await.unwrap();
+        fs.mount(&d5_dir, &d5_root, d5_opts).await.unwrap();
+
+        // Short-TTL mount with verification OFF: only expiry is consulted.
+        let ttl_dir = Path::from_str(format!("{}/write_cache_CacheMode_d5ttl", ufs_base)).unwrap();
+        let ttl_root = Path::from_str("/write_cache_CacheMode_d5ttl").unwrap();
+        let ttl_opts = MountOptionsBuilder::new()
+            .write_type(WriteType::CacheMode)
+            .access_mode(AccessMode::ReadWrite)
+            .ttl_ms(2000)
+            .build();
+        let ufs = UfsFileSystem::new(&ttl_dir, ttl_opts.add_properties.clone(), None).unwrap();
+        ufs.mkdir(&ttl_dir, true).await.unwrap();
+        fs.mount(&ttl_dir, &ttl_root, ttl_opts).await.unwrap();
+
+        let (_, d5_mount) = fs
+            .get_mount(&d5_root, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        let (_, ttl_mount) = fs
+            .get_mount(&ttl_root, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        // LEN drift: hit metadata says 4KB, the UFS file now holds 6KB —
+        // whole-object miss, the read serves the current UFS content.
+        let len_a = Utils::rand_str(4096);
+        let len_b = Utils::rand_str(6144);
+        let len_cv: Path = "/write_cache_CacheMode_d5/drift_len.log".into();
+        let mut writer = fs.create(&len_cv, true).await.unwrap();
+        writer.write_string(&len_a).await.unwrap();
+        writer.complete().await.unwrap();
+        fs.async_cache(&d5_mount.get_ufs_path(&len_cv).unwrap())
+            .unwrap();
+        fs.wait_job_complete(&len_cv, false).await.unwrap();
+        rewrite_ufs(&d5_mount.info, &len_cv, &len_b).await;
+        let mut reader = fs.open(&len_cv).await.unwrap();
+        assert_eq!(
+            reader.read_as_string().await.unwrap(),
+            len_b,
+            "len drift must demote the hit to a whole-object miss onto the current UFS"
+        );
+
+        // MTIME drift (same length, different bytes): the single stat
+        // observation's mtime binds the entry — miss onto the UFS.
+        let mt_a = Utils::rand_str(4096);
+        let mt_b = Utils::rand_str(4096);
+        assert_ne!(mt_a, mt_b);
+        let mt_cv: Path = "/write_cache_CacheMode_d5/drift_mtime.log".into();
+        let mut writer = fs.create(&mt_cv, true).await.unwrap();
+        writer.write_string(&mt_a).await.unwrap();
+        writer.complete().await.unwrap();
+        fs.async_cache(&d5_mount.get_ufs_path(&mt_cv).unwrap())
+            .unwrap();
+        fs.wait_job_complete(&mt_cv, false).await.unwrap();
+        // Guarantee an mtime delta (millisecond-resolution filesystems).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        rewrite_ufs(&d5_mount.info, &mt_cv, &mt_b).await;
+        let mut reader = fs.open(&mt_cv).await.unwrap();
+        assert_eq!(
+            reader.read_as_string().await.unwrap(),
+            mt_b,
+            "mtime drift (same len) must demote the hit to a whole-object miss"
+        );
+
+        // EXPIRY boundary (verification OFF — only expiry is consulted):
+        // before expiry the hit serves with the UFS source DELETED; after
+        // the ttl the entry demotes and the (restored) UFS serves.
+        let ttl_data = Utils::rand_str(2048);
+        let ttl_cv: Path = "/write_cache_CacheMode_d5ttl/expiry.log".into();
+        let mut writer = fs.create(&ttl_cv, true).await.unwrap();
+        writer.write_string(&ttl_data).await.unwrap();
+        writer.complete().await.unwrap();
+        fs.async_cache(&ttl_mount.get_ufs_path(&ttl_cv).unwrap())
+            .unwrap();
+        fs.wait_job_complete(&ttl_cv, false).await.unwrap();
+        let ttl_ufs = ttl_mount.get_ufs_path(&ttl_cv).unwrap();
+        ttl_mount
+            .ufs()
+            .unwrap()
+            .delete(&ttl_ufs, false)
+            .await
+            .unwrap();
+        let mut reader = fs.open(&ttl_cv).await.unwrap();
+        assert_eq!(
+            reader.read_as_string().await.unwrap(),
+            ttl_data,
+            "unexpired hit must serve from cache with the UFS source gone"
+        );
+        // Restore the UFS source, cross the ttl boundary, demote to miss.
+        rewrite_ufs(&ttl_mount.info, &ttl_cv, &ttl_data).await;
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        let mut reader = fs.open(&ttl_cv).await.unwrap();
+        assert_eq!(
+            reader.read_as_string().await.unwrap(),
+            ttl_data,
+            "expired entry must demote to the UFS read"
+        );
+
+        // Synthesized public status (valid hit): a UFS-like namespace
+        // stat — UFS_INODE_ID (never the cache object id) and the
+        // regular-file mode convention, so a FUSE permission check on a
+        // hit cannot see 000/EACCES.
+        let st_data = Utils::rand_str(4096);
+        let st_cv: Path = "/write_cache_CacheMode_d5/status.log".into();
+        let mut writer = fs.create(&st_cv, true).await.unwrap();
+        writer.write_string(&st_data).await.unwrap();
+        writer.complete().await.unwrap();
+        fs.async_cache(&d5_mount.get_ufs_path(&st_cv).unwrap())
+            .unwrap();
+        fs.wait_job_complete(&st_cv, false).await.unwrap();
+        let status = fs.get_status(&st_cv).await.unwrap();
+        assert_eq!(
+            status.id, UFS_INODE_ID,
+            "cache object id must not leak as the namespace inode id"
+        );
+        assert_eq!(
+            status.mode, 0o777,
+            "hit status must carry the readable regular-file mode"
+        );
+        assert!(!status.is_dir);
+        assert_eq!(status.len, st_data.len() as i64);
+        assert!(status.is_complete);
+        // The hit status' read-open stays usable end to end.
+        let mut reader = fs.open(&st_cv).await.unwrap();
+        assert_eq!(reader.read_as_string().await.unwrap(), st_data);
+    });
+}
+
 /// P4-1 default-off + non-cache-mode seams (gpt56 `88cda9cf`): the public
 /// entries are cache-domain only — an FsMode mount is loud, an unmounted
 /// path is loud, and the RAW binding against a default (capability-off)
@@ -1476,6 +1696,17 @@ async fn wait_for_cv_ufs_consistency(fs: &UnifiedFileSystem, path: &Path) {
         .await;
     w.result()
         .expect("timed out waiting for CV and UFS to match after journal/UFS apply");
+}
+
+/// Rewrite a UFS file in place through the mount's own UFS handle —
+/// used by the D5 drift seams to change the UFS state WITHOUT going
+/// through the cache mounts.
+async fn rewrite_ufs(mnt: &MountInfo, cv: &Path, content: &str) {
+    let ufs_path = mnt.get_ufs_path(cv).unwrap();
+    let ufs = UfsFileSystem::with_mount(mnt).unwrap();
+    let mut w = ufs.create(&ufs_path, true).await.unwrap();
+    w.write_string(content).await.unwrap();
+    w.complete().await.unwrap();
 }
 
 async fn mount(fs: &UnifiedFileSystem, write_type: WriteType) {
