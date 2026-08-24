@@ -398,6 +398,16 @@ impl UnifiedFileSystem {
     /// derived cache key. Loud on every non-cache-mode shape — these APIs
     /// are cache-domain only and never fall back to CV inodes.
     async fn resolve_cache_target(&self, path: &Path) -> FsResult<(Arc<MountValue>, String, u64)> {
+        // Unified-disabled contract (gpt56 `2e74f4ac` #2): the public
+        // cache entries are part of the Unified surface and respect the
+        // same `enable_unified` gate as `get_mount`; a disabled client
+        // must fail loud instead of quietly serving cache queries from a
+        // bypassing path. The raw `fs.cv()` bindings stay independent.
+        if !self.enable_unified {
+            return err_box!(
+                "unified filesystem is disabled: public cache_status/invalidate_cache are unavailable (raw fs.cv() bindings are unaffected)"
+            );
+        }
         if !path.is_cv() {
             return err_box!("cache status path is not curvine path: {}", path);
         }
@@ -425,47 +435,92 @@ impl UnifiedFileSystem {
         Ok((mnt, key, incarnation))
     }
 
+    /// ONE metadata Get observation with the fenced one-refresh policy
+    /// (shared by `cache_status` and `invalidate_cache`).
+    ///
+    /// On a typed CacheIncarnationFenced the mount table is force-refreshed
+    /// ONCE and the same path re-resolved; if the mount vanished, turned
+    /// non-CacheMode, or the refreshed incarnation still fences, the error
+    /// is loud — a dead namespace is never folded into a miss.
+    ///
+    /// The returned `(response, key, incarnation)` always comes from the
+    /// SAME successful call (gpt56 `694593c1` P0: a re-resolved Get must
+    /// never be paired with the stale outer resolution — the consumer,
+    /// especially the invalidate mutation, uses exactly this triple).
+    async fn cache_get_observed(
+        &self,
+        path: &Path,
+    ) -> FsResult<(curvine_proto::CacheGetResponse, String, u64)> {
+        let (_, key, incarnation) = self.resolve_cache_target(path).await?;
+        match self.cv.cache_get(incarnation, &key, false).await {
+            Ok(rep) => Ok((rep, key, incarnation)),
+            Err(e) => {
+                if !is_incarnation_fenced(&e) {
+                    return Err(e);
+                }
+                self.mount_cache.check_update(self, true).await?;
+                let (_, key, incarnation) = self.resolve_cache_target(path).await?;
+                let rep = self.cv.cache_get(incarnation, &key, false).await?;
+                Ok((rep, key, incarnation))
+            }
+        }
+    }
+
     /// Task #6 P4-1 (gpt56 `88cda9cf`): public cache-entry status — a
     /// metadata-only CacheGet (`need_locations=false`).
-    ///
-    /// FENCED ≠ miss: a typed CacheIncarnationFenced from a stale local
-    /// incarnation forces ONE mount-table refresh and re-resolves the
-    /// same path; if the mount vanished, turned non-CacheMode, or the
-    /// refreshed incarnation still fences, the error is loud — a dead
-    /// namespace is never folded into a miss (the caller must not
-    /// silently fall to the UFS under it).
     pub async fn cache_status(&self, path: &Path) -> FsResult<CacheEntryStatus> {
         let fut = async {
-            let (_, key, incarnation) = self.resolve_cache_target(path).await?;
-            match self.cv.cache_get(incarnation, &key, false).await {
-                Ok(rep) => Ok(Self::status_from_get(&rep)),
-                Err(e) => {
-                    if !is_incarnation_fenced(&e) {
-                        return Err(e);
-                    }
-                    self.mount_cache.check_update(self, true).await?;
-                    let (_, key, incarnation) = self.resolve_cache_target(path).await?;
-                    let rep = self.cv.cache_get(incarnation, &key, false).await?;
-                    Ok(Self::status_from_get(&rep))
-                }
-            }
+            let (rep, _, _) = self.cache_get_observed(path).await?;
+            Self::status_from_get(&rep)
         };
         self.track("CacheGet", path.path(), "", fut).await
     }
 
-    fn status_from_get(rep: &curvine_proto::CacheGetResponse) -> CacheEntryStatus {
-        if rep.hit.unwrap_or(false) {
-            CacheEntryStatus::Hit {
-                object_id: rep.object_id.unwrap_or(0),
-                len: rep.file_len.unwrap_or(0),
-                block_size: rep.block_size.unwrap_or(0),
-                generation: rep.generation.unwrap_or(0),
-                ufs_mtime: rep.ufs_mtime.unwrap_or(0),
-                expire_at: rep.expire_at.unwrap_or(0),
-            }
-        } else {
-            CacheEntryStatus::Miss
+    /// STRICT Get wire decode (gpt56 `2e74f4ac` #3), shared by the public
+    /// status and the composite invalidate: a response that claims
+    /// `hit=true` but omits ANY observation field is wire corruption —
+    /// fabricating a Hit (or letting Invalidate mutate with a forged 0
+    /// identity) would mask it, so the decode fails loud. Only a well
+    /// formed `hit=false` (or absent hit) is a `Miss`.
+    fn status_from_get(rep: &curvine_proto::CacheGetResponse) -> FsResult<CacheEntryStatus> {
+        if !rep.hit.unwrap_or(false) {
+            return Ok(CacheEntryStatus::Miss);
         }
+
+        let (
+            Some(object_id),
+            Some(len),
+            Some(block_size),
+            Some(generation),
+            Some(ufs_mtime),
+            Some(expire_at),
+        ) = (
+            rep.object_id,
+            rep.file_len,
+            rep.block_size,
+            rep.generation,
+            rep.ufs_mtime,
+            rep.expire_at,
+        )
+        else {
+            return err_box!(
+                "cache get response says hit but is missing observation fields: object_id={:?} file_len={:?} block_size={:?} generation={:?} ufs_mtime={:?} expire_at={:?}",
+                rep.object_id,
+                rep.file_len,
+                rep.block_size,
+                rep.generation,
+                rep.ufs_mtime,
+                rep.expire_at
+            );
+        };
+        Ok(CacheEntryStatus::Hit {
+            object_id,
+            len,
+            block_size,
+            generation,
+            ufs_mtime,
+            expire_at,
+        })
     }
 
     /// Task #6 P4-1 (gpt56 `88cda9cf` Q2): composite public Invalidate.
@@ -480,23 +535,24 @@ impl UnifiedFileSystem {
     /// ACTIVE incarnation is simply `Miss` — nothing to invalidate.
     pub async fn invalidate_cache(&self, path: &Path) -> FsResult<CacheInvalidateResult> {
         let fut = async {
-            let (_, key, incarnation) = self.resolve_cache_target(path).await?;
-            let rep = match self.cv.cache_get(incarnation, &key, false).await {
-                Ok(rep) => rep,
-                Err(e) => {
-                    if !is_incarnation_fenced(&e) {
-                        return Err(e);
-                    }
-                    self.mount_cache.check_update(self, true).await?;
-                    let (_, key, incarnation) = self.resolve_cache_target(path).await?;
-                    self.cv.cache_get(incarnation, &key, false).await?
-                }
+            // The observation and its resolution travel together: the
+            // mutation below consumes EXACTLY this triple, whether the
+            // Get succeeded first try or after the one forced refresh
+            // (gpt56 `694593c1` P0 — never mix a refreshed Get with the
+            // stale outer resolution).
+            let (rep, key, incarnation) = self.cache_get_observed(path).await?;
+            // Same STRICT decoder as the public status (gpt56 `2e74f4ac`
+            // #3): the mutation identity (generation, object_id) is only
+            // ever taken from a well-formed hit observation — never
+            // defaulted from a malformed response.
+            let (object_id, generation) = match Self::status_from_get(&rep)? {
+                CacheEntryStatus::Hit {
+                    object_id,
+                    generation,
+                    ..
+                } => (object_id, generation),
+                CacheEntryStatus::Miss => return Ok(CacheInvalidateResult::Miss),
             };
-            if !rep.hit.unwrap_or(false) {
-                return Ok(CacheInvalidateResult::Miss);
-            }
-            let generation = rep.generation.unwrap_or(0);
-            let object_id = rep.object_id.unwrap_or(0);
             let rep = self
                 .cv
                 .cache_invalidate(incarnation, &key, generation, object_id)
@@ -514,9 +570,18 @@ impl UnifiedFileSystem {
             Ok(match status {
                 Status::Applied => CacheInvalidateResult::Applied,
                 Status::AlreadyApplied => CacheInvalidateResult::AlreadyApplied,
-                Status::Superseded => CacheInvalidateResult::Superseded {
-                    current_generation: rep.current_generation.unwrap_or(0),
-                },
+                Status::Superseded => {
+                    // A legal server current_generation of 0 is sent
+                    // explicitly as Some(0); a MISSING field is wire
+                    // corruption and must be loud (gpt56 `2e74f4ac` #3),
+                    // never reported as Superseded { current_generation: 0 }.
+                    let Some(current_generation) = rep.current_generation else {
+                        return err_box!(
+                            "cache invalidate Superseded response is missing current_generation"
+                        );
+                    };
+                    CacheInvalidateResult::Superseded { current_generation }
+                }
                 // Commit-only re-planable state is impossible for an
                 // invalidate; loud, never silently treated as applied.
                 Status::ReplanNeeded => {
@@ -1427,6 +1492,76 @@ mod tests {
     use super::{AsyncCacheAdmission, AsyncCachePending};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    /// P1 seams (gpt56 `2e74f4ac` #3): the public Get decoder is STRICT —
+    /// a `hit=true` response missing any observation field fails loud
+    /// instead of fabricating a Hit (or an invalidate identity of 0).
+    #[test]
+    fn cache_get_strict_decode_rejects_malformed_hit() {
+        use super::{CacheEntryStatus, UnifiedFileSystem};
+        use curvine_proto::CacheGetResponse;
+
+        let full_hit = CacheGetResponse {
+            hit: Some(true),
+            object_id: Some(7),
+            file_len: Some(1024),
+            block_size: Some(64),
+            generation: Some(3),
+            ufs_mtime: Some(12345),
+            expire_at: Some(67890),
+            ..Default::default()
+        };
+        assert_eq!(
+            UnifiedFileSystem::status_from_get(&full_hit).unwrap(),
+            CacheEntryStatus::Hit {
+                object_id: 7,
+                len: 1024,
+                block_size: 64,
+                generation: 3,
+                ufs_mtime: 12345,
+                expire_at: 67890,
+            }
+        );
+
+        // hit=false (or absent) is a well-formed Miss.
+        let miss = CacheGetResponse {
+            hit: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            UnifiedFileSystem::status_from_get(&miss).unwrap(),
+            CacheEntryStatus::Miss
+        );
+
+        // Every observation field is individually required on a hit.
+        for missing in [
+            "object_id",
+            "file_len",
+            "block_size",
+            "generation",
+            "ufs_mtime",
+            "expire_at",
+        ] {
+            let mut malformed = full_hit.clone();
+            match missing {
+                "object_id" => malformed.object_id = None,
+                "file_len" => malformed.file_len = None,
+                "block_size" => malformed.block_size = None,
+                "generation" => malformed.generation = None,
+                "ufs_mtime" => malformed.ufs_mtime = None,
+                "expire_at" => malformed.expire_at = None,
+                _ => unreachable!(),
+            }
+            let err = UnifiedFileSystem::status_from_get(&malformed)
+                .expect_err("malformed hit must fail loud");
+            assert!(
+                format!("{:?}", err).contains("missing observation fields"),
+                "field {} missing should fail strict decode, got {:?}",
+                missing,
+                err
+            );
+        }
+    }
 
     #[test]
     fn async_cache_pending_enforces_capacity_and_releases_slots() {

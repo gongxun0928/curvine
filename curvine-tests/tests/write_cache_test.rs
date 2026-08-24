@@ -804,24 +804,17 @@ fn test_cache_fence_refresh_and_terminal_invalidate() {
             err
         );
 
-        // Public Get on the stale snapshot: fence → ONE forced refresh →
-        // re-resolve → answer under the NEW incarnation (fresh namespace,
-        // so a Miss — proving the retry crossed, not folded the fence).
-        assert_eq!(
-            fs.cache_status(&path).await.unwrap(),
-            CacheEntryStatus::Miss
-        );
-
-        // Re-load under the new incarnation; the old-inc fence must have
-        // changed NOTHING there.
-        let (_, mnt2) = fs
-            .get_mount(&path, RpcCode::GetMountInfo)
-            .await
-            .unwrap()
-            .unwrap();
+        // Resolve the rebuilt mount's id/incarnation WITHOUT touching the
+        // unified mount cache (a RAW CV table read — the snapshot must
+        // stay stale for the seam below), then re-load under inc2.
+        let table = fs.cv().get_mount_table().await.unwrap();
+        let mnt2 = table
+            .iter()
+            .find(|m| m.cv_path == "/write_cache_CacheMode")
+            .expect("rebuilt mount must be in the table");
         let inc2 = master_fs
             .cache_service
-            .current_incarnation_for_mount(mnt2.info.mount_id)
+            .current_incarnation_for_mount(mnt2.mount_id)
             .unwrap()
             .unwrap();
         assert_ne!(inc2, inc1);
@@ -835,6 +828,9 @@ fn test_cache_fence_refresh_and_terminal_invalidate() {
                 .is_some(),
             "the reload must commit into the rebuilt incarnation"
         );
+
+        // The old-inc mutation stays terminal against the POPULATED new
+        // incarnation and changes NOTHING there.
         let err = fs
             .cv()
             .cache_invalidate(inc1, &key, generation, object_id)
@@ -853,11 +849,27 @@ fn test_cache_fence_refresh_and_terminal_invalidate() {
             "the terminal old-inc mutation must leave the new incarnation at zero changes"
         );
 
-        // The composite public invalidate re-resolved fresh (Get under
-        // inc2, mutation with that same observation) — Applied.
+        // REGRESSION SEAM (gpt56 694593c1 P0): with the snapshot STILL
+        // stale (no cache_status called first), the DIRECT public
+        // invalidate must fence its Get, refresh once, and then Apply the
+        // mutation against the SAME refreshed observation — Applied, and
+        // only the NEW incarnation changed. (The shadowed-binding bug
+        // failed here with a terminal FENCED error instead.)
         assert_eq!(
             fs.invalidate_cache(&path).await.unwrap(),
             CacheInvalidateResult::Applied
+        );
+        assert!(
+            master_fs
+                .cache_service
+                .get(inc2, &key, false)
+                .unwrap()
+                .is_none(),
+            "the public invalidate must tombstone the entry under the new incarnation"
+        );
+        assert_eq!(
+            fs.cache_status(&path).await.unwrap(),
+            CacheEntryStatus::Miss
         );
 
         // Vanished mount after the refresh: loud, never a miss.
@@ -915,6 +927,157 @@ fn test_cache_apis_default_off_and_fs_mode_loud() {
             format!("{:?}", err).contains("cache metadata capability is disabled"),
             "default-off master must fail closed, got {:?}",
             err
+        );
+
+        // P1-2 seam (gpt56 `2e74f4ac` #2): with Unified disabled the public
+        // cache entries are gated LOUD — they must not bypass get_mount's
+        // enable_unified gate via the mount cache. The raw cv() binding
+        // above stays independent and unaffected.
+        let mut disabled = fs.clone();
+        disabled.disable_unified();
+        let err = disabled.cache_status(&path).await.unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("unified filesystem is disabled"),
+            "disabled unified must gate cache_status loud, got {:?}",
+            err
+        );
+        let err = disabled.invalidate_cache(&path).await.unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("unified filesystem is disabled"),
+            "disabled unified must gate invalidate_cache loud, got {:?}",
+            err
+        );
+    });
+}
+
+/// P1-4 seam (gpt56 `2e74f4ac` #4): the raw CacheRemove binding's
+/// response-loss contract on a LIVE entry — the FIRST remove changes the
+/// state exactly once (APPLIED) and the IDENTICAL replay classifies
+/// ALREADY_APPLIED with zero further state change. The alias must also
+/// stay fenced across generations: a remove carrying the pre-rebuild
+/// incarnation is terminal and leaves the rebuilt incarnation untouched.
+#[test]
+fn test_cache_remove_alias_replay_and_cross_generation_fence() {
+    let (fs, cluster) = get_fs_cache_meta();
+    let master_fs = cluster.get_active_master_fs();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        mount(&fs, WriteType::CacheMode).await;
+
+        let data = Utils::rand_str(512);
+        let cv_root = Path::from_str("/write_cache_CacheMode").unwrap();
+        let path: Path = format!("/write_cache_{:?}/p41_remove.log", WriteType::CacheMode).into();
+        let mut writer = fs.create(&path, true).await.unwrap();
+        writer.write_string(&data).await.unwrap();
+        writer.complete().await.unwrap();
+
+        let (ufs_path, mnt) = fs
+            .get_mount(&path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        fs.async_cache(&ufs_path).unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
+
+        let key = {
+            let ufs = mnt.info.get_ufs_path(&path).unwrap();
+            mnt.info.get_cache_key(&ufs).unwrap()
+        };
+        let inc1 = master_fs
+            .cache_service
+            .current_incarnation_for_mount(mnt.info.mount_id)
+            .unwrap()
+            .unwrap();
+
+        // Observe the LIVE entry's identity via the raw Get binding.
+        let rep = fs.cv().cache_get(inc1, &key, false).await.unwrap();
+        assert!(rep.hit.unwrap_or(false), "entry must be live before remove");
+        let object_id = rep.object_id.unwrap();
+        let generation = rep.generation.unwrap();
+
+        // FIRST remove on the live entry: APPLIED, state changes once.
+        let removed = fs
+            .cv()
+            .cache_remove(inc1, &key, generation, object_id)
+            .await
+            .unwrap();
+        assert_eq!(removed.status, Some(1), "first remove must be APPLIED");
+        assert!(
+            master_fs
+                .cache_service
+                .get(inc1, &key, false)
+                .unwrap()
+                .is_none(),
+            "first remove must tombstone the entry"
+        );
+
+        // Response-loss replay of the IDENTICAL payload: ALREADY_APPLIED,
+        // zero further state change.
+        let replay = fs
+            .cv()
+            .cache_remove(inc1, &key, generation, object_id)
+            .await
+            .unwrap();
+        assert_eq!(replay.status, Some(2), "replay must be ALREADY_APPLIED");
+        assert!(
+            master_fs
+                .cache_service
+                .get(inc1, &key, false)
+                .unwrap()
+                .is_none(),
+            "replay must change nothing"
+        );
+
+        // Cross-generation fence: rebuild the mount (raw client only) and
+        // re-load the entry under the new incarnation; a remove carrying
+        // the OLD incarnation is terminal and the new entry survives.
+        let ufs_base = env::var("UFS_TEST_PATH").unwrap();
+        let ufs_mount_path = Path::from_str(format!("{}/write_cache_CacheMode", ufs_base)).unwrap();
+        fs.cv().umount(&cv_root).await.unwrap();
+        let opts = MountOptionsBuilder::new()
+            .write_type(WriteType::CacheMode)
+            .access_mode(AccessMode::ReadWrite)
+            .build();
+        fs.cv()
+            .mount(&ufs_mount_path, &cv_root, opts)
+            .await
+            .unwrap();
+        let table = fs.cv().get_mount_table().await.unwrap();
+        let mnt2 = table
+            .iter()
+            .find(|m| m.cv_path == "/write_cache_CacheMode")
+            .expect("rebuilt mount must be in the table");
+        let inc2 = master_fs
+            .cache_service
+            .current_incarnation_for_mount(mnt2.mount_id)
+            .unwrap()
+            .unwrap();
+        assert_ne!(inc2, inc1);
+
+        fs.async_cache(&ufs_path).unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
+        let rep2 = fs.cv().cache_get(inc2, &key, false).await.unwrap();
+        assert!(rep2.hit.unwrap_or(false), "reload must commit under inc2");
+        let object_id2 = rep2.object_id.unwrap();
+        let generation2 = rep2.generation.unwrap();
+
+        let err = fs
+            .cv()
+            .cache_remove(inc1, &key, generation2, object_id2)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err.kind(), curvine_error::ErrorKind::CacheIncarnationFenced),
+            "old-inc remove must be the typed FENCED terminal, got {:?}",
+            err
+        );
+        assert!(
+            master_fs
+                .cache_service
+                .get(inc2, &key, false)
+                .unwrap()
+                .is_some(),
+            "the cross-generation remove must leave the new incarnation at zero changes"
         );
     });
 }

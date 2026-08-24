@@ -193,11 +193,6 @@ impl InnerMap {
         Ok(())
     }
 
-    pub fn clear(&mut self) {
-        self.cv_map.clear();
-        self.ufs_map.clear();
-    }
-
     pub fn remove(&mut self, path: &Path) {
         if path.is_cv() {
             if let Some(info) = self.cv_map.remove(path.path()) {
@@ -280,12 +275,24 @@ impl MountCache {
     /// used here.
     async fn do_refresh(&self, fs: &UnifiedFileSystem) -> FsResult<()> {
         let raw = fs.cv().get_mount_table_raw().await?;
-        let mut state = self.mounts.write().unwrap();
+        self.apply_raw(raw)
+    }
 
-        state.clear();
+    /// Publishes a raw mount-table response ATOMICICALLY (gpt56
+    /// `2e74f4ac` #1): the WHOLE response is decoded into a fresh table
+    /// before the live cache is touched, and only a fully decoded table
+    /// is swapped in under one write lock. A decode failure anywhere in
+    /// the response (e.g. a cache-mode row missing its incarnation)
+    /// leaves the previous complete snapshot untouched — the caller sees
+    /// the error, never a half-published table.
+    fn apply_raw(&self, raw: Vec<MountInfoProto>) -> FsResult<()> {
+        let mut next = InnerMap::default();
         for pb in raw {
-            state.insert(MountSnapshot::from_pb(pb)?)?;
+            next.insert(MountSnapshot::from_pb(pb)?)?;
         }
+
+        let mut state = self.mounts.write().unwrap();
+        *state = next;
 
         debug!("update mounts {:?}", state.len());
         self.last_update.set(LocalTime::mills());
@@ -490,5 +497,76 @@ mod tests {
         info.write_type = WriteType::FsMode;
         let snapshot = snapshot_for(info, None).unwrap();
         assert_eq!(snapshot.cache_incarnation, None);
+    }
+
+    /// P1 seam (gpt56 `2e74f4ac` #1): a refresh whose response has a
+    /// valid first row but a CORRUPT second row (cache-mode without
+    /// incarnation) must fail WITHOUT touching the live table — the
+    /// previously published snapshot stays complete, never a
+    /// half-published mix of old and new rows.
+    #[test]
+    fn refresh_decode_failure_keeps_old_table_complete() {
+        let mut second = opendal_oss_mount();
+        second.cv_path = "/oss-mount/other".to_string();
+        second.ufs_path = "oss://example-bucket/other".to_string();
+
+        let cache = MountCache::new(u64::MAX);
+
+        // Seed a complete old table: two rows, distinct incarnations.
+        let old_first = ProtoUtils::mount_info_to_pb(opendal_oss_mount());
+        let mut old_second = ProtoUtils::mount_info_to_pb(second.clone());
+        cache
+            .apply_raw(vec![
+                {
+                    let mut pb = old_first.clone();
+                    pb.cache_incarnation = Some(11);
+                    pb
+                },
+                {
+                    old_second.cache_incarnation = Some(22);
+                    old_second.clone()
+                },
+            ])
+            .expect("seed refresh should succeed");
+
+        // New response: first row valid, second row corrupt (cache-mode
+        // row with no incarnation).
+        let new_first = {
+            let mut info = opendal_oss_mount();
+            info.cv_path = "/oss-mount/newfirst".to_string();
+            info.ufs_path = "oss://example-bucket/newfirst".to_string();
+            let mut pb = ProtoUtils::mount_info_to_pb(info);
+            pb.cache_incarnation = Some(33);
+            pb
+        };
+        let corrupt_second = {
+            let mut pb = ProtoUtils::mount_info_to_pb(second);
+            pb.cache_incarnation = None;
+            pb
+        };
+
+        let err = cache
+            .apply_raw(vec![new_first, corrupt_second])
+            .expect_err("corrupt second row must fail the whole refresh");
+        assert!(
+            format!("{:?}", err).contains("no authoritative cache incarnation"),
+            "expected fail-closed incarnation error, got {:?}",
+            err
+        );
+
+        // The old table is COMPLETE and unchanged: both original rows,
+        // original incarnations, and none of the new response leaked in.
+        let state = cache.mounts.read().unwrap();
+        assert_eq!(state.len(), 2, "old table must keep both rows");
+        let m1 = state.get(true, "/oss-mount/data").expect("old row 1 alive");
+        assert_eq!(m1.cache_incarnation, Some(11));
+        let m2 = state
+            .get(true, "/oss-mount/other")
+            .expect("old row 2 alive");
+        assert_eq!(m2.cache_incarnation, Some(22));
+        assert!(
+            state.get(true, "/oss-mount/newfirst").is_none(),
+            "no row from the failed response may leak into the live table"
+        );
     }
 }
