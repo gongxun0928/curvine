@@ -68,8 +68,17 @@ The dashboard shows all modules with **Run / Cancel** buttons.
 | **FIO** | FIO performance tests (needs a running cluster) |
 | **LTP** | POSIX compliance tests via LTP (needs `/opt/ltp` and cluster) |
 
-> **Dailytest** does not include LTP by default. Trigger LTP separately via the Portal or `/ltp/run` API.  
+> **Dailytest** does not include LTP by default. Trigger LTP separately via the Portal or `/ltp/run` API.
 > LTP requires LTP installed at `/opt/ltp` on the host or in the container.
+>
+> **cvtest (external, preferred for CI)**: the [cvtest repo](https://github.com/gongxun0928/cvtest)
+> maintains the pinned LTP installer (version pinned there — single source
+> of truth), the curated `cv-fs` command file, and the `cvtest run`
+> entrypoint whose JSON matches this Portal's `ltp_test` schema. This repo
+> only invokes it; bumping the LTP version happens in cvtest, not here.
+> CI wiring lives in
+> `.github/workflows/e2e-ltp.yml` (label `run-ltp` / nightly / dispatch; not a
+> PR-required gate). The Portal path above stays for local/interactive use.
 
 Test results are saved under `curvine-tests/regression_result/<timestamp>/`.
 
