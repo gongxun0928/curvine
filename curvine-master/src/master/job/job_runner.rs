@@ -15,6 +15,7 @@
 use crate::common::UfsFactory;
 use crate::master::fs::policy::ChooseContext;
 use crate::master::fs::MasterFilesystem;
+use crate::master::MountManager;
 use crate::master::{JobContext, JobStore, TaskDetail};
 use curvine_config::ClientConf;
 use curvine_core_error::err_box;
@@ -39,6 +40,7 @@ pub struct LoadJobRunner {
     jobs: JobStore,
     master_fs: MasterFilesystem,
     factory: Arc<UfsFactory>,
+    mount_manager: Arc<MountManager>,
     job_max_files: usize,
     run_seq: Arc<AtomicCounter>,
 }
@@ -67,6 +69,7 @@ impl LoadJobRunner {
         jobs: JobStore,
         master_fs: MasterFilesystem,
         factory: Arc<UfsFactory>,
+        mount_manager: Arc<MountManager>,
         job_max_files: usize,
         run_seq: Arc<AtomicCounter>,
     ) -> Self {
@@ -74,6 +77,7 @@ impl LoadJobRunner {
             jobs,
             master_fs,
             factory,
+            mount_manager,
             job_max_files,
             run_seq,
         }
@@ -674,7 +678,41 @@ impl LoadJobRunner {
         true
     }
 
+    /// P4-4 (2a): dispatch-time mount audit. A task dispatched through the
+    /// legacy inode-writing load path (`cache=None`) whose CV target
+    /// re-resolves against the LIVE mount table to a cache-mode mount is
+    /// rejected loudly BEFORE any worker submit. This is a runtime check,
+    /// not a grep invariant: tasks are re-resolved at dispatch, so any
+    /// constructor that forgets to mint a CacheLoadSpec fails closed instead
+    /// of silently writing legacy inodes into a cache-mode namespace.
+    fn audit_legacy_task_targets(
+        mount_manager: &MountManager,
+        tasks: &FastHashMap<String, TaskDetail>,
+    ) -> FsResult<()> {
+        for (task_id, detail) in tasks.iter() {
+            if detail.task.cache.is_some() {
+                continue;
+            }
+            let target = Path::from_str(&detail.task.target_path)?;
+            if !target.is_cv() {
+                continue;
+            }
+            if let Some(mnt) = mount_manager.get_mount_info(&target)? {
+                if mnt.is_cache_mode() {
+                    return err_box!(
+                        "task {} targets cache-mode mount {} through the legacy inode load path (no CacheLoadSpec); refusing to dispatch — cache-mode targets require a master-minted cache spec",
+                        task_id,
+                        mnt.cv_path
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn submit_all_task(&self, tasks: FastHashMap<String, TaskDetail>) -> FsResult<()> {
+        Self::audit_legacy_task_targets(&self.mount_manager, &tasks)?;
+
         let submit_futures: Vec<_> = tasks
             .take()
             .into_iter()
@@ -866,5 +904,195 @@ impl LoadJobRunner {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod p44_tests {
+    use super::*;
+    use crate::master::journal::JournalSystem;
+    use crate::master::MountManager;
+    use crate::Master;
+    use curvine_config::ClusterConf;
+    use curvine_model::{LoadJobInfo, WriteType};
+    use curvine_runtime::common::Utils;
+    use curvine_runtime::runtime::RpcRuntime;
+
+    fn test_master_fs(name: &str) -> MasterFilesystem {
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.meta_dir = Utils::test_sub_dir(format!(
+            "job-runner-p44/meta-{}-{}",
+            name,
+            Utils::rand_str(6)
+        ));
+        conf.journal.journal_dir = Utils::test_sub_dir(format!(
+            "job-runner-p44/journal-{}-{}",
+            name,
+            Utils::rand_str(6)
+        ));
+        JournalSystem::fs_only_for_test(&conf).unwrap()
+    }
+
+    fn cache_mount(cv_path: &str) -> MountInfo {
+        MountInfo {
+            cv_path: cv_path.to_string(),
+            ufs_path: "file:///tmp/p44-audit".to_string(),
+            mount_id: 7,
+            write_type: WriteType::CacheMode,
+            ..Default::default()
+        }
+    }
+
+    fn cache_spec() -> CacheLoadSpec {
+        CacheLoadSpec {
+            incarnation: 11,
+            key: "cm/a.bin".to_string(),
+            load_token: CacheOpTokenId {
+                client_id: 1,
+                op_seq: 1,
+            },
+            commit_token: CacheOpTokenId {
+                client_id: 1,
+                op_seq: 2,
+            },
+        }
+    }
+
+    fn task_detail(task_id: &str, target: &str, cache: Option<CacheLoadSpec>) -> TaskDetail {
+        let job = LoadJobInfo {
+            job_id: "job-1".to_string(),
+            source_path: "file:///tmp/p44-audit/src.bin".to_string(),
+            target_path: target.to_string(),
+            block_size: 1024,
+            replicas: 1,
+            storage_type: Default::default(),
+            ttl_ms: 0,
+            ttl_action: Default::default(),
+            mount_info: MountInfo::default(),
+            create_time: 0,
+            overwrite: None,
+        };
+        TaskDetail::new(LoadTaskInfo {
+            job,
+            task_id: task_id.to_string(),
+            worker: WorkerAddress::default(),
+            source_path: "file:///tmp/p44-audit/src.bin".to_string(),
+            target_path: target.to_string(),
+            create_time: 0,
+            source_read_plan_json: String::new(),
+            transfer_report: None,
+            cache,
+        })
+    }
+
+    fn one_task(target: &str, cache: Option<CacheLoadSpec>) -> FastHashMap<String, TaskDetail> {
+        let mut tasks = FastHashMap::default();
+        tasks.insert("t0".to_string(), task_detail("t0", target, cache));
+        tasks
+    }
+
+    /// P4-4 (2a) quadrants: the dispatch-time audit only rejects the one
+    /// dangerous shape — legacy (`cache=None`) task whose CV target
+    /// re-resolves to a LIVE cache-mode mount. Cache-spec tasks, fs-mode
+    /// mounts, unmounted CV paths, and UFS targets all pass.
+    #[test]
+    fn p44_audit_rejects_only_legacy_tasks_on_live_cache_mounts() {
+        let fs = test_master_fs("audit-quadrants");
+        let mount_manager = Arc::new(MountManager::new(fs.clone()));
+        mount_manager
+            .unprotected_add_mount(cache_mount("/cm"))
+            .unwrap();
+        let fs_mount = MountInfo {
+            cv_path: "/fs".to_string(),
+            ufs_path: "file:///tmp/p44-fs".to_string(),
+            mount_id: 8,
+            write_type: WriteType::FsMode,
+            ..Default::default()
+        };
+        mount_manager.unprotected_add_mount(fs_mount).unwrap();
+
+        // Quadrant 1: cache mount + legacy task -> loud reject.
+        let err = match LoadJobRunner::audit_legacy_task_targets(
+            &mount_manager,
+            &one_task("cv://ns/cm/a.bin", None),
+        ) {
+            Err(e) => e,
+            Ok(()) => panic!("legacy task on a cache-mode mount must be rejected"),
+        };
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("legacy inode load path"),
+            "expected the dispatch guard message, got: {}",
+            msg
+        );
+        assert!(msg.contains("/cm"), "message must name the mount: {}", msg);
+
+        // Quadrant 2: cache mount + cache-spec task -> pass.
+        LoadJobRunner::audit_legacy_task_targets(
+            &mount_manager,
+            &one_task("cv://ns/cm/a.bin", Some(cache_spec())),
+        )
+        .unwrap();
+
+        // Quadrant 3: fs-mode mount + legacy task -> pass.
+        LoadJobRunner::audit_legacy_task_targets(
+            &mount_manager,
+            &one_task("cv://ns/fs/a.bin", None),
+        )
+        .unwrap();
+
+        // Quadrant 4: unmounted CV path -> pass.
+        LoadJobRunner::audit_legacy_task_targets(
+            &mount_manager,
+            &one_task("cv://ns/plain/a.bin", None),
+        )
+        .unwrap();
+
+        // Quadrant 5: UFS target (export task) -> pass.
+        LoadJobRunner::audit_legacy_task_targets(
+            &mount_manager,
+            &one_task("file:///tmp/p44-audit/dst.bin", None),
+        )
+        .unwrap();
+    }
+
+    /// P4-4 (2a): the audit gates `submit_all_task` itself — a legacy task
+    /// targeting a cache-mode mount is rejected BEFORE any worker client is
+    /// acquired, so the legacy submit count is zero by construction.
+    #[test]
+    fn p44_dispatch_gate_fires_before_any_worker_submit() {
+        let fs = test_master_fs("dispatch-gate");
+        let mount_manager = Arc::new(MountManager::new(fs.clone()));
+        mount_manager
+            .unprotected_add_mount(cache_mount("/cm"))
+            .unwrap();
+
+        let rt = Arc::new(curvine_runtime::runtime::Runtime::new("p44-dispatch", 1, 1));
+        let factory = Arc::new(UfsFactory::with_rt(
+            &ClusterConf::format().client,
+            rt.clone(),
+        ));
+        let runner = LoadJobRunner::new(
+            JobStore::new(),
+            fs,
+            factory,
+            mount_manager,
+            10,
+            Arc::new(AtomicCounter::new(0)),
+        );
+
+        let err = match rt.block_on(runner.submit_all_task(one_task("cv://ns/cm/a.bin", None))) {
+            Err(e) => e,
+            Ok(()) => panic!("dispatch must reject a legacy task on a cache-mode mount"),
+        };
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("legacy inode load path"),
+            "the audit must fire before worker client acquisition; got: {}",
+            msg
+        );
     }
 }

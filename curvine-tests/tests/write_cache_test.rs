@@ -81,7 +81,19 @@ fn test_cache_mode() {
         let mut writer = fs.create(&path, true).await.unwrap();
         writer.write_string(&data).await.unwrap();
         writer.complete().await.unwrap();
-        assert!(!fs.cv().exists(&path).await.unwrap());
+        match fs.cv().exists(&path).await {
+            Ok(_) => {
+                panic!("P4-4: legacy inode Exists must be refused on a cache-mode strict interior")
+            }
+            Err(e) => {
+                assert!(
+                    matches!(e, curvine_error::FsError::Unsupported(_)),
+                    "expected the P4-4 strict-interior guard, got: {:?}",
+                    e
+                );
+                assert!(format!("{}", e).contains("strict interior"));
+            }
+        }
 
         let (ufs_path, mnt) = fs
             .get_mount(&path, RpcCode::GetMountInfo)
@@ -413,10 +425,17 @@ fn test_cache_mode_free() {
             .unwrap()
             .unwrap();
         assert!(mnt.ufs().unwrap().exists(&ufs_path).await.unwrap());
-        assert!(
-            !fs.cv().exists(&path).await.unwrap(),
-            "cache-mode metadata lives in the cache index, not the CV inode tree"
-        );
+        match fs.cv().exists(&path).await {
+            Ok(_) => panic!("cache-mode metadata lives in the cache index, not the CV inode tree"),
+            Err(e) => {
+                assert!(
+                    matches!(e, curvine_error::FsError::Unsupported(_)),
+                    "expected the P4-4 strict-interior guard, got: {:?}",
+                    e
+                );
+                assert!(format!("{}", e).contains("strict interior"));
+            }
+        }
 
         // Import-style cache load (UFS source): with cache metadata
         // enabled the dual-mode split tracks cache-mode files in the
@@ -465,10 +484,17 @@ fn test_cache_mode_free() {
             "free must remove the index entry"
         );
         // Never an inode delete, and UFS is untouched.
-        assert!(
-            !fs.cv().exists(&path).await.unwrap(),
-            "free must not create or delete CV inodes"
-        );
+        match fs.cv().exists(&path).await {
+            Ok(_) => panic!("free must not create or delete CV inodes"),
+            Err(e) => {
+                assert!(
+                    matches!(e, curvine_error::FsError::Unsupported(_)),
+                    "expected the P4-4 strict-interior guard, got: {:?}",
+                    e
+                );
+                assert!(format!("{}", e).contains("strict interior"));
+            }
+        }
         assert!(
             mnt.ufs().unwrap().exists(&ufs_path).await.unwrap(),
             "cache mode free must not delete the UFS file"
@@ -579,10 +605,17 @@ fn test_cache_mode_free_child_with_unified_disabled() {
             "prefix free must not touch an entry outside the prefix"
         );
         assert!(mount.ufs().unwrap().exists(&ufs_path).await.unwrap());
-        assert!(
-            !fs.cv().exists(&path).await.unwrap(),
-            "free must not create or delete CV inodes"
-        );
+        match fs.cv().exists(&path).await {
+            Ok(_) => panic!("free must not create or delete CV inodes"),
+            Err(e) => {
+                assert!(
+                    matches!(e, curvine_error::FsError::Unsupported(_)),
+                    "expected the P4-4 strict-interior guard, got: {:?}",
+                    e
+                );
+                assert!(format!("{}", e).contains("strict interior"));
+            }
+        }
 
         // ROOT free (the mount root itself): the typed Mount scope of the
         // whole current incarnation — the sibling entry dies, its UFS
@@ -714,7 +747,55 @@ fn test_cache_mode_status_and_invalidate() {
             CacheEntryStatus::Miss
         );
 
-        // Content survives end-to-end.
+        // P4-4 2b RC2 (gpt56 c23693b9): the durable unlock through the
+        // PRODUCTION explicit-invalidate route re-opens the reload. A
+        // re-cache of the SAME source (same md5 job id) must now
+        // COMPLETE — under the pre-invalidate live Valid row its
+        // Allocate would collide "live entry" and wait_job_complete
+        // would surface the failure — and produce a fresh Hit with a
+        // NEW generation / object identity, content intact from the
+        // full object.
+        fs.async_cache(&ufs_path).unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
+        // The durable row is committed at job completion, but the
+        // servable Hit also needs the worker's volatile location
+        // report to land — poll briefly for the fresh Hit instead of
+        // racing the first observation.
+        let mut fresh_hit = awaitility::at_most(Duration::from_secs(30));
+        fresh_hit.poll_interval(Duration::from_millis(200));
+        fresh_hit
+            .until_async(|| async {
+                matches!(
+                    fs.cache_status(&path).await,
+                    Ok(CacheEntryStatus::Hit { .. })
+                )
+            })
+            .await;
+        match fs.cache_status(&path).await.unwrap() {
+            CacheEntryStatus::Hit {
+                object_id: new_object,
+                len: new_len,
+                generation: new_generation,
+                ..
+            } => {
+                assert_ne!(new_object, object_id, "fresh object identity");
+                assert!(new_generation > generation, "generation advanced");
+                assert_eq!(new_len, data.len() as i64);
+                assert_eq!(
+                    master_fs
+                        .cache_service
+                        .get(inc, &key, false)
+                        .unwrap()
+                        .unwrap()
+                        .object_id,
+                    new_object,
+                    "the authoritative index serves the rebuilt row"
+                );
+            }
+            other => panic!("expected fresh Hit after re-cache, got {:?}", other),
+        }
+
+        // Content survives end-to-end and serves from the FULL object.
         let mut reader = fs.open(&path).await.unwrap();
         assert_eq!(reader.read_as_string().await.unwrap(), data);
     });
@@ -1560,6 +1641,416 @@ fn test_cache_p43_partial_binding_shapes_fail_closed() {
             fs.cache_status(&path).await.unwrap(),
             CacheEntryStatus::Hit { .. }
         ));
+    });
+}
+
+/// P4-4 (3) strict-interior guardrail (gpt56 `f4f2f2b3` #3): legacy inode
+/// RPCs are unreachable on cache-mode mount strict interiors — raw wire
+/// requests fail closed with the stable typed `Unsupported` kind, dual-path
+/// RPCs reject on either endpoint, and a batch rejects in FULL preflight
+/// (no half-batch ever lands). The mount root, fs-mode mounts, and
+/// non-cache namespaces keep the legacy behavior exactly as before, and
+/// the public legal cache-mode flow leaves ZERO inodes on the master.
+#[test]
+fn test_cache_p44_inode_rpc_guardrail_four_quadrants() {
+    let (fs, cluster) = get_fs_cache_meta();
+    let master_fs = cluster.get_active_master_fs();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        let ufs_base = env::var("UFS_TEST_PATH").unwrap();
+
+        // --- Cache-mode mount with one publicly cached file. ---
+        let dir = Path::from_str(format!("{}/write_cache_CacheMode_p44guard", ufs_base)).unwrap();
+        let opts = MountOptionsBuilder::new()
+            .write_type(WriteType::CacheMode)
+            .access_mode(AccessMode::ReadWrite)
+            .build();
+        let root = Path::from_str("/p44guard_cm").unwrap();
+        let ufs = UfsFileSystem::new(&dir, opts.add_properties.clone(), None).unwrap();
+        ufs.mkdir(&dir, true).await.unwrap();
+        fs.mount(&dir, &root, opts).await.unwrap();
+
+        let path: Path = "/p44guard_cm/f.log".into();
+        let data = Utils::rand_str(2048);
+        let mut w = fs.create(&path, true).await.unwrap();
+        w.write_string(&data).await.unwrap();
+        w.complete().await.unwrap();
+        let (ufs_path, _mnt) = fs
+            .get_mount(&path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        fs.async_cache(&ufs_path).unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
+        assert!(matches!(
+            fs.cache_status(&path).await.unwrap(),
+            CacheEntryStatus::Hit { .. }
+        ));
+
+        // PUBLIC LEGAL PATHS → inode-RPC=0: the whole public flow above
+        // (create / status / cache) left no inode mirror for the interior
+        // file on the master.
+        assert!(master_fs.file_status("/p44guard_cm/f.log").is_err());
+
+        // --- Fs-mode mount with one real file (quadrant 3). ---
+        let fdir = Path::from_str(format!("{}/write_cache_p44guard_fs", ufs_base)).unwrap();
+        let fopts = MountOptionsBuilder::new()
+            .write_type(WriteType::FsMode)
+            .build();
+        let froot = Path::from_str("/p44guard_fs").unwrap();
+        let fufs = UfsFileSystem::new(&fdir, fopts.add_properties.clone(), None).unwrap();
+        fufs.mkdir(&fdir, true).await.unwrap();
+        fs.mount(&fdir, &froot, fopts).await.unwrap();
+        let fpath: Path = "/p44guard_fs/a.log".into();
+        let mut w = fs.create(&fpath, true).await.unwrap();
+        w.write_string(&data).await.unwrap();
+        w.complete().await.unwrap();
+
+        // A plain CV file outside every mount (quadrant 4).
+        fs.mkdir(&"/p44_plain_ok".into(), true).await.unwrap();
+        let plain: Path = "/p44_plain_ok/y.log".into();
+        let mut w = fs.create(&plain, true).await.unwrap();
+        w.write_string(&data).await.unwrap();
+        w.complete().await.unwrap();
+
+        let interior = "/p44guard_cm/f.log".to_string();
+        let interior_dir = "/p44guard_cm/sub".to_string();
+
+        // Reject helper: raw wire request must fail with the typed
+        // Unsupported kind naming the strict interior.
+        macro_rules! expect_unsupported {
+            ($resp:ty, $code:expr, $req:expr) => {{
+                let rep: Result<$resp, curvine_error::FsError> =
+                    fs.fs_client().rpc($code, $req).await;
+                match rep {
+                    Ok(_) => panic!("raw inode RPC must be rejected on cache strict interior"),
+                    Err(e) => {
+                        assert!(
+                            matches!(e, curvine_error::FsError::Unsupported(_)),
+                            "expected typed Unsupported, got: {:?}",
+                            e
+                        );
+                        assert!(format!("{:?}", e).contains("strict interior"), "{}", e);
+                    }
+                }
+            }};
+        }
+
+        // Quadrant 1: every listed legacy inode RPC, sent RAW against the
+        // cache strict interior.
+        expect_unsupported!(
+            curvine_proto::GetFileStatusResponse,
+            RpcCode::FileStatus,
+            curvine_proto::GetFileStatusRequest {
+                path: interior.clone(),
+            }
+        );
+        expect_unsupported!(
+            curvine_proto::ExistsResponse,
+            RpcCode::Exists,
+            curvine_proto::ExistsRequest {
+                path: interior.clone(),
+            }
+        );
+        expect_unsupported!(
+            curvine_proto::ListStatusResponse,
+            RpcCode::ListStatus,
+            curvine_proto::ListStatusRequest {
+                path: interior.clone(),
+                need_location: false,
+            }
+        );
+        expect_unsupported!(
+            curvine_proto::ListOptionsResponse,
+            RpcCode::ListOptions,
+            curvine_proto::ListOptionsRequest {
+                path: interior.clone(),
+                ..Default::default()
+            }
+        );
+        expect_unsupported!(
+            curvine_proto::GetBlockLocationsResponse,
+            RpcCode::GetBlockLocations,
+            curvine_proto::GetBlockLocationsRequest {
+                path: interior.clone(),
+            }
+        );
+        expect_unsupported!(
+            curvine_proto::OpenFileResponse,
+            RpcCode::OpenFile,
+            curvine_proto::OpenFileRequest {
+                path: interior.clone(),
+                ..Default::default()
+            }
+        );
+        expect_unsupported!(
+            curvine_proto::MkdirResponse,
+            RpcCode::Mkdir,
+            curvine_proto::MkdirRequest {
+                path: interior_dir.clone(),
+                ..Default::default()
+            }
+        );
+        expect_unsupported!(
+            curvine_proto::CreateFileResponse,
+            RpcCode::CreateFile,
+            curvine_proto::CreateFileRequest {
+                path: interior.clone(),
+                ..Default::default()
+            }
+        );
+        expect_unsupported!(
+            curvine_proto::DeleteResponse,
+            RpcCode::Delete,
+            curvine_proto::DeleteRequest {
+                path: interior.clone(),
+                recursive: false,
+            }
+        );
+        // Rename: EITHER endpoint strict interior rejects.
+        expect_unsupported!(
+            curvine_proto::RenameResponse,
+            RpcCode::Rename,
+            curvine_proto::RenameRequest {
+                src: interior.clone(),
+                dst: "/p44_plain_ok/dst.log".to_string(),
+                flags: 0,
+            }
+        );
+        expect_unsupported!(
+            curvine_proto::RenameResponse,
+            RpcCode::Rename,
+            curvine_proto::RenameRequest {
+                src: "/p44_plain_ok/y.log".to_string(),
+                dst: interior.clone(),
+                flags: 0,
+            }
+        );
+        expect_unsupported!(
+            curvine_proto::SetAttrResponse,
+            RpcCode::SetAttr,
+            curvine_proto::SetAttrRequest {
+                path: interior.clone(),
+                ..Default::default()
+            }
+        );
+        // Symlink: the interior LINK endpoint rejects.
+        expect_unsupported!(
+            curvine_proto::SymlinkResponse,
+            RpcCode::Symlink,
+            curvine_proto::SymlinkRequest {
+                target: "/p44_plain_ok/y.log".to_string(),
+                link: interior.clone(),
+                force: false,
+                mode: 0o644,
+                owner: None,
+                group: None,
+            }
+        );
+        expect_unsupported!(
+            curvine_proto::LinkResponse,
+            RpcCode::Link,
+            curvine_proto::LinkRequest {
+                src_path: "/p44_plain_ok/y.log".to_string(),
+                dst_path: interior.clone(),
+            }
+        );
+        expect_unsupported!(
+            curvine_proto::FileResizeResponse,
+            RpcCode::ResizeFile,
+            curvine_proto::FileResizeRequest {
+                path: interior.clone(),
+                ..Default::default()
+            }
+        );
+        expect_unsupported!(
+            curvine_proto::AddBlockResponse,
+            RpcCode::AddBlock,
+            curvine_proto::AddBlockRequest {
+                path: interior.clone(),
+                ..Default::default()
+            }
+        );
+        expect_unsupported!(
+            curvine_proto::CompleteFileResponse,
+            RpcCode::CompleteFile,
+            curvine_proto::CompleteFileRequest {
+                path: interior.clone(),
+                len: 0,
+                client_name: "p44".to_string(),
+                ..Default::default()
+            }
+        );
+
+        // Batches: FULL preflight before the first item — the legal first
+        // item never lands when a later item is strict interior.
+        expect_unsupported!(
+            curvine_proto::CreateFilesBatchResponse,
+            RpcCode::CreateFilesBatch,
+            curvine_proto::CreateFilesBatchRequest {
+                requests: vec![
+                    curvine_proto::CreateFileRequest {
+                        path: "/p44_plain_ok/x.log".to_string(),
+                        ..Default::default()
+                    },
+                    curvine_proto::CreateFileRequest {
+                        path: interior.clone(),
+                        ..Default::default()
+                    },
+                ],
+            }
+        );
+        assert!(
+            !fs.exists(&"/p44_plain_ok/x.log".into()).await.unwrap(),
+            "batch preflight must reject before the legal first item lands"
+        );
+        expect_unsupported!(
+            curvine_proto::AddBlocksBatchResponse,
+            RpcCode::AddBlocksBatch,
+            curvine_proto::AddBlocksBatchRequest {
+                requests: vec![curvine_proto::AddBlockRequest {
+                    path: interior.clone(),
+                    ..Default::default()
+                }],
+            }
+        );
+        expect_unsupported!(
+            curvine_proto::CompleteFilesBatchResponse,
+            RpcCode::CompleteFilesBatch,
+            curvine_proto::CompleteFilesBatchRequest {
+                requests: vec![curvine_proto::CompleteFileRequest {
+                    path: interior.clone(),
+                    len: 0,
+                    client_name: "p44".to_string(),
+                    ..Default::default()
+                }],
+            }
+        );
+
+        // RC 45bbdc9f P0: AssignWorker / GetLock / SetLock also enter
+        // inode/block/lock state and are guarded.
+        expect_unsupported!(
+            curvine_proto::AssignWorkerResponse,
+            RpcCode::AssignWorker,
+            curvine_proto::AssignWorkerRequest {
+                path: interior.clone(),
+                ..Default::default()
+            }
+        );
+        expect_unsupported!(
+            curvine_proto::GetLockResponse,
+            RpcCode::GetLock,
+            curvine_proto::GetLockRequest {
+                path: interior.clone(),
+                ..Default::default()
+            }
+        );
+        expect_unsupported!(
+            curvine_proto::SetLockResponse,
+            RpcCode::SetLock,
+            curvine_proto::SetLockRequest {
+                path: interior.clone(),
+                ..Default::default()
+            }
+        );
+
+        // RC 45bbdc9f P1: the symlink TARGET is verbatim payload, not
+        // an accessed endpoint — a plain-namespace link pointing AT
+        // the cache strict interior must still be created, and the
+        // payload must stay readable.
+        let sym: Result<curvine_proto::SymlinkResponse, curvine_error::FsError> = fs
+            .fs_client()
+            .rpc(
+                RpcCode::Symlink,
+                curvine_proto::SymlinkRequest {
+                    target: interior.clone(),
+                    link: "/p44_plain_ok/points-at-cache".to_string(),
+                    force: false,
+                    mode: 0o644,
+                    owner: None,
+                    group: None,
+                },
+            )
+            .await;
+        sym.unwrap();
+        let sym_status: curvine_proto::GetFileStatusResponse = fs
+            .fs_client()
+            .rpc(
+                RpcCode::FileStatus,
+                curvine_proto::GetFileStatusRequest {
+                    path: "/p44_plain_ok/points-at-cache".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sym_status.status.target.as_deref(),
+            Some(interior.as_str()),
+            "symlink payload survives: target is stored verbatim, not guarded"
+        );
+
+        // Quadrant 2: the cache mount ROOT keeps its dedicated paths.
+        let root_status: curvine_proto::GetFileStatusResponse = fs
+            .fs_client()
+            .rpc(
+                RpcCode::FileStatus,
+                curvine_proto::GetFileStatusRequest {
+                    path: "/p44guard_cm".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!root_status.status.path.is_empty());
+        let root_list: curvine_proto::ListStatusResponse = fs
+            .fs_client()
+            .rpc(
+                RpcCode::ListStatus,
+                curvine_proto::ListStatusRequest {
+                    path: "/p44guard_cm".to_string(),
+                    need_location: false,
+                },
+            )
+            .await
+            .unwrap();
+        // Interior cache files never create inode-mirror children, so the
+        // legacy ListStatus on the mount root legally observes an empty
+        // inode namespace (public listing is served from the UFS path).
+        assert!(root_list.statuses.is_empty());
+
+        // Quadrant 3: fs-mode mount interior is untouched by the guard.
+        let fs_status: curvine_proto::GetFileStatusResponse = fs
+            .fs_client()
+            .rpc(
+                RpcCode::FileStatus,
+                curvine_proto::GetFileStatusRequest {
+                    path: "/p44guard_fs/a.log".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!fs_status.status.path.is_empty());
+
+        // Quadrant 4: non-cache namespaces keep the legacy behavior
+        // (default-off shape: no cache mount covers this path).
+        let plain_status: curvine_proto::GetFileStatusResponse = fs
+            .fs_client()
+            .rpc(
+                RpcCode::FileStatus,
+                curvine_proto::GetFileStatusRequest {
+                    path: "/p44_plain_ok/y.log".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!plain_status.status.path.is_empty());
+
+        // The public cache route is STILL Hit — nothing above touched the
+        // cache domain or created an inode mirror.
+        assert!(matches!(
+            fs.cache_status(&path).await.unwrap(),
+            CacheEntryStatus::Hit { .. }
+        ));
+        assert!(master_fs.file_status("/p44guard_cm/f.log").is_err());
     });
 }
 

@@ -13505,4 +13505,59 @@ mod tests {
             assert!(!volatile.quarantine_index.contains_key(&2));
         }
     }
+
+    /// P4-4 (2b, RC2 c23693b9): `need_locations=false` judges the
+    /// DURABLE Valid loaded-state; volatile location completeness
+    /// belongs to D5 serving/session lifecycle. Proven on the REAL
+    /// session machinery up to the reload gate: a fully-published
+    /// Valid row (current-tag replicas installed) serves get(true); a
+    /// real `retire_worker_session` clears only the volatile registry
+    /// — get(true) becomes a clean miss (D5 whole-object falls back
+    /// to the UFS) while get(false) still hits and a reload Allocate
+    /// still collides "live entry": session retirement NEVER
+    /// tombstones the durable row, so lost-worker session cleanup can
+    /// never unlock (or re-warm) a reload by itself. The durable
+    /// unlock itself — the production explicit
+    /// Invalidate/Remove/TTL route (public invalidate_cache ->
+    /// CacheInvalidate -> journal propose -> applied row) followed by
+    /// a successful re-cache to a fresh Hit — is proven on the live
+    /// cluster in write_cache_test::test_cache_mode_status_and_invalidate.
+    #[test]
+    fn p44_session_retire_keeps_durable_valid_row_and_serves_ufs() {
+        let service = build_service("p44-session-retire", chooser(vec![worker(1), worker(2)]));
+        seed_sessions(&service, &[worker(1), worker(2)]);
+        let key = "/p44/a";
+        committed_entry(&service, token(2, 1), token(2, 2), key, OBJ + 1, 128, 0);
+        assert!(service.raw_row_valid(1, key).unwrap());
+
+        // Fully published: current-tag replicas for every block of the
+        // 128-byte / 64-byte-block layout.
+        let lay = layout(OBJ + 1, 128);
+        service
+            .install_locations(OBJ + 1, &lay, full_locations(&lay))
+            .unwrap();
+        assert!(service.get(1, key, true).unwrap().is_some());
+
+        // REAL production session retire (both workers' sessions end):
+        // the registry rows disappear, no current-tag replica remains,
+        // and D5 whole-object serving sees a clean miss — the caller
+        // falls back to the UFS.
+        assert!(service.retire_worker_session(1, "seed-1"));
+        assert!(service.retire_worker_session(2, "seed-2"));
+        assert!(service.get(1, key, true).unwrap().is_none());
+
+        // The durable Valid row is UNTOUCHED by session retirement:
+        // the fast-path (need_locations=false) still skips the reload
+        // job...
+        assert!(service.get(1, key, false).unwrap().is_some());
+        assert!(service.raw_row_valid(1, key).unwrap());
+        // ...and a reload Allocate still collides loudly with the live
+        // Valid row. Session cleanup is NOT a durable unlock; the
+        // unlock/re-warm continues in the live-cluster E2E test.
+        let collide = match service.allocate(token(3, 1), 7, 1, key, 128, 64) {
+            Err(e) => e,
+            Ok(_) => panic!("allocate on a live Valid row must fail loudly"),
+        };
+        assert!(format!("{}", collide).contains("live entry"), "{}", collide);
+    }
 }

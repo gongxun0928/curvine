@@ -16,7 +16,7 @@ use crate::master::fs::context::ValidateAddBlock;
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
 use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
-use crate::master::meta::{BlockIdCodec, CacheInvalidationResult, FsDir};
+use crate::master::meta::{BlockIdCodec, FsDir};
 
 use crate::master::fs::DeleteResult;
 use crate::master::meta::parse_glob_pattern;
@@ -154,8 +154,6 @@ const FULL_BLOCK_RECONCILE_QUEUE_SIZE: usize = 128;
 impl MasterFilesystem {
     // Max block-report location updates applied under a single fs_dir write lock.
     const BLOCK_REPORT_WRITE_CHUNK: usize = 4096;
-    // Max lost-worker block ids inspected under a single fs_dir write lock.
-    const LOST_WORKER_INVALIDATION_CHUNK: usize = Self::BLOCK_REPORT_WRITE_CHUNK;
 
     fn validate_alloc_capacity(
         current_len: i64,
@@ -2056,41 +2054,19 @@ impl MasterFilesystem {
             .unwrap_or(false)
     }
 
+    /// P4-4 (1): worker loss is purely a fs-mode replica-recovery event.
+    /// The old TTL-guess branch treated `ttl_action=Delete` + lost locations
+    /// as proof of a cache-mode file and rewrote the inode to Ufs-only;
+    /// cache cleanup now belongs exclusively to the cache domain (session
+    /// retire / purge paths), so ALL removed block ids flow to replica
+    /// recovery unchanged.
     pub fn delete_locations(&self, worker_id: u32) -> FsResult<LostWorkerLocationCleanup> {
         let removed_block_ids = {
             let fs_dir = self.fs_dir.write();
             fs_dir.delete_locations(worker_id)?
         };
-        let mut invalidated = CacheInvalidationResult::default();
 
-        for chunk in removed_block_ids.chunks(Self::LOST_WORKER_INVALIDATION_CHUNK) {
-            let result = {
-                let mut fs_dir = self.fs_dir.write();
-                fs_dir.invalidate_lost_cache_files(chunk)
-            };
-            match result {
-                Ok(result) => invalidated.extend(result),
-                Err(e) => warn!(
-                    "failed to invalidate lost cache files for worker {} ({} block ids); \\
-                     continuing with normal replica recovery: {}",
-                    worker_id,
-                    chunk.len(),
-                    e
-                ),
-            }
-        }
-
-        let replication_block_ids = removed_block_ids
-            .iter()
-            .copied()
-            .filter(|block_id| !invalidated.invalidated_block_ids.contains(block_id))
-            .collect();
-
-        if !invalidated.delete_result.blocks.is_empty() {
-            self.worker_manager
-                .write()
-                .remove_blocks(&invalidated.delete_result);
-        }
+        let replication_block_ids = removed_block_ids.clone();
 
         Ok(LostWorkerLocationCleanup {
             removed_block_ids,
@@ -2301,6 +2277,88 @@ mod tests {
         // Exactly at the cap is accepted.
         conf.client.replicas = crate::master::cache::MAX_LOCATIONS_PER_BLOCK as i32;
         assert!(MasterFilesystem::cache_chooser(&conf, &workers).is_ok());
+    }
+
+    /// P4-4 (1): worker loss must never rewrite legacy-lookalike cache
+    /// inodes. The old TTL-guess branch treated `ttl_action=Delete` + lost
+    /// locations as proof of "cache-mode file" and flipped the inode to
+    /// Ufs-only, swallowing the block from fs-mode replica recovery. The
+    /// fs-mode inode is authoritative: losing a worker replica is purely a
+    /// replica-recovery event, and cache cleanup belongs to the cache domain
+    /// (session retire / purge paths), not the lost-worker path.
+    #[test]
+    fn p44_lost_worker_never_touches_ttl_delete_inodes() {
+        use crate::master::meta::inode::InodeView::File;
+        use crate::master::meta::{BlockIdCodec, BlockMeta};
+        use curvine_model::{BlockLocation, StorageState, TtlAction};
+
+        let fs = test_fs("p44-ttl-delete");
+        let status = fs.create("/legacy.log", true).unwrap();
+        let inode_id = status.id;
+        let block_id = BlockIdCodec::encode_block_id(inode_id, 1).unwrap();
+
+        // Shape the fresh inode into a legacy-cache lookalike: Both state,
+        // Delete TTL action, one block whose only replica lives on worker 1.
+        {
+            let fs_dir = fs.fs_dir.read();
+            let mut inode = fs_dir.store.get_inode(inode_id, None).unwrap().unwrap();
+            let File(file) = &mut inode else {
+                panic!("expected a file inode");
+            };
+            file.storage_policy.save_ufs(12345);
+            assert!(file.storage_policy.both_exists());
+            file.storage_policy.ttl_action = TtlAction::Delete;
+            file.blocks.push(BlockMeta::new(block_id, 1024));
+            fs_dir.store.apply_cache_invalidations(vec![inode]).unwrap();
+        }
+        fs.fs_dir
+            .write()
+            .block_report(vec![(true, block_id, BlockLocation::with_id(1))])
+            .unwrap();
+
+        // Worker 1 is lost: every removed replica must go to fs-mode
+        // replica recovery, none swallowed by a cache-side guess.
+        let cleanup = fs.delete_locations(1).unwrap();
+        assert!(
+            cleanup.removed_block_ids.contains(&block_id),
+            "worker loss must remove the replica location, got {:?}",
+            cleanup.removed_block_ids
+        );
+        assert_eq!(
+            cleanup.replication_block_ids, cleanup.removed_block_ids,
+            "ALL removed block ids must flow to fs-mode replica recovery"
+        );
+
+        // The inode itself must be untouched: still Both with its UFS
+        // metadata and TTL action intact. Pre-fix this reds because
+        // invalidate_lost_cache_files flipped the state to Ufs.
+        {
+            let fs_dir = fs.fs_dir.read();
+            let inode = fs_dir.store.get_inode(inode_id, None).unwrap().unwrap();
+            let File(file) = &inode else {
+                panic!("expected a file inode");
+            };
+            assert_eq!(
+                file.storage_policy.state,
+                StorageState::Both,
+                "lost-worker cleanup must not rewrite the fs inode"
+            );
+            assert_eq!(file.storage_policy.ufs_mtime, 12345);
+            assert_eq!(file.storage_policy.ttl_action, TtlAction::Delete);
+            assert_eq!(file.blocks.len(), 1);
+        }
+
+        // And no CacheInvalidation journal entry may be recorded.
+        let has_invalidation = fs.fs_dir.read().take_entries().iter().any(|e| {
+            matches!(
+                e,
+                crate::master::journal::JournalEntry::CacheInvalidation(_)
+            )
+        });
+        assert!(
+            !has_invalidation,
+            "lost-worker cleanup must not journal CacheInvalidation entries"
+        );
     }
 
     #[test]

@@ -148,6 +148,7 @@ impl JobManager {
             self.jobs.clone(),
             self.master_fs.clone(),
             self.factory.clone(),
+            self.mount_manager.clone(),
             self.job_max_files,
             self.run_seq.clone(),
         )

@@ -20,7 +20,6 @@ mod block_id;
 pub use self::block_id::{BlockIdCodec, CacheBlockLayout, CacheObjectId};
 
 mod fs_dir;
-pub(crate) use self::fs_dir::CacheInvalidationResult;
 pub use self::fs_dir::FsDir;
 
 mod fs_stats;

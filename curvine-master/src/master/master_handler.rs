@@ -252,6 +252,101 @@ impl MasterHandler {
         ctx.response(rep_header)
     }
 
+    /// P4-4 (3) core: reject a legacy inode RPC that targets the STRICT
+    /// INTERIOR of a cache-mode mount (a path that resolves to a
+    /// cache-mode mount and is not the mount root itself). The mount root
+    /// keeps its dedicated paths (mount lifecycle, the mirrored root
+    /// directory, the Free bridge); everything strictly below it belongs
+    /// to the cache domain (CacheGet/Allocate/Commit/Invalidate) and the
+    /// UFS. Dual-path RPCs reject when EITHER endpoint is strict
+    /// interior; batch requests are fully preflighted here — before the
+    /// handler runs — so no half-batch can ever land. The error is the
+    /// stable typed `Unsupported` kind.
+    fn reject_cache_strict_interior(
+        mount_manager: &MountManager,
+        code: RpcCode,
+        paths: &[String],
+    ) -> FsResult<()> {
+        for p in paths {
+            let path = Path::from_str(p)?;
+            if !path.is_cv() {
+                continue;
+            }
+            if let Some(info) = mount_manager.get_mount_info(&path)? {
+                if info.is_cache_mode() && path.path() != info.cv_path {
+                    return Err(FsError::unsupported(format!(
+                        "legacy inode RPC {} on cache-mode mount strict interior {} (mount {}): cache-mode metadata is served only through the cache RPCs and the UFS path",
+                        code, p, info.cv_path
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// P4-4 (3) dispatch wrapper: extract every CV path carried by a
+    /// legacy inode RPC and run the strict-interior check before the
+    /// handler executes. This is a runtime gate, not a grep invariant:
+    /// any client (raw, legacy, or a future code path) that sends an
+    /// inode RPC into a cache-mode namespace fails closed here.
+    fn guard_legacy_inode_rpcs(&self, code: RpcCode, ctx: &mut RpcContext<'_>) -> FsResult<()> {
+        let paths: Vec<String> = match code {
+            RpcCode::Mkdir => vec![ctx.parse_header::<MkdirRequest>()?.path],
+            RpcCode::CreateFile => vec![ctx.parse_header::<CreateFileRequest>()?.path],
+            RpcCode::OpenFile => vec![ctx.parse_header::<OpenFileRequest>()?.path],
+            RpcCode::FileStatus => vec![ctx.parse_header::<GetFileStatusRequest>()?.path],
+            RpcCode::Exists => vec![ctx.parse_header::<ExistsRequest>()?.path],
+            RpcCode::Delete => vec![ctx.parse_header::<DeleteRequest>()?.path],
+            RpcCode::Rename => {
+                let header: RenameRequest = ctx.parse_header()?;
+                vec![header.src, header.dst]
+            }
+            RpcCode::ListStatus => vec![ctx.parse_header::<ListStatusRequest>()?.path],
+            RpcCode::ListOptions => vec![ctx.parse_header::<ListOptionsRequest>()?.path],
+            RpcCode::GetBlockLocations => {
+                vec![ctx.parse_header::<GetBlockLocationsRequest>()?.path]
+            }
+            RpcCode::AddBlock => vec![ctx.parse_header::<AddBlockRequest>()?.path],
+            RpcCode::CompleteFile => vec![ctx.parse_header::<CompleteFileRequest>()?.path],
+            RpcCode::SetAttr => vec![ctx.parse_header::<SetAttrRequest>()?.path],
+            RpcCode::Symlink => {
+                // RC 45bbdc9f: only the LINK creates a dentry; the
+                // target is stored verbatim as payload (it may name a
+                // cache interior, a UFS path, or an arbitrary string)
+                // and is NOT an accessed inode endpoint.
+                vec![ctx.parse_header::<SymlinkRequest>()?.link]
+            }
+            RpcCode::Link => {
+                let header: LinkRequest = ctx.parse_header()?;
+                vec![header.src_path, header.dst_path]
+            }
+            RpcCode::ResizeFile => vec![ctx.parse_header::<FileResizeRequest>()?.path],
+            RpcCode::AssignWorker => vec![ctx.parse_header::<AssignWorkerRequest>()?.path],
+            RpcCode::GetLock => vec![ctx.parse_header::<GetLockRequest>()?.path],
+            RpcCode::SetLock => vec![ctx.parse_header::<SetLockRequest>()?.path],
+            RpcCode::CreateFilesBatch => ctx
+                .parse_header::<CreateFilesBatchRequest>()?
+                .requests
+                .into_iter()
+                .map(|req| req.path)
+                .collect(),
+            RpcCode::AddBlocksBatch => ctx
+                .parse_header::<AddBlocksBatchRequest>()?
+                .requests
+                .into_iter()
+                .map(|req| req.path)
+                .collect(),
+            RpcCode::CompleteFilesBatch => ctx
+                .parse_header::<CompleteFilesBatchRequest>()?
+                .requests
+                .into_iter()
+                .map(|req| req.path)
+                .collect(),
+            _ => return Ok(()),
+        };
+        Self::reject_cache_strict_interior(&self.mount_manager, code, &paths)
+    }
+
     pub fn delete0(&self, req_id: i64, header: DeleteRequest) -> FsResult<DeleteResult> {
         if self.check_is_retry(req_id)? {
             return Ok(DeleteResult::default());
@@ -1601,6 +1696,10 @@ impl MessageHandler for MasterHandler {
         // observability + error_ext conversion path as async_handle).
         let response = if !self.fs.master_monitor.is_active() {
             Err(FsError::not_leader_master(ctx.code, self.client_ip()))
+        } else if let Err(e) = self.guard_legacy_inode_rpcs(code, ctx) {
+            // P4-4 (3): legacy inode RPCs never reach a cache-mode mount
+            // strict interior — full request preflight, typed Unsupported.
+            Err(e)
         } else {
             match code {
                 // File system operation request
@@ -1825,6 +1924,110 @@ mod tests {
                 err
             );
         }
+    }
+
+    /// P4-4 (3) quadrants: the strict-interior guard rejects legacy inode
+    /// RPCs ONLY on cache-mode mount strict interiors. The mount root,
+    /// fs-mode mounts, unmounted CV paths, and UFS targets all keep the
+    /// legacy inode paths. Dual-path RPCs reject when EITHER endpoint is
+    /// strict interior.
+    #[test]
+    fn cache_guard_rejects_only_cache_strict_interior() {
+        use crate::master::MountManager;
+        use curvine_config::ClusterConf;
+        use curvine_error::ErrorKind;
+        use curvine_model::{MountInfo, WriteType};
+
+        crate::Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.meta_dir =
+            Utils::test_sub_dir(format!("master-handler-guard/meta-{}", Utils::rand_str(6)));
+        conf.journal.journal_dir = Utils::test_sub_dir(format!(
+            "master-handler-guard/journal-{}",
+            Utils::rand_str(6)
+        ));
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        let mount_manager = Arc::new(MountManager::new(fs));
+        mount_manager
+            .unprotected_add_mount(MountInfo {
+                cv_path: "/cm".to_string(),
+                ufs_path: "file:///tmp/p44-guard".to_string(),
+                mount_id: 7,
+                write_type: WriteType::CacheMode,
+                ..Default::default()
+            })
+            .unwrap();
+        mount_manager
+            .unprotected_add_mount(MountInfo {
+                cv_path: "/fs".to_string(),
+                ufs_path: "file:///tmp/p44-guard-fs".to_string(),
+                mount_id: 8,
+                write_type: WriteType::FsMode,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let guard = |code: RpcCode, paths: &[&str]| {
+            MasterHandler::reject_cache_strict_interior(
+                &mount_manager,
+                code,
+                &paths.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            )
+        };
+
+        // Quadrant 1: cache-mode strict interior → typed Unsupported,
+        // whichever endpoint carries it.
+        for paths in [
+            vec!["cv://ns/cm/a.bin"],
+            vec!["cv://ns/cm/sub"],
+            vec!["cv://ns/plain/x", "cv://ns/cm/a.bin"],
+        ] {
+            let err = guard(RpcCode::FileStatus, &paths).unwrap_err();
+            assert!(
+                matches!(err.kind(), ErrorKind::Unsupported),
+                "expected typed Unsupported, got {:?}",
+                err.kind()
+            );
+            assert!(format!("{}", err).contains("strict interior"), "{}", err);
+        }
+
+        // Quadrant 2: the mount ROOT keeps its dedicated paths.
+        guard(RpcCode::FileStatus, &["cv://ns/cm"]).unwrap();
+        guard(RpcCode::ListStatus, &["cv://ns/cm"]).unwrap();
+
+        // Quadrant 3: fs-mode mount interior is untouched.
+        guard(RpcCode::Delete, &["cv://ns/fs/a.bin"]).unwrap();
+
+        // Quadrant 4: unmounted CV path (default-off shape) is untouched.
+        guard(RpcCode::Rename, &["cv://ns/plain/a", "cv://ns/plain/b"]).unwrap();
+
+        // UFS targets never route the guard.
+        guard(RpcCode::FileStatus, &["file:///tmp/p44-guard/a"]).unwrap();
+
+        // RC 45bbdc9f P0: AssignWorker/GetLock/SetLock enter
+        // inode/block/lock state and are guarded like every other
+        // legacy inode RPC.
+        for code in [RpcCode::AssignWorker, RpcCode::GetLock, RpcCode::SetLock] {
+            let err = guard(code, &["cv://ns/cm/assign-target"]).unwrap_err();
+            assert!(
+                matches!(err.kind(), ErrorKind::Unsupported),
+                "expected typed Unsupported, got {:?}",
+                err.kind()
+            );
+            assert!(format!("{}", err).contains("strict interior"), "{}", err);
+        }
+
+        // RC 45bbdc9f P1: Symlink guards only the LINK (the dentry
+        // endpoint); the target is verbatim payload and never reaches
+        // this check — guard_legacy_inode_rpcs passes only header.link,
+        // so an interior-naming target cannot trip the guard. The
+        // full-request proof (plain link -> interior target succeeds)
+        // lives in the E2E raw-RPC test.
+        let err = guard(RpcCode::Symlink, &["cv://ns/cm/sym"]).unwrap_err();
+        assert!(matches!(err.kind(), ErrorKind::Unsupported));
+        assert!(format!("{}", err).contains("strict interior"), "{}", err);
     }
 
     /// Free bridge scope derivation (task #6, gpt56 `9f83a317` q1): the
