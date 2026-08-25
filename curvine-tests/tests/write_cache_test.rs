@@ -16,16 +16,21 @@ use bytes::BytesMut;
 use curvine_client::unified::{
     CacheEntryStatus, CacheInvalidateResult, UfsFileSystem, UnifiedFileSystem, UnifiedReader,
 };
+use curvine_config::ClusterConf;
 use curvine_fs_api::{FileSystem, Path, Reader, RpcCode, Writer};
 use curvine_io::DataSlice;
-use curvine_model::{AccessMode, MountInfo, MountOptionsBuilder, WriteType, UFS_INODE_ID};
+use curvine_model::{
+    AccessMode, FileAllocOpts, MountInfo, MountOptionsBuilder, WriteType, UFS_INODE_ID,
+};
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+use curvine_server::test::MiniCluster;
 use curvine_tests::Testing;
 use std::collections::HashMap;
 use std::env;
+use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 fn get_fs() -> UnifiedFileSystem {
     let testing = Testing::builder().workers(1).build().unwrap();
     // Check if UFS configuration is available, if not, skip the test
@@ -265,6 +270,18 @@ fn test_cache_mode_recaches_after_lost_worker_cleanup() {
                 .is_some(),
             "the row itself must stay Valid after the session purge"
         );
+
+        // Phase 5 G3 (gpt56 9b513caa): with every replica unservable,
+        // the PUBLIC read path takes the D5 whole-object UFS fallback
+        // and the content is intact — before any Free/reload repair.
+        {
+            let mut reader = fs.open(&cv_path).await.unwrap();
+            assert_eq!(
+                reader.read_as_string().await.unwrap(),
+                data,
+                "D5 whole-object UFS fallback must serve intact content"
+            );
+        }
 
         // Re-admission: the typed free tombstones the dead-serving entry
         // and a fresh load re-serves the key. (Automatic reconcile-driven
@@ -640,6 +657,558 @@ fn test_cache_mode_free_child_with_unified_disabled() {
 /// (invalidate fences exactly the OBSERVED object), and the raw-binding
 /// response-loss contract (an identical re-send classifies AlreadyApplied
 /// and changes nothing).
+/// G1 (RC gpt56 `c5bc3d31`): one RO-refusal assertion surface — the op
+/// must fail typed ("read_only cache_mode mount") and the UFS source must
+/// survive with byte-identical content.
+async fn g1_assert_ro_refused<T>(
+    op: &str,
+    res: curvine_error::FsResult<T>,
+    ufs: &UfsFileSystem,
+    source_path: &Path,
+    data: &str,
+) {
+    match res {
+        Ok(_) => panic!("{op} must be refused on a read_only cache_mode mount"),
+        Err(e) => {
+            assert!(
+                matches!(e, curvine_error::FsError::Unsupported(_)),
+                "{op}: expected typed Unsupported, got: {:?}",
+                e
+            );
+            assert!(
+                format!("{e}").contains("read_only cache_mode mount"),
+                "{op}: {}",
+                e
+            );
+        }
+    }
+    assert!(
+        ufs.exists(source_path).await.unwrap(),
+        "{op}: UFS file must survive"
+    );
+    let mut reader = ufs.open(source_path).await.unwrap();
+    assert_eq!(
+        reader.read_as_string().await.unwrap(),
+        data,
+        "{op}: UFS bytes must be unchanged"
+    );
+}
+
+/// Phase 5 G1 (gpt56 9b513caa): the CacheMode READ-ONLY column.
+/// Ruling: invalidate_cache and cache-route free are ALLOWED on RO —
+/// they evict non-authoritative cache metadata/blocks and never write
+/// the UFS — while namespace/UFS mutations (create, delete, ...) are
+/// loudly refused. The flow runs entirely on UFS-prebuilt data.
+#[test]
+fn test_cache_mode_read_only_flow() {
+    let testing = Testing::builder()
+        .workers(1)
+        .mutate_conf(|conf| conf.master.cache_metadata_enabled = true)
+        .build()
+        .unwrap();
+    let ufs_base = testing.ufs_path.clone();
+    testing.start_cluster().unwrap();
+    let rt = Arc::new(AsyncRuntime::single());
+    let fs = testing.get_unified_fs_with_rt(rt.clone()).unwrap();
+
+    rt.block_on(async move {
+        let mount_dir = "cache_mode_read_only_flow";
+        let cv_path: Path = format!("/{mount_dir}/ro.log").into();
+        let ufs_dir = Path::from_str(format!("{ufs_base}/{mount_dir}")).unwrap();
+        let source_path = Path::from_str(format!("{ufs_base}/{mount_dir}/ro.log")).unwrap();
+        // RC c5bc3d31: auto_cache(false) — the D5 fallback reads in this
+        // test are OBSERVATIONS, they must not silently schedule loads.
+        let opts = MountOptionsBuilder::new()
+            .write_type(WriteType::CacheMode)
+            .access_mode(AccessMode::ReadOnly)
+            .auto_cache(false)
+            .replicas(1)
+            .build();
+        let ufs = UfsFileSystem::new(&ufs_dir, opts.add_properties.clone(), None).unwrap();
+        ufs.mkdir(&ufs_dir, true).await.unwrap();
+
+        // UFS-prebuilt data: the RO mount never writes through Curvine.
+        let data = Utils::rand_str(2048);
+        let mut writer = ufs.create(&source_path, true).await.unwrap();
+        writer.write_string(data.clone()).await.unwrap();
+        writer.complete().await.unwrap();
+
+        fs.mount(
+            &ufs_dir,
+            &Path::from_str(format!("/{mount_dir}")).unwrap(),
+            opts,
+        )
+        .await
+        .unwrap();
+
+        // 1. Public D5 read on the cold RO mount serves the UFS file.
+        {
+            let mut reader = fs.open(&cv_path).await.unwrap();
+            assert_eq!(reader.read_as_string().await.unwrap(), data);
+        }
+
+        // 2. Import-style async load reaches a serving Hit.
+        fs.async_cache(&source_path).unwrap();
+        fs.wait_job_complete(&cv_path, false).await.unwrap();
+        let mut ro_hit = awaitility::at_most(Duration::from_secs(30));
+        ro_hit.poll_interval(Duration::from_millis(200));
+        ro_hit
+            .until_async(|| async {
+                matches!(
+                    fs.cache_status(&cv_path).await,
+                    Ok(CacheEntryStatus::Hit { .. })
+                )
+            })
+            .await;
+        assert!(matches!(
+            fs.cache_status(&cv_path).await.unwrap(),
+            CacheEntryStatus::Hit { .. }
+        ));
+
+        // 3. (RC c5bc3d31) EVERY namespace/UFS mutation surface on the RO
+        //    cache-mode mount refuses loudly — create, open-for-write,
+        //    truncate/resize, rename, delete — and each refusal leaves
+        //    the UFS source byte-identical.
+        g1_assert_ro_refused(
+            "create",
+            fs.create(&cv_path, true).await,
+            &ufs,
+            &source_path,
+            &data,
+        )
+        .await;
+        g1_assert_ro_refused(
+            "open_for_write",
+            fs.open_for_write(&cv_path).await,
+            &ufs,
+            &source_path,
+            &data,
+        )
+        .await;
+        g1_assert_ro_refused(
+            "truncate/resize",
+            fs.resize(&cv_path, FileAllocOpts::with_truncate(0)).await,
+            &ufs,
+            &source_path,
+            &data,
+        )
+        .await;
+        g1_assert_ro_refused(
+            "rename",
+            fs.rename(
+                &cv_path,
+                &Path::from_str("/cache_mode_read_only_flow/ro_renamed.log").unwrap(),
+            )
+            .await,
+            &ufs,
+            &source_path,
+            &data,
+        )
+        .await;
+        g1_assert_ro_refused(
+            "delete",
+            fs.delete(&cv_path, false).await,
+            &ufs,
+            &source_path,
+            &data,
+        )
+        .await;
+
+        // 4. Public invalidate is RO-legal: Applied, the UFS file is
+        //    untouched, and reads fall back to the UFS intact.
+        assert_eq!(
+            fs.invalidate_cache(&cv_path).await.unwrap(),
+            CacheInvalidateResult::Applied
+        );
+        assert!(ufs.exists(&source_path).await.unwrap());
+        {
+            let mut reader = fs.open(&cv_path).await.unwrap();
+            assert_eq!(reader.read_as_string().await.unwrap(), data);
+        }
+
+        // 5. Re-cache, then a public Free (Key scope) — still RO-legal:
+        //    the entry dies, the UFS file and content survive.
+        fs.async_cache(&source_path).unwrap();
+        fs.wait_job_complete(&cv_path, false).await.unwrap();
+        let mut ro_rehit = awaitility::at_most(Duration::from_secs(30));
+        ro_rehit.poll_interval(Duration::from_millis(200));
+        ro_rehit
+            .until_async(|| async {
+                matches!(
+                    fs.cache_status(&cv_path).await,
+                    Ok(CacheEntryStatus::Hit { .. })
+                )
+            })
+            .await;
+        fs.free(&cv_path, false).await.unwrap();
+        assert!(matches!(
+            fs.cache_status(&cv_path).await.unwrap(),
+            CacheEntryStatus::Miss
+        ));
+        assert!(
+            ufs.exists(&source_path).await.unwrap(),
+            "RO free must not delete the UFS file"
+        );
+        {
+            let mut reader = fs.open(&cv_path).await.unwrap();
+            assert_eq!(reader.read_as_string().await.unwrap(), data);
+        }
+    });
+}
+
+/// Phase 5 G2 (gpt56 9b513caa): the master-restart column of the durable
+/// cache index — narrowed contract. A child process owns the pre-crash
+/// cluster lifetime; its process exit IS the hard crash (no graceful
+/// close, the journal_loader re-exec precedent). The parent then rebuilds
+/// the master on the SAME meta/journal dirs and the SAME resolved ports
+/// with `format_master = false` and re-acquires an active-master handle.
+///
+/// Durable contract after restart: the Valid row survives with incarnation
+/// and identity intact (`get(false)` = Hit), the invalidated row is NOT
+/// resurrected (Miss), and both UFS files stay publicly readable. Volatile
+/// location recovery is NOT a durable contract: the restarted worker
+/// re-registers and either re-reports (public Hit recovers, bounded wait)
+/// or the D5 whole-object UFS fallback keeps serving — both legal. Bonus:
+/// the tombstoned key re-caches to a fresh Hit.
+#[test]
+fn test_cache_mode_master_restart_keeps_durable_cache_state() {
+    const G2_CHILD_ENV: &str = "CURVINE_TEST_G2_CHILD";
+    const G2_BASE_ENV: &str = "CURVINE_TEST_G2_BASE";
+    const G2_TEST_NAME: &str = "test_cache_mode_master_restart_keeps_durable_cache_state";
+
+    if env::var(G2_CHILD_ENV).is_ok() {
+        let base = env::var(G2_BASE_ENV).expect("G2 child needs the base dir env");
+        g2_child_lifetime(base);
+        return;
+    }
+
+    // Parent: fresh base, spawn the child on it, bounded-wait for the
+    // pre-crash state handoff (cluster start + two loads + invalidate).
+    let base = {
+        let dir = env::current_dir().unwrap().parent().unwrap().join(format!(
+            "testing/curvine-tests/g2-restart-{}-{}",
+            std::process::id(),
+            Utils::rand_str(6)
+        ));
+        dir.display().to_string()
+    };
+    std::fs::create_dir_all(&base).unwrap();
+
+    let mut child = Command::new(env::current_exe().unwrap())
+        .arg("--exact")
+        .arg(G2_TEST_NAME)
+        .env(G2_CHILD_ENV, "1")
+        .env(G2_BASE_ENV, &base)
+        .spawn()
+        .expect("spawn G2 child test process");
+
+    let done = format!("{base}/child_done");
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while !std::path::Path::new(&done).exists() {
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("G2 child did not reach the pre-crash state within 300s");
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let status = child.wait().unwrap();
+    assert!(
+        status.success(),
+        "G2 child lifetime failed: {:?} (see child logs above)",
+        status
+    );
+
+    // ---- Restart: SAME meta/journal dirs, SAME resolved ports, NO format.
+    let mut conf = ClusterConf::from(format!("{base}/resolved-conf.toml")).unwrap();
+    // The no-format gate: ClusterConf defaults format_master to true,
+    // which would wipe the durable state under test.
+    conf.format_master = false;
+    let cluster = MiniCluster::restart(&conf, 1);
+    cluster.start_cluster();
+    let master_fs = cluster.get_active_master_fs();
+
+    let rt = Arc::new(AsyncRuntime::single());
+    let fs = UnifiedFileSystem::with_rt(conf, rt.clone()).unwrap();
+
+    rt.block_on(async move {
+        let valid_cv: Path = "/g2_restart/valid.log".into();
+        let invalid_cv: Path = "/g2_restart/invalid.log".into();
+        let invalid_src =
+            Path::from_str(format!("file://{base}/ufs/g2mnt/invalid.log")).expect("source path");
+        let valid_data = std::fs::read_to_string(format!("{base}/valid_data.txt")).unwrap();
+        let invalid_data = std::fs::read_to_string(format!("{base}/invalid_data.txt")).unwrap();
+        let marker: HashMap<String, String> = std::fs::read_to_string(format!("{base}/marker.txt"))
+            .unwrap()
+            .lines()
+            .filter_map(|l| {
+                l.split_once('=')
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+            })
+            .collect();
+        let marker_val = |k: &str| marker.get(k).unwrap().clone();
+        let inc_before: u64 = marker_val("inc").parse().unwrap();
+        let valid_object_id: i64 = marker_val("valid_object_id").parse().unwrap();
+        let valid_generation: u64 = marker_val("valid_generation").parse().unwrap();
+        let invalid_object_id: i64 = marker_val("invalid_object_id").parse().unwrap();
+
+        // Re-acquired handle: the mount itself survived the restart.
+        let (_, mnt) = fs
+            .get_mount(&valid_cv, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        let mount_id = mnt.info.mount_id;
+        let key_of = |cv: &Path| {
+            let ufs_p = mnt.info.get_ufs_path(cv).unwrap();
+            mnt.info.get_cache_key(&ufs_p).unwrap()
+        };
+        let valid_key = key_of(&valid_cv);
+        let invalid_key = key_of(&invalid_cv);
+
+        // Incarnation is unchanged by the restart.
+        let inc = master_fs
+            .cache_service
+            .current_incarnation_for_mount(mount_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(inc, inc_before, "restart must not bump the incarnation");
+
+        // Durable contract: the Valid row survived with identity intact...
+        let entry = master_fs
+            .cache_service
+            .get(inc, &valid_key, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.object_id, valid_object_id);
+        assert_eq!(entry.generation, valid_generation);
+
+        // ...and the invalidated row is NOT resurrected.
+        assert!(
+            master_fs
+                .cache_service
+                .get(inc, &invalid_key, false)
+                .unwrap()
+                .is_none(),
+            "the tombstoned entry must stay tombstoned across restart"
+        );
+        assert!(matches!(
+            fs.cache_status(&invalid_cv).await.unwrap(),
+            CacheEntryStatus::Miss
+        ));
+
+        // Both UFS contents stay publicly readable — the D5 whole-object
+        // fallback serves correctly regardless of volatile recovery.
+        {
+            let mut reader = fs.open(&valid_cv).await.unwrap();
+            assert_eq!(reader.read_as_string().await.unwrap(), valid_data);
+        }
+        {
+            let mut reader = fs.open(&invalid_cv).await.unwrap();
+            assert_eq!(reader.read_as_string().await.unwrap(), invalid_data);
+        }
+
+        // Durable contract (RC c5bc3d31): cache_status is a durable-only
+        // observation (need_locations=false, unified_filesystem.rs:748) —
+        // it MUST be Hit with the surviving identity, hard assert.
+        match fs.cache_status(&valid_cv).await.unwrap() {
+            CacheEntryStatus::Hit {
+                object_id,
+                generation,
+                ..
+            } => {
+                assert_eq!(object_id, valid_object_id);
+                assert_eq!(generation, valid_generation);
+            }
+            other => panic!(
+                "durable public status must be Hit after restart, got {:?}",
+                other
+            ),
+        }
+
+        // Volatile location recovery is NOT durable and is deliberately
+        // observed via the RAW need_locations=true lookup: bounded soft
+        // poll; timeout is legal (the D5 reads above already proved
+        // serving), a Some must match the durable identity.
+        let loc_deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(hit) = master_fs.cache_service.get(inc, &valid_key, true).unwrap() {
+                assert_eq!(hit.object_id, valid_object_id);
+                assert_eq!(hit.generation, valid_generation);
+                break;
+            }
+            if Instant::now() > loc_deadline {
+                eprintln!(
+                    "G2: volatile locations did not re-arm within 60s (legal; \
+                     D5 UFS serving already proven above)"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        // Bonus (ruling 9b513caa): the tombstoned key re-caches to a
+        // FRESH Hit — a new object identity, not a resurrection.
+        fs.async_cache(&invalid_src).unwrap();
+        fs.wait_job_complete(&invalid_cv, false).await.unwrap();
+        let mut rewarm = awaitility::at_most(Duration::from_secs(60));
+        rewarm.poll_interval(Duration::from_millis(200));
+        rewarm
+            .until_async(|| async {
+                matches!(
+                    fs.cache_status(&invalid_cv).await,
+                    Ok(CacheEntryStatus::Hit { .. })
+                )
+            })
+            .await;
+        match fs.cache_status(&invalid_cv).await.unwrap() {
+            CacheEntryStatus::Hit { object_id, .. } => {
+                assert_ne!(
+                    object_id, invalid_object_id,
+                    "re-cache after restart must mint a fresh object, not resurrect"
+                );
+            }
+            other => panic!("expected fresh Hit after re-cache, got {:?}", other),
+        }
+    });
+}
+
+/// The pre-crash lifetime of the G2 restart test (runs in the child
+/// process): one Valid entry + one invalidated/tombstone entry in the
+/// SAME cluster, state handed to the parent via marker files, then a
+/// hard process exit.
+fn g2_child_lifetime(base: String) {
+    std::fs::create_dir_all(&base).unwrap();
+    let conf_base = base.clone();
+    let testing = Testing::builder()
+        .workers(1)
+        .mutate_conf(move |conf| {
+            conf.master.cache_metadata_enabled = true;
+            conf.master.meta_dir = format!("{conf_base}/meta");
+            conf.journal.journal_dir = format!("{conf_base}/journal");
+            conf.worker.data_dir = vec![format!("{conf_base}/data")];
+        })
+        .build()
+        .unwrap();
+    let cluster = testing.start_cluster().unwrap();
+    // Persist the RESOLVED cluster conf (concrete ports, index-suffixed
+    // master dirs) so the parent restarts the exact same identity.
+    std::fs::copy(
+        testing.active_conf_path(),
+        format!("{base}/resolved-conf.toml"),
+    )
+    .unwrap();
+
+    let rt = Arc::new(AsyncRuntime::single());
+    let fs = testing.get_unified_fs_with_rt(rt.clone()).unwrap();
+    // Taken BEFORE block_on: the cluster owns a Runtime and must never be
+    // dropped inside the async context (tokio panics on runtime-in-async drop).
+    let master_fs = cluster.get_active_master_fs();
+
+    rt.block_on(async move {
+        let ufs_dir = Path::from_str(format!("file://{base}/ufs/g2mnt")).unwrap();
+        let valid_src = Path::from_str(format!("file://{base}/ufs/g2mnt/valid.log")).unwrap();
+        let invalid_src = Path::from_str(format!("file://{base}/ufs/g2mnt/invalid.log")).unwrap();
+        let valid_cv: Path = "/g2_restart/valid.log".into();
+        let invalid_cv: Path = "/g2_restart/invalid.log".into();
+
+        // RC c5bc3d31: auto_cache(false) — the post-restart D5 reads in
+        // the parent are observations; they must not schedule loads that
+        // contaminate the explicit re-cache evidence.
+        let opts = MountOptionsBuilder::new()
+            .write_type(WriteType::CacheMode)
+            .access_mode(AccessMode::ReadWrite)
+            .auto_cache(false)
+            .replicas(1)
+            .build();
+        let ufs = UfsFileSystem::new(&ufs_dir, opts.add_properties.clone(), None).unwrap();
+        ufs.mkdir(&ufs_dir, true).await.unwrap();
+        let valid_data = Utils::rand_str(2048);
+        let invalid_data = Utils::rand_str(2048);
+        for (src, data) in [(&valid_src, &valid_data), (&invalid_src, &invalid_data)] {
+            let mut w = ufs.create(src, true).await.unwrap();
+            w.write_string(data.clone()).await.unwrap();
+            w.complete().await.unwrap();
+        }
+
+        fs.mount(&ufs_dir, &Path::from_str("/g2_restart").unwrap(), opts)
+            .await
+            .unwrap();
+
+        // Both entries reach a serving Hit.
+        for (src, cv) in [(&valid_src, &valid_cv), (&invalid_src, &invalid_cv)] {
+            fs.async_cache(src).unwrap();
+            fs.wait_job_complete(cv, false).await.unwrap();
+            let mut hit = awaitility::at_most(Duration::from_secs(30));
+            hit.poll_interval(Duration::from_millis(200));
+            hit.until_async(|| async {
+                matches!(fs.cache_status(cv).await, Ok(CacheEntryStatus::Hit { .. }))
+            })
+            .await;
+            assert!(matches!(
+                fs.cache_status(cv).await.unwrap(),
+                CacheEntryStatus::Hit { .. }
+            ));
+        }
+
+        // Capture identities, then tombstone the invalid entry via the
+        // PUBLIC production route.
+        let (_, mnt) = fs
+            .get_mount(&valid_cv, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        let inc = master_fs
+            .cache_service
+            .current_incarnation_for_mount(mnt.info.mount_id)
+            .unwrap()
+            .unwrap();
+        let key_of = |cv: &Path| {
+            let ufs_p = mnt.info.get_ufs_path(cv).unwrap();
+            mnt.info.get_cache_key(&ufs_p).unwrap()
+        };
+        let valid_entry = master_fs
+            .cache_service
+            .get(inc, &key_of(&valid_cv), false)
+            .unwrap()
+            .unwrap();
+        let invalid_entry = master_fs
+            .cache_service
+            .get(inc, &key_of(&invalid_cv), false)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            fs.invalidate_cache(&invalid_cv).await.unwrap(),
+            CacheInvalidateResult::Applied
+        );
+        assert!(matches!(
+            fs.cache_status(&invalid_cv).await.unwrap(),
+            CacheEntryStatus::Miss
+        ));
+        assert!(matches!(
+            fs.cache_status(&valid_cv).await.unwrap(),
+            CacheEntryStatus::Hit { .. }
+        ));
+
+        // State handoff to the parent, then the crash.
+        std::fs::write(format!("{base}/valid_data.txt"), &valid_data).unwrap();
+        std::fs::write(format!("{base}/invalid_data.txt"), &invalid_data).unwrap();
+        std::fs::write(
+            format!("{base}/marker.txt"),
+            format!(
+                "inc={}\nvalid_object_id={}\nvalid_generation={}\ninvalid_object_id={}\n",
+                inc, valid_entry.object_id, valid_entry.generation, invalid_entry.object_id
+            ),
+        )
+        .unwrap();
+        std::fs::write(format!("{base}/child_done"), b"done").unwrap();
+    });
+
+    // Process exit IS the hard crash: master and worker die without any
+    // graceful close (journal_loader re-exec precedent).
+    std::process::exit(0);
+}
+
 #[test]
 fn test_cache_mode_status_and_invalidate() {
     let (fs, cluster) = get_fs_cache_meta();

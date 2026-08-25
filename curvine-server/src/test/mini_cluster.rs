@@ -63,6 +63,18 @@ impl MiniCluster {
         }
     }
 
+    /// Phase 5 G2 (gpt56 9b513caa): rebuild the cluster on the EXACT master
+    /// identity (ports, meta/journal dirs) captured in a persisted conf — the
+    /// master restart path after a hard crash, with NO format. The caller is
+    /// responsible for setting `format_master = false` on the passed conf.
+    /// Masters reuse the resolved ports from `conf`; workers get fresh ports
+    /// (they re-register) but keep the data dirs encoded in `conf`.
+    pub fn restart(conf: &ClusterConf, worker_num: u16) -> Self {
+        let master_conf = vec![conf.clone()];
+        let worker_conf = Self::default_worker_conf(conf, worker_num);
+        Self::new(master_conf, worker_conf)
+    }
+
     pub fn new(master_conf: Vec<ClusterConf>, worker_conf: Vec<ClusterConf>) -> Self {
         let client_rt = Arc::new(master_conf[0].client_rpc_conf().create_runtime());
         Self {
