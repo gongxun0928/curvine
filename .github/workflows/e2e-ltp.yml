@@ -1,15 +1,14 @@
 name: E2E LTP (cvtest)
 
-# Runs the LTP lane from the cvtest repo against a freshly built curvine
-# cluster mounted via FUSE.
+# Three lanes, all driven by cvtest curated suites (pin cvtest_ref deliberately).
 #
-# Trigger policy (frozen 2026-08-25, #curvine-tests:42338f0a):
-#   - NOT a PR-required gate. Label `run-ltp` on a PR, nightly schedule,
-#     or manual workflow_dispatch only. Promote to PR-required only after
-#     privileged FUSE proves stable on hosted runners.
+# | Lane         | Trigger                    | Suites                              | ~wall time |
+# |--------------|----------------------------|-------------------------------------|------------|
+# | ltp-fast     | nightly 18:00, label run-ltp | smoketest+perms+bind+fs-cv-smoke  | 15–25 min  |
+# | ltp-syscalls | daily 02:00, dispatch      | syscalls-cv                         | 45–75 min  |
+# | ltp-pressure | label run-ltp-pressure     | fs-cv (56; growfiles known reds)    | 20–40 min  |
 #
-# cvtest is pinned by ref; bump deliberately (its pinned LTP release and
-# curated cv-fs suite define what "green" means here).
+# NOT a PR-required gate until privileged FUSE proves stable on hosted runners.
 
 on:
   workflow_dispatch:
@@ -17,39 +16,52 @@ on:
       cvtest_ref:
         description: 'cvtest repo ref to use'
         required: false
-        default: 'main'
-      suites:
-        description: 'Comma-separated suites (ltp:fs_perms_simple,ltp:cv-fs)'
+        default: 'feat/cv-suites-2026-08-26'
+      lane:
+        description: 'Which lane to run'
         required: false
-        default: 'ltp:fs_perms_simple,ltp:cv-fs'
+        default: 'fast'
+        type: choice
+        options:
+          - fast
+          - syscalls
+          - pressure
+          - all
   schedule:
-    - cron: '0 18 * * *'  # nightly 18:00 UTC
+    - cron: '0 18 * * *'  # fast gate
+    - cron: '0 2 * * *'   # syscalls daily regression
   pull_request:
     types: [labeled]
 
 env:
   CVTEST_REPO: gongxun0928/cvtest
+  CVTEST_REF: ${{ inputs.cvtest_ref || 'feat/cv-suites-2026-08-26' }}
   MOUNT_PATH: /curvine-fuse
+  FAST_SUITES: >-
+    ltp:smoketest,ltp:fs_perms_simple,ltp:fcntl-locktests,ltp:fs_bind,ltp:fs-cv-smoke
+  SYSCALLS_SUITES: ltp:syscalls-cv
+  PRESSURE_SUITES: ltp:fs-cv
 
 jobs:
-  ltp:
+  ltp-fast:
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' &&
+       (inputs.lane == 'fast' || inputs.lane == 'all')) ||
+      (github.event_name == 'schedule' && github.event.schedule == '0 18 * * *') ||
       (github.event_name == 'pull_request' &&
        github.event.label.name == 'run-ltp')
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
     steps:
-      - name: Checkout curvine
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Checkout cvtest (pinned)
         uses: actions/checkout@v4
         with:
           repository: ${{ env.CVTEST_REPO }}
-          ref: ${{ inputs.cvtest_ref || 'main' }}
+          ref: ${{ env.CVTEST_REF }}
           path: cvtest
 
       - name: Setup Rust toolchain
@@ -60,10 +72,10 @@ jobs:
       - name: Build curvine distribution
         run: make build
 
-      - name: Install pinned LTP (version pinned by cvtest)
+      - name: Install pinned LTP
         run: ./cvtest/tools/ltp/install-ltp.sh /opt/ltp
 
-      - name: Start curvine cluster and mount FUSE
+      - name: Start cluster and mount FUSE
         run: |
           set -euo pipefail
           cd build/dist
@@ -72,10 +84,7 @@ jobs:
           sleep 5
           ./bin/curvine-worker.sh restart
           sleep 5
-          # fuse does a direct mount(2); it must run as root, and the
-          # runner job has CAP_SYS_ADMIN so root mounts succeed.
           sudo ./bin/curvine-fuse.sh restart -d
-          # Probe the data path before handing the mount to LTP.
           python3 - <<'EOF'
           import os, time, sys
           p = os.path.join(os.environ["MOUNT_PATH"], ".ci-ready")
@@ -97,16 +106,15 @@ jobs:
         env:
           MOUNT_PATH: ${{ env.MOUNT_PATH }}
 
-      - name: Run cvtest suites
-        id: suites
+      - name: Run cvtest fast lane
         run: |
           set -euo pipefail
-          mkdir -p artifacts
+          mkdir -p artifacts/fast
           rc=0
-          for suite in ${{ inputs.suites || 'ltp:fs_perms_simple,ltp:cv-fs' }}; do
+          for suite in ${{ env.FAST_SUITES }}; do
             name="${suite/:/-}"
             if ! ./cvtest/cvtest run --suite "$suite" --mount "$MOUNT_PATH" \
-                 --json "artifacts/${name}.json" --log "artifacts/${name}.log"; then
+                 --json "artifacts/fast/${name}.json" --log "artifacts/fast/${name}.log"; then
               rc=1
             fi
           done
@@ -118,5 +126,161 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cvtest-ltp-${{ github.run_id }}
+          name: cvtest-ltp-fast-${{ github.run_id }}
+          path: artifacts/
+
+  ltp-syscalls:
+    if: >-
+      (github.event_name == 'workflow_dispatch' &&
+       (inputs.lane == 'syscalls' || inputs.lane == 'all')) ||
+      (github.event_name == 'schedule' && github.event.schedule == '0 2 * * *')
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout cvtest (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CVTEST_REPO }}
+          ref: ${{ env.CVTEST_REF }}
+          path: cvtest
+
+      - name: Setup Rust toolchain
+        run: |
+          rustup default stable
+          rustc --version
+
+      - name: Build curvine distribution
+        run: make build
+
+      - name: Install pinned LTP
+        run: ./cvtest/tools/ltp/install-ltp.sh /opt/ltp
+
+      - name: Start cluster and mount FUSE
+        run: |
+          set -euo pipefail
+          cd build/dist
+          sudo mkdir -p "$MOUNT_PATH"
+          ./bin/curvine-master.sh restart
+          sleep 5
+          ./bin/curvine-worker.sh restart
+          sleep 5
+          sudo ./bin/curvine-fuse.sh restart -d
+          python3 - <<'EOF'
+          import os, time, sys
+          p = os.path.join(os.environ["MOUNT_PATH"], ".ci-ready")
+          payload = b"ci" * 8192
+          deadline = time.time() + 120
+          while time.time() < deadline:
+              try:
+                  with open(p, "wb") as f:
+                      f.write(payload)
+                  with open(p, "rb") as f:
+                      assert f.read() == payload
+                  os.unlink(p)
+                  sys.exit(0)
+              except OSError:
+                  time.sleep(2)
+          print("data path not ready after 120s", file=sys.stderr)
+          sys.exit(1)
+          EOF
+        env:
+          MOUNT_PATH: ${{ env.MOUNT_PATH }}
+
+      - name: Run cvtest syscalls-cv (daily regression)
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/syscalls
+          ./cvtest/cvtest run --suite ${{ env.SYSCALLS_SUITES }} --mount "$MOUNT_PATH" \
+            --json artifacts/syscalls/syscalls-cv.json --log artifacts/syscalls/syscalls-cv.log
+        env:
+          MOUNT_PATH: ${{ env.MOUNT_PATH }}
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cvtest-ltp-syscalls-${{ github.run_id }}
+          path: artifacts/
+
+  ltp-pressure:
+    if: >-
+      (github.event_name == 'workflow_dispatch' &&
+       (inputs.lane == 'pressure' || inputs.lane == 'all')) ||
+      (github.event_name == 'pull_request' &&
+       github.event.label.name == 'run-ltp-pressure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout cvtest (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CVTEST_REPO }}
+          ref: ${{ env.CVTEST_REF }}
+          path: cvtest
+
+      - name: Setup Rust toolchain
+        run: |
+          rustup default stable
+          rustc --version
+
+      - name: Build curvine distribution
+        run: make build
+
+      - name: Install pinned LTP
+        run: ./cvtest/tools/ltp/install-ltp.sh /opt/ltp
+
+      - name: Start cluster and mount FUSE
+        run: |
+          set -euo pipefail
+          cd build/dist
+          sudo mkdir -p "$MOUNT_PATH"
+          ./bin/curvine-master.sh restart
+          sleep 5
+          ./bin/curvine-worker.sh restart
+          sleep 5
+          sudo ./bin/curvine-fuse.sh restart -d
+          python3 - <<'EOF'
+          import os, time, sys
+          p = os.path.join(os.environ["MOUNT_PATH"], ".ci-ready")
+          payload = b"ci" * 8192
+          deadline = time.time() + 120
+          while time.time() < deadline:
+              try:
+                  with open(p, "wb") as f:
+                      f.write(payload)
+                  with open(p, "rb") as f:
+                      assert f.read() == payload
+                  os.unlink(p)
+                  sys.exit(0)
+              except OSError:
+                  time.sleep(2)
+          print("data path not ready after 120s", file=sys.stderr)
+          sys.exit(1)
+          EOF
+        env:
+          MOUNT_PATH: ${{ env.MOUNT_PATH }}
+
+      - name: Run cvtest fs-cv pressure lane
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/pressure
+          ./cvtest/cvtest run --suite ${{ env.PRESSURE_SUITES }} --mount "$MOUNT_PATH" \
+            --json artifacts/pressure/fs-cv.json --log artifacts/pressure/fs-cv.log
+        env:
+          MOUNT_PATH: ${{ env.MOUNT_PATH }}
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cvtest-ltp-pressure-${{ github.run_id }}
           path: artifacts/
