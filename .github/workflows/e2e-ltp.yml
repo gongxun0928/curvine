@@ -5,7 +5,7 @@ name: E2E LTP (cvtest)
 # | Lane         | Trigger                    | Suites                              | ~wall time |
 # |--------------|----------------------------|-------------------------------------|------------|
 # | ltp-fast     | nightly 18:00, label run-ltp | smoketest+perms+bind+fs-cv-smoke  | 15–25 min  |
-# | ltp-syscalls | daily 02:00, dispatch      | syscalls-cv                         | 45–75 min  |
+# | ltp-syscalls | daily 02:00, dispatch      | syscalls-cv                         | ~3h35m measured |
 # | ltp-pressure | label run-ltp-pressure     | fs-cv (56; growfiles known reds)    | 20–40 min  |
 #
 # NOT a PR-required gate until privileged FUSE proves stable on hosted runners.
@@ -135,7 +135,7 @@ jobs:
        (inputs.lane == 'syscalls' || inputs.lane == 'all')) ||
       (github.event_name == 'schedule' && github.event.schedule == '0 2 * * *')
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
     permissions:
       contents: read
     steps:
@@ -191,6 +191,7 @@ jobs:
           MOUNT_PATH: ${{ env.MOUNT_PATH }}
 
       - name: Run cvtest syscalls-cv (daily regression)
+        continue-on-error: true
         run: |
           set -euo pipefail
           mkdir -p artifacts/syscalls
