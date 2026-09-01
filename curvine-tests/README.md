@@ -73,12 +73,13 @@ The dashboard shows all modules with **Run / Cancel** buttons.
 >
 > **cvtest (external, preferred for CI)**: the [cvtest repo](https://github.com/gongxun0928/cvtest)
 > maintains the pinned LTP installer (version pinned there — single source
-> of truth), the curated `cv-fs` command file, and the `cvtest run`
-> entrypoint whose JSON matches this Portal's `ltp_test` schema. This repo
-> only invokes it; bumping the LTP version happens in cvtest, not here.
-> CI wiring lives in
-> `.github/workflows/e2e-ltp.yml` (label `run-ltp` / nightly / dispatch; not a
-> PR-required gate). The Portal path above stays for local/interactive use.
+> of truth), curated suites (`fs-cv-smoke` / `fs-cv` / `syscalls-cv`, …),
+> and the `cvtest run` entrypoint whose JSON matches this Portal's
+> `ltp_test` schema. This repo only invokes it; bumping the LTP version
+> happens in cvtest, not here. CI wiring lives in
+> `.github/workflows/e2e-ltp.yml` (three lanes: fast / daily syscalls /
+> pressure; not a PR-required gate). The Portal path above stays for
+> local/interactive use; Portal defaults match the fast lane.
 
 Test results are saved under `curvine-tests/regression_result/<timestamp>/`.
 

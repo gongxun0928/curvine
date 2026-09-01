@@ -14,10 +14,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils import cluster_utils
 from utils import test_utils
 
-# LTP test suites list (can be extended)
+# LTP test suites list — aligned with cvtest fast lane (ci-fast.txt).
+# syscalls-cv is daily-only (too heavy); full fs-cv is pressure-lane only.
 LTP_TEST_SUITES = [
+    'smoketest',
     'fs_perms_simple',
-    'cv-fs',
+    'fcntl-locktests',
+    'fs_bind',
+    'fs-cv-smoke',
 ]
 
 
