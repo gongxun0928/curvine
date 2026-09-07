@@ -52,6 +52,10 @@ allow_stale_cache = true
 # master configuration
 [master]
 meta_dir = "testing/meta"
+# Opt-in metadata snapshot reads (SnapshotUnlocked); restart Master to change.
+# Keeps write ordering; large/unbounded lists and quota-eviction block reads
+# use the original path. Enable only after workload-specific validation.
+metadata_read_snapshot = false
 # Worker selection policy: local, robin, random, load_based, or weighted.
 # local prefers a local worker for the first replica and assigns the rest via the weighted policy.
 # worker_policy = "weighted"

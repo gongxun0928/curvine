@@ -14,6 +14,7 @@
 
 use crate::master::fs::context::ValidateAddBlock;
 use crate::master::fs::policy::ChooseContext;
+use crate::master::fs::read_snapshot::{SnapshotReadReply, SnapshotReadRequest};
 use crate::master::journal::JournalSystem;
 use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
 use crate::master::meta::{CacheInvalidationResult, FsDir};
@@ -479,6 +480,16 @@ impl MasterFilesystem {
     }
 
     pub fn file_status<T: AsRef<str>>(&self, path: T) -> FsResult<FileStatus> {
+        if self.conf.metadata_read_snapshot {
+            if let Some(reply) =
+                self.try_snapshot_read(path.as_ref(), SnapshotReadRequest::Status)?
+            {
+                return match reply {
+                    SnapshotReadReply::Status(value) => Ok(value),
+                    _ => unreachable!("snapshot reply must match its request"),
+                };
+            }
+        }
         let fs_dir = self.fs_dir.read();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
         let status = fs_dir.file_status(&inp)?;
@@ -486,6 +497,16 @@ impl MasterFilesystem {
     }
 
     pub fn exists<T: AsRef<str>>(&self, path: T) -> FsResult<bool> {
+        if self.conf.metadata_read_snapshot {
+            if let Some(reply) =
+                self.try_snapshot_read(path.as_ref(), SnapshotReadRequest::Exists)?
+            {
+                return match reply {
+                    SnapshotReadReply::Exists(value) => Ok(value),
+                    _ => unreachable!("snapshot reply must match its request"),
+                };
+            }
+        }
         let fs_dir = self.fs_dir.read();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
         Ok(inp.get_last_inode().is_some())
@@ -514,8 +535,16 @@ impl MasterFilesystem {
         opts: ListOptions,
     ) -> FsResult<Vec<FileStatus>> {
         let path = path.as_ref();
-        let fs_dir = self.fs_dir.read();
         let (is_glob_pattern, _) = parse_glob_pattern(path);
+        if self.conf.metadata_read_snapshot && !is_glob_pattern {
+            if let Some(reply) = self.try_snapshot_read(path, SnapshotReadRequest::List(&opts))? {
+                return match reply {
+                    SnapshotReadReply::List(value) => Ok(value),
+                    _ => unreachable!("snapshot reply must match its request"),
+                };
+            }
+        }
+        let fs_dir = self.fs_dir.read();
         if is_glob_pattern {
             err_box!("list_options does not support glob pattern, path {}", path)
         } else {
@@ -815,6 +844,16 @@ impl MasterFilesystem {
     }
 
     pub fn get_block_locations<T: AsRef<str>>(&self, path: T) -> FsResult<FileBlocks> {
+        if self.conf.metadata_read_snapshot {
+            if let Some(reply) =
+                self.try_snapshot_read(path.as_ref(), SnapshotReadRequest::Blocks)?
+            {
+                return match reply {
+                    SnapshotReadReply::Blocks(value) => Ok(value),
+                    _ => unreachable!("snapshot reply must match its request"),
+                };
+            }
+        }
         let fs_dir = self.fs_dir.read();
         let path = path.as_ref();
         let inp = Self::resolve_path(&fs_dir, path)?;

@@ -40,6 +40,10 @@ const MODE_SETGID: u32 = 0o2000;
 
 /// Note: The modification operation uses &mut self, which is a necessary improvement. We use the unsafe API to perform modifications.
 pub struct FsDir {
+    // Snapshot readers hold a shared lease after releasing the namespace lock.
+    // Restore holds the namespace write lock, then drains these leases before
+    // closing/replacing RocksDB. No reader may reacquire FS while holding a lease.
+    pub(crate) read_lifecycle: Arc<parking_lot::RwLock<()>>,
     pub(crate) root_dir: InodeView,
     pub(crate) inode_id: InodeId,
     pub(crate) store: InodeStore,
@@ -83,6 +87,7 @@ impl FsDir {
         let (last_inode_id, root_dir) = state.create_blank_tree()?;
 
         let fs_dir = Self {
+            read_lifecycle: Default::default(),
             root_dir,
             inode_id: InodeId::new(),
             store: state,
@@ -903,6 +908,8 @@ impl FsDir {
     // Restore in-memory tree from RocksDB without checkpoint (for testing only).
     // In production, use restore() with checkpoint path via Raft snapshot.
     pub fn restore_from_rocksdb(&mut self) -> CommonResult<()> {
+        let lifecycle = Arc::clone(&self.read_lifecycle);
+        let _drain = lifecycle.write();
         let (last_inode_id, root_dir) = self.store.create_tree()?;
         self.root_dir = root_dir;
         self.update_last_inode_id(last_inode_id)?;
@@ -914,9 +921,17 @@ impl FsDir {
     }
 
     pub fn restore<T: AsRef<str>>(&mut self, path: T, checkpoint_size: u64) -> CommonResult<()> {
+        let lifecycle = Arc::clone(&self.read_lifecycle);
+        let _drain = lifecycle.write();
         let mut spend = TimeSpent::new();
         let path = path.as_ref();
 
+        // Detect unrelated store owners before clearing the namespace.
+        if Arc::strong_count(&self.store.store) != 1 {
+            return err_box!(
+                "cannot restore: unexpected RocksInodeStore owners after readers drained"
+            );
+        }
         // Set to other value first to facilitate memory recycling.
         self.root_dir = Self::create_root();
 

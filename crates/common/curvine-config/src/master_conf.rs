@@ -37,6 +37,11 @@ pub struct MasterConf {
     // Whether metadata requests can be processed concurrently within a connection.
     pub meta_request_concurrent: bool,
 
+    /// Capture a consistent metadata snapshot under FS read lock and finish
+    /// stat/exists/block-location/bounded-list reads after releasing that lock.
+    /// Opt-in until workload and HA validation are complete.
+    pub metadata_read_snapshot: bool,
+
     // Metadata configuration, currently only supports rocksdb.
     // rocksdb configuration.
     pub meta_dir: String,
@@ -267,6 +272,7 @@ impl Default for MasterConf {
             io_timeout: "10m".to_string(),
             io_close_idle: true,
             meta_request_concurrent: true,
+            metadata_read_snapshot: false,
 
             meta_dir: dir,
 
@@ -348,5 +354,22 @@ impl Default for MasterConf {
 
         conf.init().unwrap();
         conf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MasterConf;
+
+    #[test]
+    fn metadata_read_snapshot_is_opt_in_and_round_trips() {
+        // Existing configs must retain their original read behavior.
+        let old: MasterConf = toml::from_str("meta_request_concurrent = true").unwrap();
+        assert!(!old.metadata_read_snapshot);
+        let enabled: MasterConf = toml::from_str("metadata_read_snapshot = true").unwrap();
+        assert!(enabled.metadata_read_snapshot);
+        let encoded = toml::to_string(&enabled).unwrap();
+        let decoded: MasterConf = toml::from_str(&encoded).unwrap();
+        assert!(decoded.metadata_read_snapshot);
     }
 }
