@@ -15,7 +15,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::block::{
-    BlockClientPool, BlockReadContext, CreateBatchBlockContext, CreateBlockContext,
+    BlockClientPool, BlockReadContext, CreateBatchBlockContext, CreateBlockContext, ReadSession,
 };
 use crate::file::FsContext;
 use curvine_config::ClientConf;
@@ -38,6 +38,12 @@ use curvine_rpc::message::{Builder, Message, RequestStatus};
 use curvine_runtime::common::LocalTime;
 use std::sync::Arc;
 use std::time::Duration;
+
+// Require the whole block to fit so every subsequent in-block seek can still
+// use one read. Workers independently validate the range supplied on the wire.
+pub(crate) fn is_read_once_eligible(off: i64, len: i64, chunk: i32) -> bool {
+    chunk > 0 && off >= 0 && off <= len && len <= i64::from(chunk)
+}
 
 pub struct BlockClient {
     client: Option<RpcClient>,
@@ -252,7 +258,9 @@ impl BlockClient {
         short_circuit: bool,
     ) -> FsResult<BlockReadContext> {
         let request = self.read_request(conf, block, off, len, short_circuit);
-        let rep = self.open_read_request(request, req_id, seq_id).await?;
+        let rep =
+            FsContext::metrics_track("OpenBlock", self.open_read_request(request, req_id, seq_id))
+                .await?;
         let rep_header: BlockReadResponse = rep.parse_header()?;
         Ok(BlockReadContext::from_req(rep_header))
     }
@@ -293,7 +301,7 @@ impl BlockClient {
             .proto_header(request)
             .build();
 
-        FsContext::metrics_track("OpenBlock", self.rpc(msg)).await
+        self.rpc(msg).await
     }
 
     pub(crate) async fn read_small_block(
@@ -301,40 +309,66 @@ impl BlockClient {
         mut request: BlockReadRequest,
         req_id: i64,
     ) -> FsResult<DataSlice> {
-        if request.off < 0 || request.off > request.len || request.len > request.chunk_size as i64 {
-            return err_box!(
-                "Invalid small block read range: offset {}, length {}, chunk {}",
-                request.off,
-                request.len,
-                request.chunk_size
-            );
-        }
-        let expected = request.len - request.off;
-        let block = ExtendedBlock::with_id(request.id);
-        request.read_once = Some(true);
-        let rep = self.open_read_request(request, req_id, 0).await?;
-        let data = if rep.request_status() == RequestStatus::Complete {
-            rep.data
-        } else {
-            // A legacy worker ignored the optional flag. Finish the session it
-            // already opened, including cleanup when the data request fails.
-            let result = if expected == 0 {
-                Ok(DataSlice::Empty)
+        FsContext::metrics_track("ReadOnceBlock", async {
+            if !is_read_once_eligible(request.off, request.len, request.chunk_size) {
+                return err_box!(
+                    "Invalid small block read range: offset {}, length {}, chunk {}",
+                    request.off,
+                    request.len,
+                    request.chunk_size
+                );
+            }
+            let expected = request.len - request.off;
+            let block = ExtendedBlock::with_id(request.id);
+            request.read_once = Some(true);
+            let mut session = ReadSession::new(req_id, 0);
+            let rep = self
+                .open_read_request(request, session.req_id, session.seq_id)
+                .await?;
+            let data = if rep.request_status() == RequestStatus::Complete {
+                rep.data
             } else {
-                self.read_data(req_id, 1, None).await
+                self.read_legacy_small_block(&block, expected, &mut session)
+                    .await?
             };
-            let complete = self.read_commit(&block, req_id, 2).await;
-            let data = result?;
-            complete?;
-            data
+            if data.len() as i64 != expected {
+                return err_box!(
+                    "Incomplete small block read: expected {}, received {}",
+                    expected,
+                    data.len()
+                );
+            }
+            Ok(data)
+        })
+        .await
+    }
+
+    async fn read_legacy_small_block(
+        &self,
+        block: &ExtendedBlock,
+        expected: i64,
+        session: &mut ReadSession,
+    ) -> FsResult<DataSlice> {
+        let result = if expected == 0 {
+            Ok(DataSlice::Empty)
+        } else {
+            let seq_id = session.next_seq_id();
+            self.read_data(session.req_id, seq_id, None).await
         };
-        if data.len() as i64 != expected {
-            return err_box!(
-                "Incomplete small block read: expected {}, received {}",
-                expected,
-                data.len()
-            );
+
+        // The legacy worker opened a read session. Always attempt Complete to
+        // release it, even after a read error; this is cleanup, not a write commit.
+        // Preserve the read error if both operations fail. A failed cleanup must
+        // not leave a potentially live session on a pooled connection.
+        let seq_id = session.next_seq_id();
+        let complete = self.read_commit(block, session.req_id, seq_id).await;
+        if complete.is_err() {
+            if let Some(client) = &self.client {
+                client.set_closed();
+            }
         }
+        let data = result?;
+        complete?;
         Ok(data)
     }
 

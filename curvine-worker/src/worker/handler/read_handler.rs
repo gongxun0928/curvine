@@ -20,12 +20,11 @@ use curvine_core_error::ErrorExt;
 use curvine_core_error::{err_box, ternary, try_option_mut, CommonResult};
 use curvine_error::FsError;
 use curvine_error::FsResult;
-use curvine_io::{CacheManager, ReadAheadTask};
+use curvine_io::{CacheManager, DataSlice, ReadAheadTask};
 use curvine_proto::{BlockReadResponse, DataHeaderProto};
 use curvine_rpc::message::{Builder, Message, RequestStatus};
 use curvine_runtime::common::{ByteUnit, TimeSpent};
 use log::{info, warn};
-use std::mem;
 
 pub struct ReadHandler {
     pub(crate) store: BlockStore,
@@ -139,6 +138,7 @@ impl ReadHandler {
             && context.len - context.off <= context.chunk_size as i64;
         let empty_read = context.off == context.len;
 
+        self.release_session();
         self.os_cache = CacheManager::new(
             context.enable_read_ahead,
             context.read_ahead_len,
@@ -164,8 +164,8 @@ impl ReadHandler {
             storage_type: meta.storage_type().into(),
         };
 
-        let _ = mem::replace(&mut self.file, file);
-        let _ = self.context.replace(context);
+        self.file = file;
+        self.context = Some(context);
 
         self.metrics.read_blocks.with_label_values(&[label]).inc();
         info!("{}", log_msg);
@@ -174,12 +174,11 @@ impl ReadHandler {
             // The response must own its bytes before the file is released;
             // a sendfile slice would borrow a descriptor from that file.
             let data = if empty_read {
-                Ok(curvine_io::DataSlice::Empty)
+                Ok(DataSlice::Empty)
             } else {
                 self.read_region(false)
             };
-            self.file = None;
-            self.context = None;
+            self.release_session();
             return Ok(Builder::success(msg)
                 .request(RequestStatus::Complete)
                 .proto_header(response)
@@ -213,7 +212,7 @@ impl ReadHandler {
         Ok(msg.success_with_data(None, region))
     }
 
-    fn read_region(&mut self, enable_send_file: bool) -> FsResult<curvine_io::DataSlice> {
+    fn read_region(&mut self, enable_send_file: bool) -> FsResult<DataSlice> {
         let file = try_option_mut!(self.file);
         let context = try_option_mut!(self.context);
         let spend = TimeSpent::new();
@@ -249,10 +248,17 @@ impl ReadHandler {
             None => -1,
         };
 
-        self.file = None;
+        self.release_session();
 
         info!("Read block end for req_id {}", msg.req_id());
         Ok(msg.success())
+    }
+
+    fn release_session(&mut self) {
+        self.file = None;
+        self.context = None;
+        self.last_task = None;
+        self.os_cache = CacheManager::with_place();
     }
 
     pub fn handle(&mut self, msg: &Message) -> FsResult<Message> {

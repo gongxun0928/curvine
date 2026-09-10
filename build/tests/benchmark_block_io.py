@@ -21,6 +21,7 @@ def main():
     parser.add_argument("--chunks", default="131072,1048576")
     parser.add_argument("--sendfile", default="1", choices=["0", "1"])
     parser.add_argument("--separate", action="store_true", help="group writes before reads")
+    parser.add_argument("--initial-seek", action="store_true", help="seek to 0 before the first read")
     args = parser.parse_args()
     if args.rounds < 1:
         parser.error("--rounds must be positive")
@@ -35,6 +36,7 @@ def main():
         "rounds": args.rounds, "chunks": chunks, "cpus": args.cpus,
         "data_dir": str(args.data_dir.resolve()), "sendfile": args.sendfile,
         "separate": args.separate,
+        "initial_seek": args.initial_seek,
     }
     (args.output / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     grouped = {}
@@ -45,6 +47,7 @@ def main():
                 name = f"{version}-chunk{chunk}-run{repeat}"
                 command = [str(versions[version]), str(args.data_dir.resolve()), args.sendfile, str(chunk)]
                 command.append("1" if args.separate else "0")
+                command.append("1" if args.initial_seek else "0")
                 if args.cpus:
                     command = ["taskset", "-c", args.cpus, *command]
                 csv_path = args.output / f"{name}.csv"

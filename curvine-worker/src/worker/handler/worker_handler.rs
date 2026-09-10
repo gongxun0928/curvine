@@ -114,13 +114,17 @@ impl MessageHandler for WorkerHandler {
                 let h = self.get_handler(msg, &mut handler)?;
                 let res = h.handle(msg);
 
-                if res.as_ref().is_ok_and(|response| {
+                let request_ends_session = matches!(
+                    msg.request_status(),
+                    RequestStatus::Cancel | RequestStatus::Complete
+                );
+                let should_close = res.as_ref().is_ok_and(|response| {
+                    let response_ends_session =
+                        response.request_status() == RequestStatus::Complete;
                     response.response_status() == ResponseStatus::Success
-                        && (matches!(
-                            msg.request_status(),
-                            RequestStatus::Cancel | RequestStatus::Complete
-                        ) || response.request_status() == RequestStatus::Complete)
-                }) {
+                        && (request_ends_session || response_ends_session)
+                });
+                if should_close {
                     let _ = handler.take();
                 };
 

@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::block::BlockClient;
+use crate::block::block_client::is_read_once_eligible;
+use crate::block::{BlockClient, ReadSession};
 use crate::file::FsContext;
 use curvine_core_error::err_box;
 use curvine_error::FsResult;
@@ -21,18 +22,24 @@ use curvine_model::{ExtendedBlock, WorkerAddress};
 use curvine_proto::{BlockReadRequest, DataHeaderProto};
 use curvine_runtime::common::Utils;
 
+enum ReadMode {
+    Streaming {
+        session: ReadSession,
+        header: Option<DataHeaderProto>,
+    },
+    Once {
+        request: BlockReadRequest,
+    },
+    Closed,
+}
+
 pub struct BlockReaderRemote {
     client: BlockClient,
     block: ExtendedBlock,
     worker_address: WorkerAddress,
     pos: i64,
     len: i64,
-    req_id: i64,
-    seq_id: i32,
-    header: Option<DataHeaderProto>,
-    read_once: Option<BlockReadRequest>,
-    initial_data: Option<DataSlice>,
-    read_once_completed: bool,
+    mode: ReadMode,
 }
 
 impl BlockReaderRemote {
@@ -43,40 +50,38 @@ impl BlockReaderRemote {
         off: i64,
         len: i64,
     ) -> FsResult<Self> {
-        let req_id = Utils::req_id();
-        let seq_id = 0;
-
         let client = fs_context.acquire_read(&worker_address).await?;
-        if len >= 0 && len <= fs_context.read_chunk_size() as i64 && off >= 0 && off <= len {
-            let request = client.read_request(&fs_context.conf.client, &block, off, len, false);
-            let data = client.read_small_block(request.clone(), req_id).await?;
-            let mut reader =
-                Self::from_opened(client, block, worker_address, off, len, req_id, seq_id);
-            reader.read_once = Some(request);
-            reader.initial_data = Some(data);
-            return Ok(reader);
-        }
-        let _ = client
-            .open_block(
-                &fs_context.conf.client,
-                &block,
-                off,
-                len,
-                req_id,
-                seq_id,
-                false,
-            )
-            .await?;
+        let request = client.read_request(&fs_context.conf.client, &block, off, len, false);
+        let mode = if is_read_once_eligible(off, len, request.chunk_size) {
+            // Defer the block RPC until read(), after any initial seek.
+            ReadMode::Once { request }
+        } else {
+            let session = ReadSession::new(Utils::req_id(), 0);
+            client
+                .open_block(
+                    &fs_context.conf.client,
+                    &block,
+                    off,
+                    len,
+                    session.req_id,
+                    session.seq_id,
+                    false,
+                )
+                .await?;
+            ReadMode::Streaming {
+                session,
+                header: None,
+            }
+        };
 
-        Ok(Self::from_opened(
+        Ok(Self {
             client,
             block,
             worker_address,
-            off,
+            pos: off,
             len,
-            req_id,
-            seq_id,
-        ))
+            mode,
+        })
     }
 
     pub(crate) fn from_opened(
@@ -94,18 +99,15 @@ impl BlockReaderRemote {
             worker_address,
             pos: off,
             len,
-            req_id,
-            seq_id,
-            header: None,
-            read_once: None,
-            initial_data: None,
-            read_once_completed: false,
+            mode: ReadMode::Streaming {
+                session: ReadSession::new(req_id, seq_id),
+                header: None,
+            },
         }
     }
 
-    fn next_seq_id(&mut self) -> i32 {
-        self.seq_id += 1;
-        self.seq_id
+    pub(crate) fn is_closed(&self) -> bool {
+        matches!(self.mode, ReadMode::Closed)
     }
 
     pub fn pos(&self) -> i64 {
@@ -125,60 +127,62 @@ impl BlockReaderRemote {
     }
 
     pub fn seek(&mut self, pos: i64) -> FsResult<i64> {
-        self.pos = pos;
-        // A seek must observe a fresh read, rather than indefinitely reusing
-        // the bytes prefetched by the constructor.
-        self.initial_data = None;
-        if let Some(request) = &mut self.read_once {
-            request.off = pos;
+        if self.is_closed() {
+            return err_box!("Read session has completed");
         }
-        self.header = Some(DataHeaderProto {
-            offset: pos,
-            flush: false,
-            is_last: false,
-        });
+        if pos < 0 || pos > self.len {
+            return err_box!("Invalid read offset: {}, block length: {}", pos, self.len);
+        }
+        match &mut self.mode {
+            ReadMode::Streaming { header, .. } => {
+                *header = Some(DataHeaderProto {
+                    offset: pos,
+                    flush: false,
+                    is_last: false,
+                });
+            }
+            ReadMode::Once { request } => request.off = pos,
+            ReadMode::Closed => unreachable!(),
+        }
+        self.pos = pos;
         Ok(self.pos)
     }
 
     pub async fn read(&mut self) -> FsResult<DataSlice> {
-        if self.read_once_completed {
+        if self.is_closed() {
             return err_box!("Read session has completed");
         }
         if self.remaining() <= 0 {
             return err_box!("No readable data");
         }
 
-        if let Some(request) = &self.read_once {
-            let data = match self.initial_data.take() {
-                Some(data) => data,
-                None => {
-                    self.client
-                        .read_small_block(request.clone(), Utils::req_id())
-                        .await?
-                }
-            };
-            self.pos += data.len() as i64;
-            return Ok(data);
-        }
-
-        let seq_id = self.next_seq_id();
-        let header = self.header.take();
-        let chunk = self.client.read_data(self.req_id, seq_id, header).await?;
-
+        let chunk = match &mut self.mode {
+            ReadMode::Streaming { session, header } => {
+                let seq_id = session.next_seq_id();
+                self.client
+                    .read_data(session.req_id, seq_id, header.take())
+                    .await?
+            }
+            ReadMode::Once { request } => {
+                self.client
+                    .read_small_block(request.clone(), Utils::req_id())
+                    .await?
+            }
+            ReadMode::Closed => unreachable!(),
+        };
         self.pos += chunk.len() as i64;
         Ok(chunk)
     }
 
     pub async fn complete(&mut self) -> FsResult<()> {
-        if self.read_once.is_some() {
-            self.initial_data = None;
-            self.read_once_completed = true;
-            return Ok(());
+        if let ReadMode::Streaming { session, .. } = &mut self.mode {
+            let seq_id = session.next_seq_id();
+            self.client
+                .read_commit(&self.block, session.req_id, seq_id)
+                .await?;
         }
-        let next_seq_id = self.next_seq_id();
-        self.client
-            .read_commit(&self.block, self.req_id, next_seq_id)
-            .await
+        self.mode = ReadMode::Closed;
+        Ok(())
     }
 
     pub fn block_id(&self) -> i64 {

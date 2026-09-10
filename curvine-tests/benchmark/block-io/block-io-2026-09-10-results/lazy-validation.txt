@@ -1,0 +1,12 @@
+lazy-tests.log: test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+lazy-tests.log: test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+lazy-tests.log: test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+lazy-tests.log: test result: ok. 38 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.06s
+lazy-tests.log: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.01s
+lazy-server-tests.log: test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+Total: 97 passed; 1 existing worker benchmark ignored.
+Clippy: curvine-client-core and curvine-worker, release, all-targets, no-deps, deny warnings (allow clippy::uninlined-format-args): passed.
+cargo fmt --all -- --check: passed
+git diff --check: passed
+RPC/protobuf production code unchanged; not re-run in this refactor.

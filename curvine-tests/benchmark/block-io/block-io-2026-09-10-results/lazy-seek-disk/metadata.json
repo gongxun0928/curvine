@@ -1,0 +1,26 @@
+{
+  "binaries": {
+    "before": {
+      "path": "block-eager-seek",
+      "sha256": "27821786ac34c900abbdffc650b5c0d1a3681aa5c85de40270aff9e3e09d9719"
+    },
+    "after": {
+      "path": "block-lazy",
+      "sha256": "5bbbfc09a945bf3548e1671a5880c6e06f6f48c9450c19ad2bd023902824bae6"
+    }
+  },
+  "rounds": 3,
+  "chunks": [
+    131072
+  ],
+  "cpus": "2-5",
+  "data_dir": "disk filesystem (workspace backing device)",
+  "sendfile": "1",
+  "separate": false,
+  "initial_seek": true,
+  "sources": {
+    "before": "864dc895466537b6a2a8a5270db62a515827eed2",
+    "after": "lazy refactor in the commit containing this result"
+  },
+  "benchmark_sha256": "5f04ef2a005f9c684fb85324e4c9bfb04524de905582ebb7aa9f792f9e35e685"
+}

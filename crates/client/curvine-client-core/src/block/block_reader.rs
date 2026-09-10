@@ -16,8 +16,8 @@ use crate::block::block_reader::ReaderAdapter::{Hole, Local, Remote};
 use crate::block::block_reader_local::LocalReaderOpen;
 use crate::block::{BlockReaderHole, BlockReaderLocal, BlockReaderRemote};
 use crate::file::FsContext;
-use curvine_core_error::CommonResult;
 use curvine_core_error::ErrorExt;
+use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_io::DataSlice;
@@ -234,6 +234,9 @@ impl BlockReader {
 
     // Based on network transmission efficiency considerations, the data size of the underlying tcp is fixed each time.
     pub async fn read(&mut self) -> FsResult<DataSlice> {
+        if matches!(&self.inner, Remote(reader) if reader.is_closed()) {
+            return err_box!("Read session has completed");
+        }
         if !self.has_remaining() {
             // end of block file
             return Ok(DataSlice::empty());
@@ -273,9 +276,6 @@ impl BlockReader {
     }
 
     pub fn blocking_read(&mut self, rt: &Runtime) -> FsResult<DataSlice> {
-        if !self.has_remaining() {
-            return Ok(DataSlice::empty()); // end of block file
-        }
         rt.block_on(self.read())
     }
 

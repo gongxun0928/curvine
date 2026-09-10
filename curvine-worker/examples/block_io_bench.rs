@@ -59,6 +59,9 @@ fn main() -> CommonResult<()> {
     // Pass 1 as the fourth argument to group writes before reads. This helps
     // distinguish write latency from scheduling effects of alternating I/O.
     let separate = std::env::args().nth(4).as_deref() == Some("1");
+    // Pass 1 as the fifth argument to seek before the first read. Even a
+    // same-position seek discarded the eager implementation's prefetched block.
+    let initial_seek = std::env::args().nth(5).as_deref() == Some("1");
     let worker = Worker::with_conf(conf.clone())?;
     let service = worker.service().clone();
     let store = service.get_message_handler(None).store;
@@ -125,6 +128,9 @@ fn main() -> CommonResult<()> {
                         size as i64,
                     )
                     .await?;
+                    if initial_seek {
+                        reader.seek(0)?;
+                    }
                     let mut read_time = started.elapsed();
                     let mut offset = 0;
                     while reader.remaining() > 0 {

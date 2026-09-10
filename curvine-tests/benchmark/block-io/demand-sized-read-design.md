@@ -4,7 +4,7 @@
 
 ## 两项改动的边界
 
-- 小 block 单 RPC 读取：当前实现只在逻辑 block 长度不超过默认 read chunk 时启用。新 Worker 返回数据和 Complete；旧 Worker 返回 Open，新 client 自动补 read/complete。减少的是该次远程 block 会话的控制往返，Master 元数据 RPC 仍独立存在。
+- 小 block 单 RPC 读取：当前实现只在逻辑 block 长度不超过配置的 read chunk 时启用。构造时保存请求，实际 read 时才发送，提前 seek 只更新 offset。新 Worker 返回数据和 Complete；旧 Worker 返回 Open，新 client 自动补 read/complete。减少的是该次远程 block 会话的控制往返，Master 元数据 RPC 仍独立存在。接口与状态见 [Lazy 重构说明](lazy-read-refactor.md)。
 - 按需扩大读取：保留 128KiB 常规读取粒度；将调用方已明确需要的大范围拆成更少、更大的数据请求。RPC 返回数据量、后台预取总量和 buffer 容量必须分开控制。
 
 ## 当前调用链的具体障碍

@@ -15,6 +15,22 @@
 use curvine_model::StorageType;
 use curvine_proto::BlockReadResponse;
 
+pub(crate) struct ReadSession {
+    pub req_id: i64,
+    pub seq_id: i32,
+}
+
+impl ReadSession {
+    pub fn new(req_id: i64, seq_id: i32) -> Self {
+        Self { req_id, seq_id }
+    }
+
+    pub fn next_seq_id(&mut self) -> i32 {
+        self.seq_id += 1;
+        self.seq_id
+    }
+}
+
 pub struct CreateBlockContext {
     pub id: i64,
     pub off: i64,
