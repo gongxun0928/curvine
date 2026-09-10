@@ -1,0 +1,20 @@
+{
+  "binaries": {
+    "before": {
+      "path": "block-before-final",
+      "sha256": "ba43f9243f846dfa7ac06e63cf024e0f06931790c10386025c227610bf477d07"
+    },
+    "after": {
+      "path": "block-read-only",
+      "sha256": "5bb5e64952beab33c149fdfe993eee8ee111a90e30833e3e0ba1ec1f98449ce0"
+    }
+  },
+  "rounds": 3,
+  "chunks": [
+    131072
+  ],
+  "cpus": "2-5",
+  "data_dir": "workspace filesystem",
+  "sendfile": "1",
+  "path_note": "Machine-specific directories omitted; binary filenames and SHA256 values preserved."
+}

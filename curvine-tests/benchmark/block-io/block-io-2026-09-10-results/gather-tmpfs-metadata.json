@@ -1,0 +1,21 @@
+{
+  "binaries": {
+    "before": {
+      "path": "block-before-final",
+      "sha256": "ba43f9243f846dfa7ac06e63cf024e0f06931790c10386025c227610bf477d07"
+    },
+    "after": {
+      "path": "block-after-final",
+      "sha256": "668b6267f2d009ebffff007b6ac77834ad8fc95e9dbac03ee1e933b8e2e7f07e"
+    }
+  },
+  "rounds": 5,
+  "chunks": [
+    131072,
+    1048576
+  ],
+  "cpus": "2-5",
+  "data_dir": "tmpfs",
+  "sendfile": "1",
+  "path_note": "Machine-specific directories omitted; binary filenames and SHA256 values preserved."
+}

@@ -1,0 +1,9 @@
+# Merge this fragment into an existing client configuration.
+# Measured for sequential remote block I/O; see block-io-2026-09-10.md.
+[client]
+read_chunk_size = "1MB"
+write_chunk_size = "1MB"
+# Keep cache advice ranges equal to the benchmark, instead of deriving them
+# from the larger chunk size and the default eight queued chunks.
+read_ahead_len = "1MB"
+drop_cache_len = "1MB"
