@@ -51,6 +51,11 @@ message BlockReadRequest {
     required int64 read_ahead_len = 9 [default = 4194304];
     required int64 drop_cache_len = 10 [default = 1048576];
 
+    // Opt-in: return a complete small remote read in the Open response. The
+    // response uses Complete status after releasing the read session. Older
+    // workers ignore this field and keep the ordinary Open/Running/Complete flow.
+    optional bool read_once = 11 [default = false];
+
     // Structured version/protocol metadata reported by the client on the
     // reserved 1000+ cross-cutting range. Legacy clients omit this field;
     // workers treat absence as a legacy/unknown peer and ignore it, so

@@ -55,6 +55,7 @@ pub struct ReadContext {
     pub enable_read_ahead: bool,
     pub read_ahead_len: i64,
     pub drop_cache_len: i64,
+    pub read_once: bool,
 }
 
 impl ReadContext {
@@ -70,6 +71,7 @@ impl ReadContext {
             enable_read_ahead: req.enable_read_ahead,
             read_ahead_len: req.read_ahead_len,
             drop_cache_len: req.drop_cache_len,
+            read_once: req.read_once.unwrap_or(false),
         };
 
         Ok(context)

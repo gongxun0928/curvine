@@ -114,14 +114,13 @@ impl MessageHandler for WorkerHandler {
                 let h = self.get_handler(msg, &mut handler)?;
                 let res = h.handle(msg);
 
-                if res
-                    .as_ref()
-                    .is_ok_and(|msg| msg.response_status() == ResponseStatus::Success)
-                    && matches!(
-                        msg.request_status(),
-                        RequestStatus::Cancel | RequestStatus::Complete
-                    )
-                {
+                if res.as_ref().is_ok_and(|response| {
+                    response.response_status() == ResponseStatus::Success
+                        && (matches!(
+                            msg.request_status(),
+                            RequestStatus::Cancel | RequestStatus::Complete
+                        ) || response.request_status() == RequestStatus::Complete)
+                }) {
                     let _ = handler.take();
                 };
 
@@ -526,6 +525,7 @@ mod tests {
             enable_read_ahead: true,
             read_ahead_len: 4 * 1024 * 1024,
             drop_cache_len: 1 << 20,
+            read_once: None,
             component_info: Some(sample_component_info()),
         };
         let open = build_msg(RpcCode::ReadBlock, RequestStatus::Open, header);

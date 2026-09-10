@@ -134,6 +134,10 @@ impl ReadHandler {
             (meta, false, path, Some(file))
         };
         let label = if is_short_circuit { "local" } else { "remote" };
+        let read_once = context.read_once
+            && !is_short_circuit
+            && context.len - context.off <= context.chunk_size as i64;
+        let empty_read = context.off == context.len;
 
         self.os_cache = CacheManager::new(
             context.enable_read_ahead,
@@ -166,6 +170,23 @@ impl ReadHandler {
         self.metrics.read_blocks.with_label_values(&[label]).inc();
         info!("{}", log_msg);
 
+        if read_once {
+            // The response must own its bytes before the file is released;
+            // a sendfile slice would borrow a descriptor from that file.
+            let data = if empty_read {
+                Ok(curvine_io::DataSlice::Empty)
+            } else {
+                self.read_region(false)
+            };
+            self.file = None;
+            self.context = None;
+            return Ok(Builder::success(msg)
+                .request(RequestStatus::Complete)
+                .proto_header(response)
+                .data(data?)
+                .build());
+        }
+
         Ok(Builder::success(msg).proto_header(response).build())
     }
 
@@ -182,19 +203,25 @@ impl ReadHandler {
 
     pub fn read(&mut self, msg: &Message) -> FsResult<Message> {
         let file = try_option_mut!(self.file);
-        let context = try_option_mut!(self.context);
 
         if msg.header_len() > 0 {
             let header: DataHeaderProto = msg.parse_header()?;
             file.seek_to(header.offset)?;
         }
 
+        let region = self.read_region(self.enable_send_file)?;
+        Ok(msg.success_with_data(None, region))
+    }
+
+    fn read_region(&mut self, enable_send_file: bool) -> FsResult<curvine_io::DataSlice> {
+        let file = try_option_mut!(self.file);
+        let context = try_option_mut!(self.context);
         let spend = TimeSpent::new();
         if let Some(local) = file.as_local_mut() {
             self.last_task = local.read_ahead(&self.os_cache, self.last_task.take());
         }
 
-        let enable_send_file = self.enable_send_file && file.supports_send_file();
+        let enable_send_file = enable_send_file && file.supports_send_file();
         let region = file.read_region(enable_send_file, context.chunk_size)?;
 
         let used = spend.used_us();
@@ -210,7 +237,7 @@ impl ReadHandler {
         self.metrics.read_time_us.inc_by(used as i64);
         self.metrics.read_count.inc();
 
-        Ok(msg.success_with_data(None, region))
+        Ok(region)
     }
 
     pub fn complete(&mut self, msg: &Message) -> FsResult<Message> {

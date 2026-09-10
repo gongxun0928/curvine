@@ -179,6 +179,7 @@ fn test_block_read_component_info_round_trip() {
         enable_read_ahead: true,
         read_ahead_len: 4 * 1024 * 1024,
         drop_cache_len: 1 << 20,
+        read_once: None,
         component_info: Some(sample_component_info()),
     };
 
@@ -192,6 +193,23 @@ fn test_block_read_component_info_round_trip() {
     assert_eq!(decoded.len, 4096);
     assert!(decoded.enable_read_ahead);
     assert_eq!(decoded.read_ahead_len, 4 * 1024 * 1024);
+}
+
+#[test]
+fn read_once_is_optional_for_legacy_workers_and_clients() {
+    let request = BlockReadRequest {
+        id: 42,
+        off: 0,
+        len: 4096,
+        chunk_size: 4096,
+        read_once: Some(true),
+        ..Default::default()
+    };
+    let legacy = LegacyBlockReadRequest::decode(request.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(legacy.id, 42);
+    assert_eq!(legacy.len, 4096);
+    let decoded = BlockReadRequest::decode(legacy.encode_to_vec().as_slice()).unwrap();
+    assert!(!decoded.read_once.unwrap_or(false));
 }
 
 #[test]

@@ -20,7 +20,7 @@ use crate::block::{
 use crate::file::FsContext;
 use curvine_config::ClientConf;
 use curvine_core_error::ErrorExt;
-use curvine_core_error::{try_option_ref, CommonResult};
+use curvine_core_error::{err_box, try_option_ref, CommonResult};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
@@ -251,7 +251,21 @@ impl BlockClient {
         seq_id: i32,
         short_circuit: bool,
     ) -> FsResult<BlockReadContext> {
-        let request = BlockReadRequest {
+        let request = self.read_request(conf, block, off, len, short_circuit);
+        let rep = self.open_read_request(request, req_id, seq_id).await?;
+        let rep_header: BlockReadResponse = rep.parse_header()?;
+        Ok(BlockReadContext::from_req(rep_header))
+    }
+
+    pub(crate) fn read_request(
+        &self,
+        conf: &ClientConf,
+        block: &ExtendedBlock,
+        off: i64,
+        len: i64,
+        short_circuit: bool,
+    ) -> BlockReadRequest {
+        BlockReadRequest {
             id: block.id,
             off,
             len,
@@ -261,8 +275,16 @@ impl BlockClient {
             read_ahead_len: conf.read_ahead_len,
             drop_cache_len: conf.drop_cache_len,
             component_info: Some(self.component_info.clone()),
-        };
+            read_once: None,
+        }
+    }
 
+    async fn open_read_request(
+        &self,
+        request: BlockReadRequest,
+        req_id: i64,
+        seq_id: i32,
+    ) -> FsResult<Message> {
         let msg = Builder::new()
             .code(RpcCode::ReadBlock)
             .request(RequestStatus::Open)
@@ -271,10 +293,49 @@ impl BlockClient {
             .proto_header(request)
             .build();
 
-        let rep = FsContext::metrics_track("OpenBlock", self.rpc(msg)).await?;
-        let rep_header: BlockReadResponse = rep.parse_header()?;
+        FsContext::metrics_track("OpenBlock", self.rpc(msg)).await
+    }
 
-        Ok(BlockReadContext::from_req(rep_header))
+    pub(crate) async fn read_small_block(
+        &self,
+        mut request: BlockReadRequest,
+        req_id: i64,
+    ) -> FsResult<DataSlice> {
+        if request.off < 0 || request.off > request.len || request.len > request.chunk_size as i64 {
+            return err_box!(
+                "Invalid small block read range: offset {}, length {}, chunk {}",
+                request.off,
+                request.len,
+                request.chunk_size
+            );
+        }
+        let expected = request.len - request.off;
+        let block = ExtendedBlock::with_id(request.id);
+        request.read_once = Some(true);
+        let rep = self.open_read_request(request, req_id, 0).await?;
+        let data = if rep.request_status() == RequestStatus::Complete {
+            rep.data
+        } else {
+            // A legacy worker ignored the optional flag. Finish the session it
+            // already opened, including cleanup when the data request fails.
+            let result = if expected == 0 {
+                Ok(DataSlice::Empty)
+            } else {
+                self.read_data(req_id, 1, None).await
+            };
+            let complete = self.read_commit(&block, req_id, 2).await;
+            let data = result?;
+            complete?;
+            data
+        };
+        if data.len() as i64 != expected {
+            return err_box!(
+                "Incomplete small block read: expected {}, received {}",
+                expected,
+                data.len()
+            );
+        }
+        Ok(data)
     }
 
     pub async fn read_commit(

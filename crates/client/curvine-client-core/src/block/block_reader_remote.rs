@@ -18,7 +18,7 @@ use curvine_core_error::err_box;
 use curvine_error::FsResult;
 use curvine_io::DataSlice;
 use curvine_model::{ExtendedBlock, WorkerAddress};
-use curvine_proto::DataHeaderProto;
+use curvine_proto::{BlockReadRequest, DataHeaderProto};
 use curvine_runtime::common::Utils;
 
 pub struct BlockReaderRemote {
@@ -30,6 +30,9 @@ pub struct BlockReaderRemote {
     req_id: i64,
     seq_id: i32,
     header: Option<DataHeaderProto>,
+    read_once: Option<BlockReadRequest>,
+    initial_data: Option<DataSlice>,
+    read_once_completed: bool,
 }
 
 impl BlockReaderRemote {
@@ -44,6 +47,15 @@ impl BlockReaderRemote {
         let seq_id = 0;
 
         let client = fs_context.acquire_read(&worker_address).await?;
+        if len >= 0 && len <= fs_context.read_chunk_size() as i64 && off >= 0 && off <= len {
+            let request = client.read_request(&fs_context.conf.client, &block, off, len, false);
+            let data = client.read_small_block(request.clone(), req_id).await?;
+            let mut reader =
+                Self::from_opened(client, block, worker_address, off, len, req_id, seq_id);
+            reader.read_once = Some(request);
+            reader.initial_data = Some(data);
+            return Ok(reader);
+        }
         let _ = client
             .open_block(
                 &fs_context.conf.client,
@@ -85,6 +97,9 @@ impl BlockReaderRemote {
             req_id,
             seq_id,
             header: None,
+            read_once: None,
+            initial_data: None,
+            read_once_completed: false,
         }
     }
 
@@ -111,6 +126,12 @@ impl BlockReaderRemote {
 
     pub fn seek(&mut self, pos: i64) -> FsResult<i64> {
         self.pos = pos;
+        // A seek must observe a fresh read, rather than indefinitely reusing
+        // the bytes prefetched by the constructor.
+        self.initial_data = None;
+        if let Some(request) = &mut self.read_once {
+            request.off = pos;
+        }
         self.header = Some(DataHeaderProto {
             offset: pos,
             flush: false,
@@ -120,8 +141,24 @@ impl BlockReaderRemote {
     }
 
     pub async fn read(&mut self) -> FsResult<DataSlice> {
+        if self.read_once_completed {
+            return err_box!("Read session has completed");
+        }
         if self.remaining() <= 0 {
             return err_box!("No readable data");
+        }
+
+        if let Some(request) = &self.read_once {
+            let data = match self.initial_data.take() {
+                Some(data) => data,
+                None => {
+                    self.client
+                        .read_small_block(request.clone(), Utils::req_id())
+                        .await?
+                }
+            };
+            self.pos += data.len() as i64;
+            return Ok(data);
         }
 
         let seq_id = self.next_seq_id();
@@ -133,6 +170,11 @@ impl BlockReaderRemote {
     }
 
     pub async fn complete(&mut self) -> FsResult<()> {
+        if self.read_once.is_some() {
+            self.initial_data = None;
+            self.read_once_completed = true;
+            return Ok(());
+        }
         let next_seq_id = self.next_seq_id();
         self.client
             .read_commit(&self.block, self.req_id, next_seq_id)
