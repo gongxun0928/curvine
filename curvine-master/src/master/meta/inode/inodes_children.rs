@@ -15,7 +15,6 @@
 use crate::master::meta::inode::{InodePtr, InodeView};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_model::ListOptions;
-use glob::Pattern;
 use std::collections::btree_map::{Entry, Values};
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -40,43 +39,6 @@ impl InodeChildren {
     // Search for whether the current inode name exists.
     fn search_by_name(list: &[Box<InodeView>], name: &str) -> Result<usize, usize> {
         list.binary_search_by(|f| f.name().cmp(name))
-    }
-
-    /// Get children matching glob pattern (e.g., "*.txt", "dir*")
-    pub fn get_child_by_glob_pattern<'a>(
-        &'a self,
-        glob_pattern: &'a Pattern,
-    ) -> Option<Vec<&'a InodeView>> {
-        match self {
-            InodeChildren::List(list) => {
-                let mut matches: Vec<&'a InodeView> = Vec::new();
-                for child in list {
-                    if glob_pattern.matches(child.name()) {
-                        matches.push(child.as_ref());
-                    }
-                }
-                Some(matches)
-            }
-            InodeChildren::Map(map) => {
-                let mut matches: Vec<&'a InodeView> = Vec::new();
-                for child in map.values() {
-                    if glob_pattern.matches(child.name()) {
-                        matches.push(child.as_ref());
-                    }
-                }
-                Some(matches)
-            }
-        }
-    }
-
-    pub fn get_child_ptr_by_glob_pattern(&self, glob_pattern: &Pattern) -> Option<Vec<InodePtr>> {
-        self.get_child_by_glob_pattern(glob_pattern)
-            .map(|children| {
-                children
-                    .iter()
-                    .map(|child_ref| InodePtr::from_ref(*child_ref)) // Deref &&InodeView -> &InodeView
-                    .collect()
-            })
     }
 
     pub fn get_child(&self, name: &str) -> Option<&InodeView> {

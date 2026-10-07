@@ -24,6 +24,7 @@ mod inode_view;
 pub use self::inode_view::*;
 
 mod inode_path;
+pub(crate) use self::inode_path::GlobTreeEntry;
 pub use self::inode_path::InodePath;
 
 mod inodes_children;

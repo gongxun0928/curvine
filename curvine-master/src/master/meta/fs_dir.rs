@@ -29,7 +29,8 @@ use curvine_model::{
     FreeResult, ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, TtlAction,
     WorkerAddress, INTERNAL_CTIME_XATTR,
 };
-use curvine_runtime::common::{LocalTime, TimeSpent};
+use curvine_rocksdb::RocksUtils;
+use curvine_runtime::common::{LocalTime, SerdeUtils, TimeSpent};
 use curvine_runtime::sync::AtomicCounter;
 use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet, LinkedList};
@@ -762,6 +763,58 @@ impl FsDir {
         }
     }
 
+    /// Load file bodies for glob matches after the FsDir read lock is released.
+    ///
+    /// `files` is `(inode_id, tree_name, full_path)` copied while the tree was stable.
+    /// Names come from the tree, not from the stored inode body.
+    pub fn file_statuses_by_ids(
+        store: &RocksInodeStore,
+        files: &[(i64, String, String)],
+    ) -> FsResult<Vec<FileStatus>> {
+        const BATCH: usize = 8192;
+        let mut out = Vec::with_capacity(files.len());
+        for chunk in files.chunks(BATCH) {
+            let keys: Vec<[u8; 8]> = chunk
+                .iter()
+                .map(|(id, _, _)| RocksUtils::i64_to_bytes(*id))
+                .collect();
+            let batch = store.batched_multi_get_inodes(keys.iter(), false)?;
+            if batch.len() != chunk.len() {
+                return err_box!(
+                    "file_statuses_by_ids: batch len {} != request len {}",
+                    batch.len(),
+                    chunk.len()
+                );
+            }
+            for (item, (id, name, path)) in batch.into_iter().zip(chunk.iter()) {
+                let bytes = match item {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => {
+                        return err_ext!(FsError::file_not_found(path).ctx(format!("inode_id={id}")))
+                    }
+                    Err(err) => {
+                        return err_box!(
+                            "file_statuses_by_ids: read {} id {} failed: {}",
+                            path,
+                            id,
+                            err
+                        )
+                    }
+                };
+                let mut inode: InodeView = SerdeUtils::deserialize(bytes.as_ref())?;
+                if inode.id() != *id {
+                    return err_box!(
+                        "file_statuses_by_ids: inode id mismatch for {path} (expected {id}, stored {})",
+                        inode.id()
+                    );
+                }
+                inode.change_name(name.clone());
+                out.push(inode.to_file_status(path)?);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn acquire_new_block(
         &mut self,
         path: impl AsRef<str>,
@@ -979,10 +1032,13 @@ impl FsDir {
         let mut spend = TimeSpent::new();
         let path = path.as_ref();
 
+        // Drain readers before replacing the live tree. A late failure must not
+        // leave `root_dir` empty.
+        self.store.wait_until_store_exclusive();
+
         // Set to other value first to facilitate memory recycling.
         self.root_dir = Self::create_root();
 
-        // Reset rocksdb
         self.store.restore(path)?;
         let time1 = spend.used_ms();
         spend.reset();
@@ -1025,11 +1081,11 @@ impl FsDir {
     }
 
     pub fn get_rocks_store(&self) -> &RocksInodeStore {
-        &self.store.store
+        self.store.store()
     }
 
     pub fn delete_locations(&self, worker_id: u32) -> FsResult<Vec<i64>> {
-        let block_ids = self.store.store.delete_locations(worker_id)?;
+        let block_ids = self.store.store().delete_locations(worker_id)?;
         Ok(block_ids)
     }
 
@@ -1094,7 +1150,7 @@ impl FsDir {
     }
 
     pub fn get_worker_block_ids(&self, worker_id: u32) -> FsResult<Vec<i64>> {
-        Ok(self.store.store.get_block_ids(worker_id)?)
+        Ok(self.store.store().get_block_ids(worker_id)?)
     }
 
     // for testing
@@ -1103,7 +1159,7 @@ impl FsDir {
     }
 
     pub fn store_mount(&mut self, info: MountInfo, send_log: bool) -> FsResult<()> {
-        self.store.store.add_mountpoint(info.mount_id, &info)?;
+        self.store.store().add_mountpoint(info.mount_id, &info)?;
 
         if send_log {
             self.journal_writer.log_mount(self, info)?;
@@ -1113,18 +1169,18 @@ impl FsDir {
     }
 
     pub fn unprotected_store_mount(&mut self, info: MountInfo) -> FsResult<()> {
-        self.store.store.add_mountpoint(info.mount_id, &info)?;
+        self.store.store().add_mountpoint(info.mount_id, &info)?;
         Ok(())
     }
 
     pub fn unmount(&mut self, id: u32) -> FsResult<()> {
-        self.store.store.remove_mountpoint(id)?;
+        self.store.store().remove_mountpoint(id)?;
         self.journal_writer.log_unmount(self, id)?;
         Ok(())
     }
 
     pub fn unprotected_unmount(&mut self, id: u32) -> FsResult<()> {
-        self.store.store.remove_mountpoint(id)?;
+        self.store.store().remove_mountpoint(id)?;
         Ok(())
     }
 

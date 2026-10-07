@@ -15,8 +15,11 @@
 use crate::master::fs::context::ValidateAddBlock;
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
-use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
-use crate::master::meta::{CacheInvalidationResult, FsDir};
+use crate::master::meta::inode::{
+    GlobTreeEntry, Inode, InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR,
+};
+use crate::master::meta::{BlockMeta, CacheInvalidationResult, FsDir};
+use crate::master::quota::eviction::evictor::Evictor;
 
 use crate::master::fs::DeleteResult;
 use crate::master::meta::parse_glob_pattern;
@@ -32,7 +35,7 @@ use curvine_runtime::runtime::GroupExecutor;
 use curvine_runtime::sync::ArcRwLock;
 use log::{error, info, warn};
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 pub struct CvMetadataSnapshotEntry {
@@ -63,6 +66,19 @@ struct CompleteFileOptions {
     only_flush: bool,
     return_file_blocks: bool,
     set_attr_opts: Option<SetAttrOpts>,
+}
+
+/// Page size for unbounded `list_status`. Matches the FUSE default `list_limit`.
+const LIST_STATUS_PAGE_SIZE: usize = 1000;
+
+enum GlobListMatch {
+    Dir(String),
+    File(FileStatus),
+}
+
+enum GlobPageResult {
+    Parents(Vec<String>),
+    Matches(Vec<GlobListMatch>),
 }
 
 #[derive(Clone)]
@@ -488,32 +504,208 @@ impl MasterFilesystem {
         inode_id: Option<i64>,
     ) -> FsResult<FileStatus> {
         let path = path.as_ref();
+        if let Some(id) = inode_id.filter(|id| *id > 0) {
+            return self.file_status_from_store(path, id);
+        }
         let fs_dir = self.fs_dir.read();
         let inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
         Ok(inode.to_file_status(path)?)
     }
 
+    /// One RocksDB get by inode id, after the `FsDir` read guard is dropped.
+    fn file_status_from_store(&self, path: &str, inode_id: i64) -> FsResult<FileStatus> {
+        let store = {
+            let fs_dir = self.fs_dir.read();
+            fs_dir.store.read_lease()
+        };
+        match store.get_inode(inode_id)? {
+            Some(view) => Ok(view.to_file_status(path)?),
+            None => err_ext!(FsError::file_not_found(path).ctx(format!("inode_id={inode_id}"))),
+        }
+    }
+
+    /// Existence is the in-memory child pointer, including a `FileEntry` with no store body.
     pub fn exists<T: AsRef<str>>(&self, path: T) -> FsResult<bool> {
         let fs_dir = self.fs_dir.read();
-        let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
-        Ok(inp.get_last_inode().is_some())
+        Ok(InodePath::exists_in_tree(fs_dir.root_ptr(), path.as_ref())?)
     }
 
     pub fn list_status<T: AsRef<str>>(&self, path: T) -> FsResult<Vec<FileStatus>> {
-        let fs_dir = self.fs_dir.read();
-        let (is_glob_pattern, _) = parse_glob_pattern(path.as_ref());
+        let path = path.as_ref();
+        let (is_glob_pattern, _) = parse_glob_pattern(path);
         if is_glob_pattern {
-            let paths = Self::resolve_path_by_glob_pattern(&fs_dir, path.as_ref())?;
-            let mut all_statuses = Vec::new();
-            for path in &paths {
-                let statuses = fs_dir.list_status(path)?;
-                all_statuses.extend(statuses);
-            }
-            Ok(all_statuses)
+            self.list_status_glob(path)
         } else {
-            let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
-            fs_dir.list_status(&inp)
+            self.list_status_paged(path)
         }
+    }
+
+    /// Lists one page per `fs_dir` read lock. The next page re-resolves `path` and
+    /// `start_after`. A concurrent mkdir or delete can omit or add a name across pages.
+    fn list_status_paged(&self, path: &str) -> FsResult<Vec<FileStatus>> {
+        let mut all = Vec::new();
+        let mut start_after: Option<String> = None;
+        loop {
+            let page = {
+                let fs_dir = self.fs_dir.read();
+                let inp = Self::resolve_path(&fs_dir, path)?;
+                let opts = ListOptions {
+                    limit: Some(LIST_STATUS_PAGE_SIZE),
+                    start_after: start_after.clone(),
+                };
+                fs_dir.list_options(&inp, &opts)?
+            };
+            if page.len() < LIST_STATUS_PAGE_SIZE {
+                all.extend(page);
+                break;
+            }
+            let last_name = page[page.len() - 1].name.clone();
+            all.extend(page);
+            start_after = Some(last_name);
+        }
+        Ok(all)
+    }
+
+    fn materialize_glob_entries(
+        fs_dir: &FsDir,
+        entries: Vec<GlobTreeEntry>,
+    ) -> FsResult<Vec<GlobListMatch>> {
+        let file_keys: Vec<_> = entries
+            .iter()
+            .filter(|entry| !entry.is_dir)
+            .map(|entry| (entry.id, entry.name.clone(), entry.path.clone()))
+            .collect();
+        let file_statuses = FsDir::file_statuses_by_ids(fs_dir.store.store(), &file_keys)?;
+        let mut files = file_statuses.into_iter();
+        let mut matches = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if entry.is_dir {
+                matches.push(GlobListMatch::Dir(entry.path));
+            } else {
+                let Some(status) = files.next() else {
+                    return err_box!("glob file status missing after page read");
+                };
+                matches.push(GlobListMatch::File(status));
+            }
+        }
+        if files.next().is_some() {
+            return err_box!("glob file status count exceeds page entries");
+        }
+        Ok(matches)
+    }
+
+    fn finish_glob_page(
+        fs_dir: &FsDir,
+        entries: Vec<GlobTreeEntry>,
+        is_last: bool,
+    ) -> FsResult<GlobPageResult> {
+        if is_last {
+            Ok(GlobPageResult::Matches(Self::materialize_glob_entries(
+                fs_dir, entries,
+            )?))
+        } else {
+            Ok(GlobPageResult::Parents(
+                entries
+                    .into_iter()
+                    .filter(|entry| entry.is_dir)
+                    .map(|entry| entry.path)
+                    .collect(),
+            ))
+        }
+    }
+
+    /// Glob walk in pages of [`LIST_STATUS_PAGE_SIZE`]. File bodies are read in the
+    /// same guard as their tree entries. No `InodePtr` is kept after the guard drops.
+    fn list_status_glob(&self, pattern: &str) -> FsResult<Vec<FileStatus>> {
+        let components = InodeView::path_components(pattern)?;
+        let mut parents = vec![PATH_SEPARATOR.to_string()];
+        let mut matches = Vec::new();
+
+        for (index, component) in components.iter().enumerate().skip(1) {
+            let is_last = index + 1 == components.len();
+            let (is_glob, compiled) = parse_glob_pattern(component);
+            let mut next_parents = Vec::new();
+
+            if is_glob {
+                let Some(compiled) = compiled else {
+                    return err_box!("invalid glob pattern: {}", component);
+                };
+                let mut tasks: VecDeque<(String, Option<String>)> = parents
+                    .iter()
+                    .cloned()
+                    .map(|parent| (parent, None))
+                    .collect();
+                while !tasks.is_empty() {
+                    let result = {
+                        let fs_dir = self.fs_dir.read();
+                        let mut entries = Vec::new();
+                        let mut remaining = LIST_STATUS_PAGE_SIZE;
+                        while remaining > 0 {
+                            let Some((parent, start_after)) = tasks.pop_front() else {
+                                break;
+                            };
+                            let page = InodePath::glob_children_page(
+                                fs_dir.root_ptr(),
+                                &parent,
+                                &compiled,
+                                start_after,
+                                remaining,
+                            )?;
+                            remaining = remaining.saturating_sub(page.scanned.max(1));
+                            entries.extend(page.entries);
+                            if let Some(last_name) = page.next_after {
+                                tasks.push_front((parent, Some(last_name)));
+                            }
+                        }
+                        Self::finish_glob_page(&fs_dir, entries, is_last)?
+                    };
+
+                    match result {
+                        GlobPageResult::Parents(paths) => next_parents.extend(paths),
+                        GlobPageResult::Matches(page_matches) => matches.extend(page_matches),
+                    }
+                }
+            } else {
+                for parent_chunk in parents.chunks(LIST_STATUS_PAGE_SIZE) {
+                    let result = {
+                        let fs_dir = self.fs_dir.read();
+                        let mut entries = Vec::with_capacity(parent_chunk.len());
+                        for parent in parent_chunk {
+                            if let Some(entry) =
+                                InodePath::glob_literal_child(fs_dir.root_ptr(), parent, component)?
+                            {
+                                entries.push(entry);
+                            }
+                        }
+                        Self::finish_glob_page(&fs_dir, entries, is_last)?
+                    };
+
+                    match result {
+                        GlobPageResult::Parents(paths) => next_parents.extend(paths),
+                        GlobPageResult::Matches(page_matches) => matches.extend(page_matches),
+                    }
+                }
+            }
+
+            if is_last {
+                break;
+            }
+            parents = next_parents;
+            if parents.is_empty() {
+                break;
+            }
+        }
+
+        let mut all_statuses = Vec::new();
+        for entry in matches {
+            match entry {
+                GlobListMatch::Dir(path) => {
+                    all_statuses.extend(self.list_status_paged(&path)?);
+                }
+                GlobListMatch::File(status) => all_statuses.push(status),
+            }
+        }
+        Ok(all_statuses)
     }
 
     pub fn list_options<T: AsRef<str>>(
@@ -534,10 +726,6 @@ impl MasterFilesystem {
 
     fn resolve_path(fs_dir: &FsDir, path: &str) -> CommonResult<InodePath> {
         InodePath::resolve(fs_dir.root_ptr(), path, &fs_dir.store)
-    }
-
-    fn resolve_path_by_glob_pattern(fs_dir: &FsDir, path: &str) -> CommonResult<Vec<InodePath>> {
-        InodePath::resolve_for_glob_pattern(fs_dir.root_ptr(), path, &fs_dir.store)
     }
 
     pub fn check_path_length(&self, path: &str) -> CommonResult<()> {
@@ -832,22 +1020,59 @@ impl MasterFilesystem {
     }
 
     pub fn get_block_locations<T: AsRef<str>>(&self, path: T) -> FsResult<FileBlocks> {
-        let fs_dir = self.fs_dir.read();
         let path = path.as_ref();
-        let inp = Self::resolve_path(&fs_dir, path)?;
-
-        let inode = match inp.get_last_inode() {
-            Some(v) => v,
-            None => return err_ext!(FsError::file_not_found(path)),
+        // complete_file writes block length and CF_BLOCK rows in one batch.
+        // Read both before dropping this guard.
+        let (status, file_id, scanned, evictor) = {
+            let fs_dir = self.fs_dir.read();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            let inode = match inp.get_last_inode() {
+                Some(v) => v,
+                None => return err_ext!(FsError::file_not_found(path)),
+            };
+            let file = inode.as_file_ref()?;
+            let status = inode.to_file_status(path)?;
+            let block_size = file.block_size;
+            let storage_type = file.storage_policy.storage_type;
+            let file_type = file.file_type;
+            let mut scanned = Vec::with_capacity(file.blocks.len());
+            for (index, meta) in file.blocks.iter().enumerate() {
+                if index + 1 < file.blocks.len() && meta.len() != block_size as i64 {
+                    return err_box!(
+                        "block status abnormal, block id {}, block len {}, expected block size {}",
+                        meta.id,
+                        meta.len(),
+                        block_size
+                    );
+                }
+                let locs: Vec<BlockLocation> = fs_dir.get_block_locations(meta.id)?;
+                scanned.push((
+                    meta.id,
+                    meta.len(),
+                    storage_type,
+                    file_type,
+                    meta.alloc_opts.clone(),
+                    locs,
+                ));
+            }
+            (status, file.id(), scanned, Arc::clone(&fs_dir.evictor))
         };
-        let file = inode.as_file_ref()?;
-        let block_locs = self.get_block_locs(path, &fs_dir, file)?;
-        let locate_blocks = FileBlocks {
-            status: inode.to_file_status(path)?,
-            block_locs,
-        };
 
-        Ok(locate_blocks)
+        evictor.on_access(file_id);
+        let wm = self.worker_manager.read();
+        let mut block_locs = Vec::with_capacity(scanned.len());
+        for (id, len, storage_type, file_type, alloc_opts, locs) in scanned {
+            let extend_block = ExtendedBlock {
+                id,
+                len,
+                storage_type,
+                file_type,
+                alloc_opts,
+            };
+            block_locs.push(wm.create_locate_block(path, extend_block, &locs)?);
+        }
+
+        Ok(FileBlocks { status, block_locs })
     }
 
     pub fn get_file_block_details<T: AsRef<str>>(&self, path: T) -> FsResult<FileBlockDetails> {
@@ -2266,5 +2491,189 @@ mod tests {
                 .scheduled_bytes,
             0
         );
+    }
+
+    fn create_named_files(
+        fs: &MasterFilesystem,
+        dir: &str,
+        count: usize,
+    ) -> Vec<(String, i64, i64, bool)> {
+        fs.mkdir(dir, true).unwrap();
+        let width = count.max(1).ilog10() as usize + 1;
+        let mut expected = Vec::with_capacity(count);
+        for i in 0..count {
+            let name = format!("n{i:0width$}");
+            let status = fs.create(format!("{dir}/{name}"), false).unwrap();
+            expected.push((name, status.id, status.len, status.is_dir));
+        }
+        expected
+    }
+
+    fn assert_list_matches(
+        fs: &MasterFilesystem,
+        dir: &str,
+        expected: &[(String, i64, i64, bool)],
+    ) {
+        let listed = fs.list_status(dir).unwrap();
+        assert_eq!(listed.len(), expected.len(), "list len for {dir}");
+        for (got, (name, id, len, is_dir)) in listed.iter().zip(expected.iter()) {
+            assert_eq!(&got.name, name);
+            assert_eq!(got.id, *id);
+            assert_eq!(got.len, *len);
+            assert_eq!(got.is_dir, *is_dir);
+        }
+        assert!(listed.windows(2).all(|pair| pair[0].name < pair[1].name));
+    }
+
+    #[test]
+    fn list_status_page_boundaries() {
+        let fs = test_fs("list-pages");
+        let cases = [
+            ("empty", 0usize),
+            ("one", 1),
+            ("page-minus", LIST_STATUS_PAGE_SIZE - 1),
+            ("exact-page", LIST_STATUS_PAGE_SIZE),
+            ("page-plus", LIST_STATUS_PAGE_SIZE + 1),
+            ("two-pages", LIST_STATUS_PAGE_SIZE * 2),
+        ];
+        for (label, count) in cases {
+            let dir = format!("/pages/{label}");
+            let expected = create_named_files(&fs, &dir, count);
+            assert_list_matches(&fs, &dir, &expected);
+        }
+    }
+
+    #[test]
+    fn glob_a_star_b_star_matches_tree_order() {
+        let fs = test_fs("glob-a-star-b");
+        fs.mkdir("/a", true).unwrap();
+        let mut expected_paths = Vec::new();
+        let mut expected_ids = Vec::new();
+        for i in 0..3 {
+            fs.mkdir(format!("/a/x{i}/b"), true).unwrap();
+            for j in 0..3 {
+                let path = format!("/a/x{i}/b/y{j}");
+                let status = fs.create(&path, false).unwrap();
+                expected_paths.push(path);
+                expected_ids.push((status.id, status.len, status.is_dir));
+            }
+        }
+        let listed = fs.list_status("/a/*/b/*").unwrap();
+        let paths: Vec<_> = listed.iter().map(|status| status.path.clone()).collect();
+        assert_eq!(paths, expected_paths);
+        for (got, (id, len, is_dir)) in listed.iter().zip(expected_ids.iter()) {
+            assert_eq!(got.id, *id);
+            assert_eq!(got.len, *len);
+            assert_eq!(got.is_dir, *is_dir);
+        }
+    }
+
+    #[test]
+    fn exists_file_dir_missing_and_symlink_unchanged() {
+        let fs = test_fs("exists-tree");
+        fs.mkdir("/e/dir", true).unwrap();
+        fs.create("/e/file", false).unwrap();
+        fs.symlink("/e/file", "/e/link", false, 0o777).unwrap();
+        fs.symlink("missing-target", "/e/dangling", false, 0o777)
+            .unwrap();
+
+        assert!(fs.exists("/").unwrap());
+        assert!(fs.exists("/e/dir").unwrap());
+        assert!(fs.exists("/e/file").unwrap());
+        assert!(fs.exists("/e/link").unwrap());
+        assert!(fs.exists("/e/dangling").unwrap());
+        assert!(!fs.exists("/e/missing").unwrap());
+        assert!(!fs.exists("/e/file/child").unwrap());
+        assert!(!fs.exists("/e/dangling/child").unwrap());
+
+        let link = fs.file_status("/e/link").unwrap();
+        assert_eq!(link.target.as_deref(), Some("/e/file"));
+        assert!(!link.is_dir);
+        assert_eq!(link.file_type, FileType::Link);
+
+        let listed = fs.list_status("/e/file").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "file");
+        assert!(!listed[0].is_dir);
+
+        let file = fs.file_status("/e/file").unwrap();
+        let by_id = fs.file_status_by_id("/e/file", Some(file.id)).unwrap();
+        assert_eq!(by_id.id, file.id);
+        assert_eq!(by_id.len, file.len);
+        let missing = fs.file_status_by_id("/missing", Some(42)).unwrap_err();
+        assert_file_not_found_roundtrip(&missing);
+    }
+
+    #[test]
+    fn get_block_locations_stays_consistent_across_complete_file() {
+        let fs = test_fs("block-locs-complete");
+        let capacity = 1 << 30;
+        fs.add_test_worker(worker_with_status(
+            1,
+            WorkerStatus::Live,
+            capacity,
+            capacity,
+        ));
+        let created = fs.create("/blk/race", true).unwrap();
+        let addr = ClientAddress::default();
+        let added = fs
+            .add_block("/blk/race", Some(created.id), addr, vec![], vec![], 0, None)
+            .unwrap();
+        let worker_id = added.locs[0].worker_id;
+        let committed_len = created.block_size;
+        let commit = CommitBlock {
+            block_id: added.block.id,
+            block_len: committed_len,
+            locations: vec![BlockLocation {
+                worker_id,
+                storage_type: Default::default(),
+            }],
+        };
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_reader = Arc::clone(&stop);
+        let reader_fs = fs.clone();
+        let block_id = added.block.id;
+        let reader = std::thread::spawn(move || {
+            let mut samples = Vec::new();
+            while !stop_reader.load(std::sync::atomic::Ordering::Relaxed) {
+                samples.push(reader_fs.get_block_locations("/blk/race").unwrap());
+            }
+            samples.push(reader_fs.get_block_locations("/blk/race").unwrap());
+            samples
+        });
+
+        fs.complete_file(
+            "/blk/race",
+            Some(created.id),
+            committed_len,
+            vec![commit],
+            "test-client",
+            false,
+            None,
+        )
+        .unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let samples = reader.join().unwrap();
+        assert!(!samples.is_empty());
+
+        for sample in &samples {
+            let block = sample
+                .block_locs
+                .iter()
+                .find(|block| block.block.id == block_id)
+                .expect("allocated block");
+            let has_worker = block.locs.iter().any(|loc| loc.worker_id == worker_id);
+            let before_complete = block.block.len == 0 && !has_worker && sample.status.len == 0;
+            let after_complete = block.block.len == committed_len
+                && has_worker
+                && sample.status.len == committed_len;
+            assert!(
+                before_complete || after_complete,
+                "mixed block len {} status len {} worker {has_worker}",
+                block.block.len,
+                sample.status.len
+            );
+        }
     }
 }

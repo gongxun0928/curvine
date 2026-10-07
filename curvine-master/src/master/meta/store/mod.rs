@@ -14,6 +14,7 @@
 
 mod inode_store;
 pub use self::inode_store::InodeStore;
+pub(crate) use self::inode_store::StoreReadLease;
 
 mod rocks_inode_store;
 pub use self::rocks_inode_store::*;

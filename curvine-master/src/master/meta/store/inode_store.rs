@@ -22,9 +22,11 @@ use curvine_model::{BlockLocation, CommitBlock, FileLock, FileStatus, MountInfo}
 use curvine_rocksdb::{DBConf, RocksUtils};
 use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::{FileUtils, Utils};
-use log::info;
+use log::{info, warn};
 use std::collections::{HashMap, HashSet, LinkedList, VecDeque};
-use std::sync::Arc;
+use std::ops::Deref;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Private helper structs for bulk-load snapshot restore (Issue #964)
@@ -91,11 +93,48 @@ impl RestoreTimer {
 
 // Currently, only RockSDB is supported.
 // Note: InodeStore is intentionally NOT Clone.
-// Cloning InodeStore increases Arc<RocksInodeStore> refcount, which prevents
-// the RocksDB lock from being released during Raft snapshot restore.
-// If you need to share InodeStore, use Arc<InodeStore> or access it via FsDir.
+// Lock-free readers use StoreReadLease, allowing restore to wait for exactly
+// the readers that still hold the current RocksDB generation.
+struct StoreLeaseTracker {
+    active: Mutex<usize>,
+    drained: Condvar,
+}
+
+pub(crate) struct StoreReadLease {
+    // Dropped before `active` is decremented so restore cannot wake while the
+    // RocksDB Arc is still alive.
+    store: Option<Arc<RocksInodeStore>>,
+    tracker: Arc<StoreLeaseTracker>,
+}
+
+impl Deref for StoreReadLease {
+    type Target = RocksInodeStore;
+
+    fn deref(&self) -> &Self::Target {
+        self.store.as_deref().expect("store lease already dropped")
+    }
+}
+
+impl Drop for StoreReadLease {
+    fn drop(&mut self) {
+        drop(self.store.take());
+        let mut active = self
+            .tracker
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *active = active
+            .checked_sub(1)
+            .expect("store lease counter underflow");
+        if *active == 0 {
+            self.tracker.drained.notify_all();
+        }
+    }
+}
+
 pub struct InodeStore {
-    pub(crate) store: Arc<RocksInodeStore>,
+    store: Arc<RocksInodeStore>,
+    lease_tracker: Arc<StoreLeaseTracker>,
     pub(crate) fs_stats: Arc<FileSystemStats>,
     ttl_bucket_list: Arc<TtlBucketList>,
 }
@@ -104,6 +143,10 @@ impl InodeStore {
     pub fn new(store: RocksInodeStore, ttl_bucket_list: Arc<TtlBucketList>) -> CommonResult<Self> {
         Ok(InodeStore {
             store: Arc::new(store),
+            lease_tracker: Arc::new(StoreLeaseTracker {
+                active: Mutex::new(0),
+                drained: Condvar::new(),
+            }),
             fs_stats: Arc::new(FileSystemStats::new()?),
             ttl_bucket_list,
         })
@@ -884,18 +927,49 @@ impl InodeStore {
         self.store.db.create_checkpoint(id)
     }
 
-    pub fn restore<T: AsRef<str>>(&mut self, path: T) -> CommonResult<()> {
-        // Check if there are other references to the Arc, which would prevent the lock from being released
-        let ref_count = Arc::strong_count(&self.store);
-        if ref_count > 1 {
-            return err_box!(
-                "cannot restore: RocksInodeStore has {} references (expected 1). \
-                Other components are still holding clones of InodeStore, \
-                which prevents RocksDB lock from being released.",
-                ref_count
-            );
+    /// Pins the current RocksDB generation until the lease is dropped.
+    pub(crate) fn read_lease(&self) -> StoreReadLease {
+        let store = Arc::clone(&self.store);
+        let tracker = Arc::clone(&self.lease_tracker);
+        let mut active = tracker
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *active += 1;
+        drop(active);
+        StoreReadLease {
+            store: Some(store),
+            tracker,
         }
+    }
 
+    /// Blocks until outstanding read leases drop. Caller must hold `fs_dir`'s write lock.
+    pub(crate) fn wait_until_store_exclusive(&self) {
+        const WARN_INTERVAL: Duration = Duration::from_secs(10);
+        let mut active = self
+            .lease_tracker
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *active > 0 {
+            let (next, wait_result) = self
+                .lease_tracker
+                .drained
+                .wait_timeout(active, WARN_INTERVAL)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            active = next;
+            if wait_result.timed_out() && *active > 0 {
+                warn!(
+                    "snapshot restore is waiting for {} active RocksDB read lease(s)",
+                    *active
+                );
+            }
+        }
+        debug_assert_eq!(Arc::strong_count(&self.store), 1);
+    }
+
+    pub fn restore<T: AsRef<str>>(&mut self, path: T) -> CommonResult<()> {
+        self.wait_until_store_exclusive();
         let conf = self.store.db.conf().clone();
 
         // The database points to a temporary directory.
@@ -1271,6 +1345,43 @@ mod tests {
             total_inodes
         );
 
+        Ok(())
+    }
+
+    fn write_marker(store: &InodeStore, id: i64) -> CommonResult<()> {
+        let mut batch = store.new_batch();
+        let file = InodeView::new_file("marker".to_string(), InodeFile::new(id, 0));
+        batch.write_inode(&file)?;
+        batch.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn restore_waits_for_store_lease_to_drop() -> CommonResult<()> {
+        let mut store = new_store("restore-wait")?;
+        const MARKER: i64 = 4242;
+        write_marker(&store, MARKER)?;
+        let checkpoint = store.create_checkpoint(7)?;
+        let held = store.read_lease();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(held);
+        });
+        let started = std::time::Instant::now();
+        store.restore(&checkpoint)?;
+        let waited = started.elapsed();
+        worker.join().unwrap();
+        assert!(
+            waited >= std::time::Duration::from_millis(150),
+            "restore returned before the clone was released: {waited:?}"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(2),
+            "restore waited much longer than the 200ms holder: {waited:?}"
+        );
+        let loaded = store.store().get_inode(MARKER)?.expect("restored inode");
+        assert_eq!(loaded.id(), MARKER);
+        assert_eq!(Arc::strong_count(&store.store), 1);
         Ok(())
     }
 }

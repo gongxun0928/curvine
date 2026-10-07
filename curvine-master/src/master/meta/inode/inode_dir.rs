@@ -19,7 +19,6 @@ use crate::master::meta::inode::{
 };
 use curvine_core_error::CommonResult;
 use curvine_model::{ListOptions, MkdirOpts, StoragePolicy, INTERNAL_CTIME_XATTR};
-use glob::Pattern;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,13 +83,6 @@ impl InodeDir {
 
     pub fn get_child_ptr(&mut self, name: &str) -> Option<InodePtr> {
         self.children.get_child_ptr(name)
-    }
-
-    pub fn get_child_ptr_by_glob_pattern(
-        &mut self,
-        glob_pattern: &Pattern,
-    ) -> Option<Vec<InodePtr>> {
-        self.children.get_child_ptr_by_glob_pattern(glob_pattern)
     }
 
     pub fn update_mtime(&mut self, time: i64) {
